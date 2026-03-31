@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "aml_core",
+    "aml_cli",
+    "aml_gui/src-tauri"
+]
+resolver = "2"
