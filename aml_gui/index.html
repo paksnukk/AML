@@ -4,194 +4,257 @@
         <meta charset="UTF-8" />
         <link rel="icon" type="image/svg+xml" href="/vite.svg" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>AML - AudioMIDI Link</title>
-        <link rel="stylesheet" href="/src/styles.css" />
+        <title>AML — AudioMIDI Link</title>
         <style>
             :root {
-                font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-                color-scheme: light dark;
-                background-color: #242424;
-                color: rgba(255, 255, 255, 0.87);
+                font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+                color-scheme: dark;
+                --bg: #1a1d21;
+                --card: #252a31;
+                --line: #3a424d;
+                --text: #e8eaed;
+                --muted: #9aa3ad;
+                --accent: #3d9a7a;
+                --warn: #d4a017;
+                --danger: #d64545;
             }
-
+            * { box-sizing: border-box; }
             body {
                 margin: 0;
-                display: flex;
-                place-items: center;
-                min-width: 320px;
                 min-height: 100vh;
+                background:
+                    radial-gradient(ellipse at top, #243038 0%, var(--bg) 55%);
+                color: var(--text);
             }
-
             .container {
-                max-width: 800px;
+                max-width: 960px;
                 margin: 0 auto;
-                padding: 2rem;
-                text-align: center;
-                width: 100%;
+                padding: 1.5rem;
             }
-
             h1 {
-                font-size: 2.5em;
-                line-height: 1.1;
+                margin: 0 0 0.25rem;
+                font-size: 1.75rem;
+                letter-spacing: 0.02em;
             }
-
+            h2 {
+                margin: 0 0 0.75rem;
+                font-size: 1rem;
+                font-weight: 600;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+            }
+            .banner {
+                background: #2a2418;
+                border: 1px solid #6b5420;
+                color: #f0d78c;
+                padding: 0.75rem 1rem;
+                border-radius: 6px;
+                margin: 1rem 0;
+                font-size: 0.9rem;
+            }
             .card {
-                padding: 1.5em;
-                background-color: #333;
+                background: var(--card);
+                border: 1px solid var(--line);
                 border-radius: 8px;
-                margin-bottom: 1em;
-                text-align: left;
+                padding: 1rem;
+                margin-bottom: 1rem;
             }
-
             .row {
                 display: flex;
-                gap: 1em;
-                align-items: center;
+                gap: 1rem;
+                flex-wrap: wrap;
             }
-
             .col {
                 flex: 1;
+                min-width: 200px;
                 display: flex;
                 flex-direction: column;
-                gap: 0.5em;
+                gap: 0.4rem;
             }
-
+            label { font-size: 0.8rem; color: var(--muted); }
+            select, button {
+                padding: 0.55rem 0.75rem;
+                border-radius: 6px;
+                border: 1px solid var(--line);
+                background: #15181c;
+                color: var(--text);
+                font: inherit;
+            }
             button {
-                border-radius: 8px;
-                border: 1px solid transparent;
-                padding: 0.6em 1.2em;
-                font-size: 1em;
-                font-weight: 500;
-                font-family: inherit;
-                background-color: #1a1a1a;
                 cursor: pointer;
-                transition: border-color 0.25s;
-                color: white;
+                background: #1e242b;
             }
-            button:hover {
-                border-color: #646cff;
+            button:hover { border-color: var(--accent); }
+            button:disabled { opacity: 0.45; cursor: not-allowed; }
+            button.primary {
+                background: var(--accent);
+                border-color: var(--accent);
+                color: #04140e;
+                font-weight: 600;
             }
-            button:focus,
-            button:focus-visible {
-                outline: 4px auto -webkit-focus-ring-color;
-            }
-            button:disabled {
-                opacity: 0.5;
-                cursor: not-allowed;
-            }
-
-            select {
-                padding: 0.6em;
-                border-radius: 4px;
-                background-color: #1a1a1a;
-                color: white;
-                border: 1px solid #444;
-            }
-
+            .mode-row { gap: 0.5rem; align-items: center; }
+            .mode-row label { display: flex; align-items: center; gap: 0.35rem; color: var(--text); font-size: 0.9rem; }
             .display-box {
-                background: #000;
-                padding: 1em;
-                border-radius: 4px;
-                font-family: monospace;
-                color: #0f0;
-                min-height: 3em;
+                background: #0d0f12;
+                border: 1px solid var(--line);
+                padding: 0.85rem;
+                border-radius: 6px;
+                font-family: "IBM Plex Mono", ui-monospace, monospace;
+                color: var(--accent);
+                min-height: 2.8em;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                font-size: 1.2em;
-                margin-top: 10px;
             }
-
             .log-box {
-                background: #111;
-                height: 150px;
+                background: #0d0f12;
+                height: 160px;
                 overflow-y: auto;
-                padding: 0.5em;
-                font-family: monospace;
-                font-size: 0.9em;
-                border: 1px solid #444;
-                white-space: pre-wrap;
+                padding: 0.5rem;
+                font-family: ui-monospace, monospace;
+                font-size: 0.8rem;
+                border: 1px solid var(--line);
+                border-radius: 6px;
             }
-
-            .hint {
-                font-size: 0.8em;
-                color: #888;
-            }
-
+            .hint { font-size: 0.8rem; color: var(--muted); margin: 0; }
             .meter-container {
                 width: 100%;
-                height: 10px;
-                background-color: #222;
-                border-radius: 5px;
-                margin-top: 10px;
+                height: 8px;
+                background: #12151a;
+                border-radius: 4px;
                 overflow: hidden;
             }
             .meter-bar {
                 height: 100%;
                 width: 0%;
-                background-color: #0f0;
+                background: var(--accent);
                 transition: width 0.05s ease-out;
             }
+            .alarm {
+                display: none;
+                background: #3a1818;
+                border: 1px solid var(--danger);
+                color: #ffb4b4;
+                padding: 0.75rem 1rem;
+                border-radius: 6px;
+                margin-bottom: 1rem;
+                font-weight: 600;
+            }
+            .alarm.visible { display: block; }
+            .stat-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 0.5rem 1rem;
+                font-size: 0.9rem;
+            }
+            .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>AML - AudioMIDI Link</h1>
+            <h1>AML</h1>
+            <p class="hint">AudioMIDI Link v1.0 — MIDI over a dedicated audio path</p>
+
+            <div class="banner">
+                Dedicated channel only (like LTC). Do not EQ, compress, or limit the AML bus. Keep gain staging stable.
+            </div>
+
+            <div id="alarm-box" class="alarm"></div>
 
             <div class="card">
-                <h2>Configuration</h2>
-                <div class="row">
+                <h2>Link Status</h2>
+                <div class="stat-grid">
+                    <div>State: <strong id="link-state">Search</strong></div>
+                    <div>Link alive: <span id="link-alive">no</span></div>
+                    <div>Confidence: <span id="link-confidence">—</span> dB</div>
+                    <div>Est. latency: <span id="link-latency">—</span> ms</div>
+                    <div>CRC pass/fail: <span id="link-crc">0 / 0</span></div>
+                    <div>CRC pass rate: <span id="link-crc-rate">—</span>%</div>
+                    <div>Sync lost: <span id="link-sync-lost">0</span></div>
+                    <div>Buffer drops: <span id="link-drops">0</span></div>
+                    <div>Last seq: <span id="link-seq">—</span></div>
+                    <div>Last event: <span id="link-last-event">—</span></div>
+                </div>
+                <div class="meter-container" title="Confidence" style="margin-top: 0.75rem">
+                    <div id="confidence-meter" class="meter-bar"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Setup</h2>
+                <div class="row mode-row" style="margin-bottom: 0.75rem">
+                    <span class="hint">Mode:</span>
+                    <label><input type="radio" name="mode" value="encode" /> Encode</label>
+                    <label><input type="radio" name="mode" value="decode" /> Decode</label>
+                    <label><input type="radio" name="mode" value="both" checked /> Both</label>
+                </div>
+                <div class="row" style="margin-bottom: 0.75rem">
                     <div class="col">
-                        <label for="input-device-select"
-                            >Input Device (Microphone)</label
-                        >
-                        <select id="input-device-select">
-                            <option value="">Loading...</option>
+                        <label for="profile-select">Profile</label>
+                        <select id="profile-select">
+                            <option value="robust">Robust (safer, ~136 ms)</option>
+                            <option value="fast">Fast (clean chain, ~54 ms)</option>
                         </select>
                     </div>
                     <div class="col">
-                        <label for="output-device-select"
-                            >Output Device (Speakers)</label
-                        >
-                        <select id="output-device-select">
-                            <option value="">Loading...</option>
-                        </select>
+                        <label>&nbsp;</label>
+                        <p class="hint" id="profile-hint">Dedicated bus recommended for Fast.</p>
                     </div>
                 </div>
-                <div
-                    class="row"
-                    style="margin-top: 10px; justify-content: flex-end"
-                >
+                <div class="row">
+                    <div class="col">
+                        <label for="input-device-select">Audio In (AML RX)</label>
+                        <select id="input-device-select"></select>
+                    </div>
+                    <div class="col">
+                        <label for="output-device-select">Audio Out (AML TX)</label>
+                        <select id="output-device-select"></select>
+                    </div>
+                </div>
+                <div class="row" style="margin-top: 0.75rem">
+                    <div class="col">
+                        <label for="midi-in-select">MIDI In (to encoder)</label>
+                        <select id="midi-in-select"></select>
+                    </div>
+                    <div class="col">
+                        <label for="midi-out-select">MIDI Out (from decoder)</label>
+                        <select id="midi-out-select"></select>
+                    </div>
+                </div>
+                <div class="actions">
                     <button id="refresh-devices-btn">Refresh Devices</button>
+                    <button id="save-settings-btn">Save Settings</button>
+                    <button id="self-test-btn">Self-Test</button>
                 </div>
             </div>
 
             <div class="row">
-                <!-- Decoder Control -->
-                <div class="card col">
-                    <h2>Decoder (Receiver)</h2>
-                    <div class="row">
-                        <button id="start-listening-btn">
-                            Start Listening
-                        </button>
+                <div class="card col" id="decode-card">
+                    <h2>Decoder (Audio → MIDI)</h2>
+                    <div class="actions">
+                        <button id="start-listening-btn" class="primary">Start Decoder</button>
                         <button id="stop-listening-btn" disabled>Stop</button>
                     </div>
                     <div id="decoded-display" class="display-box">
-                        <span style="color: #555">Waiting for signal...</span>
+                        <span style="color: #555">Waiting…</span>
                     </div>
-                    <div class="meter-container" title="Input Level">
+                    <div class="meter-container" title="Input Level" style="margin-top: 0.5rem">
                         <div id="input-meter" class="meter-bar"></div>
                     </div>
                 </div>
 
-                <!-- Encoder Control -->
-                <div class="card col">
-                    <h2>Encoder (Test)</h2>
-                    <div class="row">
-                        <button id="start-test-btn">Start Test Sequence</button>
-                        <button id="stop-test-btn" disabled>Stop</button>
+                <div class="card col" id="encode-card">
+                    <h2>Encoder (MIDI → Audio)</h2>
+                    <div class="actions">
+                        <button id="start-encode-btn" class="primary">Start Encoder</button>
+                        <button id="stop-encode-btn" disabled>Stop</button>
                     </div>
-                    <p class="hint">Plays a C-Major scale loop.</p>
+                    <label style="margin-top: 0.5rem">
+                        <input type="checkbox" id="simulate-check" />
+                        Simulate C-major scale (if no MIDI in)
+                    </label>
+                    <p class="hint">Heartbeat is sent every 500 ms while encoding.</p>
                 </div>
             </div>
 
@@ -200,7 +263,6 @@
                 <div id="log-container" class="log-box"></div>
             </div>
         </div>
-
         <script type="module" src="/src/main.ts"></script>
     </body>
 </html>

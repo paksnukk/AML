@@ -1,33 +1,88 @@
 pub mod audio;
+pub mod settings;
 
-use aml_core::decoder::Decoder;
-use aml_core::encoder::Encoder;
-use aml_core::profile::ProfileDefinition;
-use aml_core::protocol::{FrameType, SymbolValue};
+use aml_core::modem::{decode_samples, encode_to_samples, AmlModemRx, AmlModemTx, ModemOutput};
+use aml_core::phy::{LinkState, PhyConfig};
+use aml_core::transport::{midi_to_message, TransportMessage};
 use cpal::traits::StreamTrait;
+use midir::{MidiInput, MidiOutput};
 use ringbuf::HeapRb;
+use settings::{load_settings, save_settings, AppSettings};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
+struct WorkerGate {
+    stop: AtomicBool,
+    running: AtomicBool,
+}
+
+impl WorkerGate {
+    fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(true),
+            running: AtomicBool::new(false),
+        }
+    }
+
+    fn request_stop_and_wait(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.running.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn mark_stopped(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
 struct AppState {
-    // Flags to control the worker threads
-    is_listening: Arc<AtomicBool>,
-    is_playing: Arc<AtomicBool>,
+    decode_gate: Arc<WorkerGate>,
+    encode_gate: Arc<WorkerGate>,
+    /// Shared stop flags so commands can flip them
+    decode_stop: Mutex<Option<Arc<AtomicBool>>>,
+    encode_stop: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct DecodedFrameEvent {
     frame_type: String,
     payload: String,
+    is_heartbeat: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct LogEvent {
     message: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct LinkStatsEvent {
+    state: String,
+    crc_pass: u64,
+    crc_fail: u64,
+    confidence_db: f32,
+    last_seq: Option<u8>,
+    sync_lost: u64,
+    crc_pass_rate: f32,
+    est_latency_ms: f32,
+    link_alive: bool,
+    buffer_drops: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AlarmEvent {
+    kind: String,
+    message: String,
+}
+
+fn parse_profile(profile: &str) -> PhyConfig {
+    PhyConfig::from_name(profile)
 }
 
 #[tauri::command]
@@ -41,256 +96,313 @@ fn get_output_devices() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn start_listening(
+fn get_midi_inputs() -> Result<Vec<String>, String> {
+    let midi_in = MidiInput::new("aml list in").map_err(|e| e.to_string())?;
+    let mut names = Vec::new();
+    for port in midi_in.ports() {
+        names.push(
+            midi_in
+                .port_name(&port)
+                .unwrap_or_else(|_| "Unknown".into()),
+        );
+    }
+    Ok(names)
+}
+
+#[tauri::command]
+fn get_midi_outputs() -> Result<Vec<String>, String> {
+    let midi_out = MidiOutput::new("aml list out").map_err(|e| e.to_string())?;
+    let mut names = Vec::new();
+    for port in midi_out.ports() {
+        names.push(
+            midi_out
+                .port_name(&port)
+                .unwrap_or_else(|_| "Unknown".into()),
+        );
+    }
+    Ok(names)
+}
+
+#[tauri::command]
+fn get_settings() -> AppSettings {
+    load_settings()
+}
+
+#[tauri::command]
+fn set_settings(settings: AppSettings) -> Result<(), String> {
+    save_settings(&settings)
+}
+
+#[tauri::command]
+fn get_profile_info(profile: String) -> Result<serde_json::Value, String> {
+    let cfg = parse_profile(&profile);
+    Ok(serde_json::json!({
+        "profile": profile,
+        "est_latency_ms": cfg.estimated_first_copy_ms(),
+        "symbol_duration_ms": cfg.symbol_duration_ms,
+        "guard_gap_ms": cfg.guard_gap_ms,
+        "repetition_k": cfg.repetition_k,
+        "sample_rate_hz": cfg.sample_rate_hz,
+    }))
+}
+
+#[tauri::command]
+fn run_self_test(profile: String) -> Result<String, String> {
+    let config = parse_profile(&profile);
+    let messages = vec![
+        TransportMessage::NoteOn {
+            note: 60,
+            velocity: 100,
+        },
+        TransportMessage::NoteOff { note: 60 },
+        TransportMessage::Heartbeat,
+    ];
+    let samples = encode_to_samples(config.clone(), &messages);
+    let decoded = decode_samples(config.clone(), &samples);
+    let ok = decoded.iter().any(|m| matches!(m, TransportMessage::NoteOn { .. }))
+        && decoded
+            .iter()
+            .any(|m| matches!(m, TransportMessage::NoteOff { .. }));
+    if ok {
+        Ok(format!(
+            "Self-test OK ({}). est latency {:.0} ms. Decoded {} msgs.",
+            profile,
+            config.estimated_first_copy_ms(),
+            decoded.len()
+        ))
+    } else {
+        Err(format!(
+            "Self-test FAILED. Got: {:?}",
+            decoded
+        ))
+    }
+}
+
+#[tauri::command]
+fn start_decoder(
     app: AppHandle,
     state: State<'_, AppState>,
-    device_index: Option<usize>,
+    audio_in: Option<usize>,
+    midi_out: Option<usize>,
+    profile: String,
 ) -> Result<(), String> {
-    // 1. Signal any existing thread to stop
-    state.is_listening.store(false, Ordering::SeqCst);
-    thread::sleep(Duration::from_millis(100));
+    state.decode_gate.request_stop_and_wait();
+    if let Some(prev) = state.decode_stop.lock().unwrap().take() {
+        prev.store(true, Ordering::SeqCst);
+    }
+    state.decode_gate.request_stop_and_wait();
 
-    // 2. Set flag to true for new thread
-    state.is_listening.store(true, Ordering::SeqCst);
-    let keep_running = state.is_listening.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    *state.decode_stop.lock().unwrap() = Some(stop.clone());
+    state.decode_gate.stop.store(false, Ordering::SeqCst);
+    state.decode_gate.running.store(true, Ordering::SeqCst);
 
-    // 3. Spawn the worker thread
+    let gate = state.decode_gate.clone();
     let app_handle = app.clone();
 
     thread::spawn(move || {
         let _ = app_handle.emit(
             "log",
             LogEvent {
-                message: "Initializing audio stream...".into(),
+                message: format!("Starting decoder (profile={})...", profile),
             },
         );
 
-        let mut profile = ProfileDefinition::default_pro_clean();
-        // Relax thresholds for over-the-air testing
-        profile.detection.min_confidence_db_over_runnerup = 1.0;
-        profile.detection.absolute_threshold.margin_db = 1.0;
-        profile.audio.ramp_ms.attack = 0.0;
-        let preferred_sample_rate = profile.audio.sample_rate_hz;
+        let mut config = parse_profile(&profile);
+        let est_latency = config.estimated_first_copy_ms();
+        let preferred_sample_rate = config.sample_rate_hz;
 
-        // RingBuffer: Audio Thread -> Decoder Thread
+        let midi_conn = match midi_out {
+            Some(idx) => match open_midi_out(idx) {
+                Ok(c) => Some(Arc::new(Mutex::new(c))),
+                Err(e) => {
+                    let _ = app_handle.emit(
+                        "log",
+                        LogEvent {
+                            message: format!("MIDI out error: {}", e),
+                        },
+                    );
+                    None
+                }
+            },
+            None => {
+                let _ = app_handle.emit(
+                    "log",
+                    LogEvent {
+                        message: "No MIDI out selected — decode to UI only.".into(),
+                    },
+                );
+                None
+            }
+        };
+
+        let drops = Arc::new(AtomicU64::new(0));
+        let drops_cb = drops.clone();
         let ring = HeapRb::<f32>::new(preferred_sample_rate as usize * 2);
         let (mut producer, mut consumer) = ring.split();
 
-        // We create the stream HERE, inside the thread.
-        // This avoids Send issues because the Stream never leaves this thread.
         let stream_result = audio::setup_input_stream(
-            device_index,
+            audio_in,
             Some(preferred_sample_rate),
-            move |data: &[f32]| {
-                for &sample in data {
-                    let _ = producer.push(sample);
+            move |data: &[f32], channels: usize| {
+                for frame in data.chunks(channels.max(1)) {
+                    if let Some(&s) = frame.first() {
+                        if producer.push(s).is_err() {
+                            drops_cb.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             },
         );
 
         match stream_result {
-            Ok((stream, stream_sample_rate)) => {
+            Ok((stream, stream_sample_rate, channels)) => {
+                let _ = app_handle.emit(
+                    "log",
+                    LogEvent {
+                        message: format!(
+                            "Audio in {} Hz, {} ch (ch0). est latency {:.0} ms.",
+                            stream_sample_rate, channels, est_latency
+                        ),
+                    },
+                );
                 if stream_sample_rate != preferred_sample_rate {
                     let _ = app_handle.emit(
                         "log",
                         LogEvent {
                             message: format!(
-                                "Input stream sample rate: {} Hz (preferred {} Hz). Using {} Hz.",
-                                stream_sample_rate, preferred_sample_rate, stream_sample_rate
+                                "Sample rate adapted {} → {} Hz",
+                                preferred_sample_rate, stream_sample_rate
                             ),
                         },
                     );
-                } else {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!(
-                                "Input stream sample rate: {} Hz.",
-                                stream_sample_rate
-                            ),
-                        },
-                    );
+                    config = config.with_sample_rate(stream_sample_rate);
                 }
-                profile.audio.sample_rate_hz = stream_sample_rate;
 
                 if let Err(e) = stream.play() {
                     let _ = app_handle.emit(
                         "log",
                         LogEvent {
-                            message: format!("Failed to play stream: {}", e),
+                            message: format!("Failed to play input: {}", e),
                         },
                     );
+                    gate.mark_stopped();
                     return;
                 }
 
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: "Listening started.".into(),
-                    },
-                );
+                let mut rx = AmlModemRx::new(config);
+                let mut rms_accumulator = 0.0f32;
+                let mut sample_count_for_meter = 0usize;
+                let meter_report_interval = (stream_sample_rate as usize) / 20;
+                let mut last_stats_emit = Instant::now();
+                let mut sync_lost: u64 = 0;
+                let mut link_alive = false;
 
-                // Decoder Setup
-                let mut decoder = Decoder::new(profile.clone());
-                let symbol_duration_ms = profile.audio.symbol_duration_ms;
-                let samples_per_symbol =
-                    (stream_sample_rate as f32 * symbol_duration_ms / 1000.0) as usize;
-                let samples_guard_gap =
-                    (stream_sample_rate as f32 * profile.audio.guard_gap_ms / 1000.0) as usize;
-                let hop_size = samples_per_symbol / 4;
-                let symbol_total_ms = symbol_duration_ms + profile.audio.guard_gap_ms;
-                let max_misses = ((profile.detection.timeouts_ms.frame_payload as f32)
-                    / symbol_total_ms)
-                    .ceil() as usize;
-                let max_misses = max_misses.max(2);
-                let mut analysis_buffer: VecDeque<f32> =
-                    VecDeque::with_capacity(samples_per_symbol * 2);
-
-                // Metering variables
-                let mut rms_accumulator = 0.0;
-                let mut sample_count_for_meter = 0;
-                let meter_report_interval = 2400; // Emit level every ~50ms (at 48k)
-                let mut missed_symbol_count = 0usize;
-                let preamble_min_power = 200.0;
-
-                // Loop
-                while keep_running.load(Ordering::Relaxed) {
-                    // 1. Consume from RingBuffer
+                while !stop.load(Ordering::SeqCst) {
+                    let mut chunk = Vec::new();
                     while let Some(sample) = consumer.pop() {
-                        analysis_buffer.push_back(sample);
-
-                        // Calculate Level
+                        chunk.push(sample);
                         rms_accumulator += sample * sample;
                         sample_count_for_meter += 1;
-
                         if sample_count_for_meter >= meter_report_interval {
                             let rms = (rms_accumulator / sample_count_for_meter as f32).sqrt();
-                            // Send level to frontend (event name: "input_level")
                             let _ = app_handle.emit("input_level", rms);
                             rms_accumulator = 0.0;
                             sample_count_for_meter = 0;
                         }
+                        if chunk.len() >= 512 {
+                            break;
+                        }
                     }
 
-                    // 2. Decoder Logic
-                    // We wait for symbol + guard gap to ensure we can advance correctly
-                    let samples_required = samples_per_symbol + samples_guard_gap;
-                    if analysis_buffer.len() >= samples_required {
-                        let window: Vec<f32> = analysis_buffer
-                            .iter()
-                            .take(samples_per_symbol)
-                            .cloned()
-                            .collect();
-                        let candidates = decoder.get_scan_candidates();
+                    if chunk.is_empty() {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
 
-                        if let Some((symbol, power)) = decoder.detect_symbol(&window, &candidates) {
-                            let was_wait_preamble =
-                                matches!(decoder.state, aml_core::decoder::DecoderState::WaitPreamble);
-                            let mut preamble_align_offset = 0usize;
-                            // Filter weak Preambles (noise/echo)
-                            if symbol == SymbolValue::Preamble {
-                                if power < preamble_min_power {
-                                    // Too weak, probably noise. Skip small amount and retry.
-                                    if analysis_buffer.len() >= hop_size {
-                                        analysis_buffer.drain(0..hop_size);
-                                    }
-                                    continue;
+                    for out in rx.push_samples(&chunk) {
+                        match out {
+                            ModemOutput::Message(msg) => {
+                                let is_hb = matches!(msg, TransportMessage::Heartbeat);
+                                if is_hb {
+                                    link_alive = true;
                                 }
-
-                                if was_wait_preamble {
-                                    // Try to align to the strongest preamble offset within the hop window.
-                                    let max_offset = hop_size.min(
-                                        analysis_buffer
-                                            .len()
-                                            .saturating_sub(samples_per_symbol),
-                                    );
-                                    let step = (hop_size / 2).max(1);
-                                    let mut offset = step;
-                                    let mut best_power = power;
-                                    while offset <= max_offset {
-                                        let offset_window: Vec<f32> = analysis_buffer
-                                            .iter()
-                                            .skip(offset)
-                                            .take(samples_per_symbol)
-                                            .cloned()
-                                            .collect();
-                                        let offset_power = decoder.goertzel_power(
-                                            &offset_window,
-                                            decoder.get_preamble_freq(),
-                                        );
-                                        if offset_power > best_power {
-                                            best_power = offset_power;
-                                            preamble_align_offset = offset;
-                                        }
-                                        offset += step;
-                                    }
-                                }
-
-                                let _ = app_handle.emit(
-                                    "log",
-                                    LogEvent {
-                                        message: format!("Detected Preamble (P: {:.0})", power),
-                                    },
-                                );
-                            }
-
-                            if let Some(frame) = decoder.handle_symbol(symbol) {
+                                let (frame_type, payload) = format_message(&msg);
                                 let _ = app_handle.emit(
                                     "decoded_frame",
                                     DecodedFrameEvent {
-                                        frame_type: format!("{:?}", frame.frame_type),
-                                        payload: format!("{:?}", frame.payload),
+                                        frame_type,
+                                        payload,
+                                        is_heartbeat: is_hb,
                                     },
                                 );
                             }
-                            missed_symbol_count = 0;
-                            // Advance (consume symbol + guard gap), with optional alignment after preamble
-                            let mut advance = samples_required;
-                            if symbol == SymbolValue::Preamble
-                                && was_wait_preamble
-                                && preamble_align_offset > 0
-                                && preamble_align_offset < samples_required
-                            {
-                                advance = samples_required - preamble_align_offset;
-                            }
-                            analysis_buffer.drain(0..advance);
-                        } else {
-                            // Advance / Hop
-                            match decoder.state {
-                                aml_core::decoder::DecoderState::WaitPreamble => {
-                                    missed_symbol_count = 0;
-                                    if analysis_buffer.len() >= hop_size {
-                                        analysis_buffer.drain(0..hop_size);
+                            ModemOutput::Midi(bytes) => {
+                                if let Some(conn) = &midi_conn {
+                                    if let Ok(mut c) = conn.lock() {
+                                        let _ = c.send(&bytes);
                                     }
                                 }
-                                _ => {
-                                    missed_symbol_count += 1;
-                                    if missed_symbol_count >= max_misses {
-                                        let _ = app_handle.emit(
-                                            "log",
-                                            LogEvent {
-                                                message: "Sync Lost (Missing Symbol)".into(),
-                                            },
-                                        );
-                                        decoder.reset_state();
-                                        missed_symbol_count = 0;
+                            }
+                            ModemOutput::LinkDead => {
+                                link_alive = false;
+                                let _ = app_handle.emit(
+                                    "alarm",
+                                    AlarmEvent {
+                                        kind: "link_dead".into(),
+                                        message: "Link dead — All Notes Off sent".into(),
+                                    },
+                                );
+                                let _ = app_handle.emit(
+                                    "log",
+                                    LogEvent {
+                                        message: "Link dead — All Notes Off".into(),
+                                    },
+                                );
+                            }
+                            ModemOutput::SyncLost => {
+                                sync_lost = sync_lost.saturating_add(1);
+                            }
+                            ModemOutput::Stats(stats) => {
+                                if last_stats_emit.elapsed() >= Duration::from_millis(200) {
+                                    let total = stats.crc_pass + stats.crc_fail;
+                                    let rate = if total == 0 {
+                                        100.0
+                                    } else {
+                                        100.0 * stats.crc_pass as f32 / total as f32
+                                    };
+                                    if matches!(stats.link_state, LinkState::Locked) {
+                                        link_alive = true;
                                     }
-                                    if analysis_buffer.len() >= hop_size {
-                                        analysis_buffer.drain(0..hop_size);
+                                    if matches!(stats.link_state, LinkState::Dead) {
+                                        link_alive = false;
                                     }
+                                    let _ = app_handle.emit(
+                                        "link_stats",
+                                        LinkStatsEvent {
+                                            state: link_state_str(stats.link_state).into(),
+                                            crc_pass: stats.crc_pass,
+                                            crc_fail: stats.crc_fail,
+                                            confidence_db: stats.last_confidence_db,
+                                            last_seq: stats.last_seq,
+                                            sync_lost,
+                                            crc_pass_rate: rate,
+                                            est_latency_ms: est_latency,
+                                            link_alive,
+                                            buffer_drops: drops.load(Ordering::Relaxed),
+                                        },
+                                    );
+                                    last_stats_emit = Instant::now();
                                 }
                             }
                         }
-                    } else {
-                        thread::sleep(Duration::from_millis(5));
                     }
                 }
 
-                // When loop exits, `stream` is dropped here.
                 let _ = app_handle.emit(
                     "log",
                     LogEvent {
-                        message: "Listener thread stopped.".into(),
+                        message: "Decoder stopped.".into(),
                     },
                 );
             }
@@ -298,20 +410,236 @@ fn start_listening(
                 let _ = app_handle.emit(
                     "log",
                     LogEvent {
-                        message: format!("Error setting up audio: {}", e),
+                        message: format!("Audio input error: {}", e),
                     },
                 );
             }
         }
+        gate.mark_stopped();
     });
 
     Ok(())
 }
 
 #[tauri::command]
-fn stop_listening(state: State<'_, AppState>) -> Result<(), String> {
-    state.is_listening.store(false, Ordering::SeqCst);
+fn stop_decoder(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(stop) = state.decode_stop.lock().unwrap().as_ref() {
+        stop.store(true, Ordering::SeqCst);
+    }
+    state.decode_gate.request_stop_and_wait();
     Ok(())
+}
+
+#[tauri::command]
+fn start_encoder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    audio_out: Option<usize>,
+    midi_in: Option<usize>,
+    profile: String,
+    simulate: bool,
+) -> Result<(), String> {
+    state.encode_gate.request_stop_and_wait();
+    if let Some(prev) = state.encode_stop.lock().unwrap().take() {
+        prev.store(true, Ordering::SeqCst);
+    }
+    state.encode_gate.request_stop_and_wait();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    *state.encode_stop.lock().unwrap() = Some(stop.clone());
+    state.encode_gate.stop.store(false, Ordering::SeqCst);
+    state.encode_gate.running.store(true, Ordering::SeqCst);
+
+    let gate = state.encode_gate.clone();
+    let app_handle = app.clone();
+
+    thread::spawn(move || {
+        let _ = app_handle.emit(
+            "log",
+            LogEvent {
+                message: format!("Starting encoder (profile={}, simulate={})...", profile, simulate),
+            },
+        );
+
+        let mut config = parse_profile(&profile);
+        let est_latency = config.estimated_first_copy_ms();
+        let preferred_sample_rate = config.sample_rate_hz;
+        let heartbeat_ms = config.heartbeat_interval_ms as u64;
+
+        let pending: Arc<Mutex<VecDeque<TransportMessage>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+
+        // Keep MIDI connection alive for the thread lifetime
+        let _midi_conn = if let Some(idx) = midi_in {
+            match open_midi_in(idx, pending.clone()) {
+                Ok(c) => {
+                    let _ = app_handle.emit(
+                        "log",
+                        LogEvent {
+                            message: format!("MIDI in index {} connected.", idx),
+                        },
+                    );
+                    Some(c)
+                }
+                Err(e) => {
+                    let _ = app_handle.emit(
+                        "log",
+                        LogEvent {
+                            message: format!("MIDI in error: {}", e),
+                        },
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let drops = Arc::new(AtomicU64::new(0));
+        let ring = HeapRb::<f32>::new(preferred_sample_rate as usize * 4);
+        let (mut producer, mut consumer) = ring.split();
+
+        let stream_result = audio::setup_output_stream(
+            audio_out,
+            Some(preferred_sample_rate),
+            move |data: &mut [f32], channels: usize| {
+                for frame in data.chunks_mut(channels.max(1)) {
+                    let sample = consumer.pop().unwrap_or(0.0);
+                    for s in frame.iter_mut() {
+                        *s = sample;
+                    }
+                }
+            },
+        );
+
+        match stream_result {
+            Ok((stream, stream_sample_rate, channels)) => {
+                let _ = app_handle.emit(
+                    "log",
+                    LogEvent {
+                        message: format!(
+                            "Audio out {} Hz, {} ch. est latency {:.0} ms.",
+                            stream_sample_rate, channels, est_latency
+                        ),
+                    },
+                );
+                if stream_sample_rate != preferred_sample_rate {
+                    config = config.with_sample_rate(stream_sample_rate);
+                }
+                if let Err(e) = stream.play() {
+                    let _ = app_handle.emit(
+                        "log",
+                        LogEvent {
+                            message: format!("Failed to play output: {}", e),
+                        },
+                    );
+                    gate.mark_stopped();
+                    return;
+                }
+
+                let mut tx = AmlModemTx::new(config.clone());
+                let mut last_heartbeat = Instant::now();
+                let mut note_idx = 0usize;
+                let scale = [0u8, 2, 4, 5, 7, 9, 11, 12];
+                let mut last_sim = Instant::now() - Duration::from_secs(1);
+                let use_sim = simulate || midi_in.is_none();
+
+                while !stop.load(Ordering::SeqCst) {
+                    let msgs: Vec<TransportMessage> = {
+                        let mut q = pending.lock().unwrap();
+                        q.drain(..).collect()
+                    };
+                    for msg in msgs {
+                        let _ = app_handle.emit(
+                            "log",
+                            LogEvent {
+                                message: format!("TX {:?}", msg),
+                            },
+                        );
+                        push_audio(&mut producer, &tx.encode_message(&msg), &stop, &drops);
+                    }
+
+                    if use_sim && last_sim.elapsed() >= Duration::from_millis(1000) {
+                        let note = 60 + scale[note_idx % scale.len()];
+                        let on = TransportMessage::NoteOn {
+                            note,
+                            velocity: 100,
+                        };
+                        push_audio(&mut producer, &tx.encode_message(&on), &stop, &drops);
+                        let off = TransportMessage::NoteOff { note };
+                        push_audio(&mut producer, &tx.encode_message(&off), &stop, &drops);
+                        let _ = app_handle.emit(
+                            "log",
+                            LogEvent {
+                                message: format!("TX sim Note {}", note),
+                            },
+                        );
+                        note_idx += 1;
+                        last_sim = Instant::now();
+                    }
+
+                    if last_heartbeat.elapsed() >= Duration::from_millis(heartbeat_ms) {
+                        push_audio(&mut producer, &tx.encode_heartbeat(), &stop, &drops);
+                        last_heartbeat = Instant::now();
+                    }
+
+                    let d = drops.load(Ordering::Relaxed);
+                    if d > 0 && d % 1000 == 0 {
+                        let _ = app_handle.emit(
+                            "log",
+                            LogEvent {
+                                message: format!("Audio buffer drops: {}", d),
+                            },
+                        );
+                    }
+
+                    thread::sleep(Duration::from_millis(5));
+                }
+
+                let _ = app_handle.emit(
+                    "log",
+                    LogEvent {
+                        message: "Encoder stopped.".into(),
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = app_handle.emit(
+                    "log",
+                    LogEvent {
+                        message: format!("Audio output error: {}", e),
+                    },
+                );
+            }
+        }
+        gate.mark_stopped();
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_encoder(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(stop) = state.encode_stop.lock().unwrap().as_ref() {
+        stop.store(true, Ordering::SeqCst);
+    }
+    state.encode_gate.request_stop_and_wait();
+    Ok(())
+}
+
+// Back-compat aliases used by older frontend bindings during transition
+#[tauri::command]
+fn start_listening(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    device_index: Option<usize>,
+) -> Result<(), String> {
+    start_decoder(app, state, device_index, None, "robust".into())
+}
+
+#[tauri::command]
+fn stop_listening(state: State<'_, AppState>) -> Result<(), String> {
+    stop_decoder(state)
 }
 
 #[tauri::command]
@@ -320,147 +648,100 @@ fn start_test_sequence(
     state: State<'_, AppState>,
     device_index: Option<usize>,
 ) -> Result<(), String> {
-    state.is_playing.store(false, Ordering::SeqCst);
-    thread::sleep(Duration::from_millis(100));
-
-    state.is_playing.store(true, Ordering::SeqCst);
-    let keep_running = state.is_playing.clone();
-    let app_handle = app.clone();
-
-    thread::spawn(move || {
-        let _ = app_handle.emit(
-            "log",
-            LogEvent {
-                message: "Initializing test sequence...".into(),
-            },
-        );
-
-        let mut profile = ProfileDefinition::default_pro_clean();
-        profile.audio.ramp_ms.attack = 0.0;
-        let preferred_sample_rate = profile.audio.sample_rate_hz;
-
-        let ring = HeapRb::<f32>::new(preferred_sample_rate as usize * 2);
-        let (mut producer, mut consumer) = ring.split();
-
-        let stream_result = audio::setup_output_stream(
-            device_index,
-            Some(preferred_sample_rate),
-            move |data: &mut [f32]| {
-                for sample in data.iter_mut() {
-                    *sample = consumer.pop().unwrap_or(0.0);
-                }
-            },
-        );
-
-        match stream_result {
-            Ok((stream, stream_sample_rate)) => {
-                if stream_sample_rate != preferred_sample_rate {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!(
-                                "Output stream sample rate: {} Hz (preferred {} Hz). Using {} Hz.",
-                                stream_sample_rate, preferred_sample_rate, stream_sample_rate
-                            ),
-                        },
-                    );
-                } else {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!(
-                                "Output stream sample rate: {} Hz.",
-                                stream_sample_rate
-                            ),
-                        },
-                    );
-                }
-                profile.audio.sample_rate_hz = stream_sample_rate;
-                if let Err(e) = stream.play() {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!("Failed to play output: {}", e),
-                        },
-                    );
-                    return;
-                }
-
-                let encoder = Encoder::new(profile);
-                let mut note_idx = 0;
-                let scale = [0, 2, 4, 5, 7, 9, 11, 12];
-
-                while keep_running.load(Ordering::Relaxed) {
-                    let note_offset = scale[note_idx % scale.len()];
-                    let base_note = 60;
-                    let note = base_note + note_offset;
-
-                    let frame_symbols = vec![
-                        SymbolValue::Preamble,
-                        SymbolValue::Type(FrameType::NoteOn),
-                        SymbolValue::Note((note % 12) as u8),
-                        SymbolValue::Octave((note / 12) as u8),
-                        SymbolValue::Value(12),
-                    ];
-
-                    let samples = encoder.encode_frame(&frame_symbols);
-
-                    for sample in samples {
-                        let mut attempts = 0;
-                        while producer.is_full() {
-                            if !keep_running.load(Ordering::Relaxed) || attempts > 1000 {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(1));
-                            attempts += 1;
-                        }
-                        if !keep_running.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let _ = producer.push(sample);
-                    }
-
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!("Sent Note: {}", note),
-                        },
-                    );
-
-                    // Sleep between notes
-                    for _ in 0..10 {
-                        if !keep_running.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    note_idx += 1;
-                }
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: "Encoder thread stopped.".into(),
-                    },
-                );
-            }
-            Err(e) => {
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: format!("Error setting up output: {}", e),
-                    },
-                );
-            }
-        }
-    });
-
-    Ok(())
+    start_encoder(app, state, device_index, None, "robust".into(), true)
 }
 
 #[tauri::command]
 fn stop_playing(state: State<'_, AppState>) -> Result<(), String> {
-    state.is_playing.store(false, Ordering::SeqCst);
-    Ok(())
+    stop_encoder(state)
+}
+
+fn open_midi_out(index: usize) -> Result<midir::MidiOutputConnection, String> {
+    let midi_out = MidiOutput::new("aml decode out").map_err(|e| e.to_string())?;
+    let ports = midi_out.ports();
+    let port = ports
+        .get(index)
+        .ok_or_else(|| format!("MIDI out index {} not found", index))?;
+    midi_out
+        .connect(port, "aml out")
+        .map_err(|e| format!("MIDI connect: {}", e))
+}
+
+fn open_midi_in(
+    index: usize,
+    pending: Arc<Mutex<VecDeque<TransportMessage>>>,
+) -> Result<midir::MidiInputConnection<()>, String> {
+    let midi_in = MidiInput::new("aml encode in").map_err(|e| e.to_string())?;
+    let ports = midi_in.ports();
+    let port = ports
+        .get(index)
+        .ok_or_else(|| format!("MIDI in index {} not found", index))?;
+    midi_in
+        .connect(
+            port,
+            "aml in",
+            move |_stamp, message, _| {
+                if let Some(msg) = midi_to_message(message) {
+                    if let Ok(mut q) = pending.lock() {
+                        q.push_back(msg);
+                    }
+                }
+            },
+            (),
+        )
+        .map_err(|e| format!("MIDI connect: {}", e))
+}
+
+fn push_audio(
+    producer: &mut ringbuf::HeapProducer<f32>,
+    samples: &[f32],
+    stop: &AtomicBool,
+    drops: &AtomicU64,
+) {
+    for &sample in samples {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut attempts = 0;
+        while producer.is_full() {
+            if stop.load(Ordering::Relaxed) || attempts > 2000 {
+                drops.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+            attempts += 1;
+        }
+        if producer.push(sample).is_err() {
+            drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn link_state_str(state: LinkState) -> &'static str {
+    match state {
+        LinkState::Search => "Search",
+        LinkState::Locked => "Locked",
+        LinkState::Dead => "Dead",
+    }
+}
+
+fn format_message(msg: &TransportMessage) -> (String, String) {
+    match msg {
+        TransportMessage::NoteOn { note, velocity } => (
+            "NoteOn".into(),
+            format!("note={} vel={}", note, velocity),
+        ),
+        TransportMessage::NoteOff { note } => ("NoteOff".into(), format!("note={}", note)),
+        TransportMessage::ProgramChange { program } => {
+            ("ProgramChange".into(), format!("program={}", program))
+        }
+        TransportMessage::MscLite { cmd, cuelist, cue } => (
+            "MscLite".into(),
+            format!("{:?} cuelist={} cue={}", cmd, cuelist, cue),
+        ),
+        TransportMessage::Heartbeat => ("Heartbeat".into(), String::new()),
+        TransportMessage::Panic => ("Panic".into(), String::new()),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -468,12 +749,24 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
-            is_listening: Arc::new(AtomicBool::new(false)),
-            is_playing: Arc::new(AtomicBool::new(false)),
+            decode_gate: Arc::new(WorkerGate::new()),
+            encode_gate: Arc::new(WorkerGate::new()),
+            decode_stop: Mutex::new(None),
+            encode_stop: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_input_devices,
             get_output_devices,
+            get_midi_inputs,
+            get_midi_outputs,
+            get_settings,
+            set_settings,
+            get_profile_info,
+            run_self_test,
+            start_decoder,
+            stop_decoder,
+            start_encoder,
+            stop_encoder,
             start_listening,
             stop_listening,
             start_test_sequence,

@@ -1,5 +1,5 @@
-use crate::profile::ProfileDefinition;
-use crate::protocol::{FrameType, MscCommand, SymbolValue};
+use crate::phy_v1::profile::ProfileDefinition;
+use crate::phy_v1::protocol::{FrameType, MscCommand, SymbolValue};
 use std::f32::consts::PI;
 
 #[derive(Debug, Clone, PartialEq)]

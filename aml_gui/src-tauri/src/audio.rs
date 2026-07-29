@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 
 pub fn list_input_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
@@ -19,17 +19,17 @@ pub fn list_output_devices() -> Result<Vec<String>> {
     Ok(devices)
 }
 
+/// Callback receives interleaved buffer and channel count. Use channel 0 only.
 pub fn setup_input_stream<F>(
     device_index: Option<usize>,
     preferred_sample_rate: Option<u32>,
     mut on_audio: F,
-) -> Result<(cpal::Stream, u32)>
+) -> Result<(cpal::Stream, u32, usize)>
 where
-    F: FnMut(&[f32]) + Send + 'static,
+    F: FnMut(&[f32], usize) + Send + 'static,
 {
     let host = cpal::default_host();
 
-    // Select device
     let device = if let Some(index) = device_index {
         host.input_devices()?
             .nth(index)
@@ -39,7 +39,6 @@ where
             .ok_or_else(|| anyhow!("No default input device available"))?
     };
 
-    // Configure stream
     let default_config = device.default_input_config()?;
     let default_sample_format = default_config.sample_format();
     let default_channels = default_config.channels();
@@ -70,14 +69,16 @@ where
     let sample_format = selected_config.sample_format();
     let stream_config: cpal::StreamConfig = selected_config.into();
     let sample_rate = stream_config.sample_rate.0;
+    let channels = stream_config.channels as usize;
 
     let err_fn = |err| eprintln!("an error occurred on input stream: {}", err);
+    let ch = channels;
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &stream_config,
             move |data: &[f32], _: &_| {
-                on_audio(data);
+                on_audio(data, ch);
             },
             err_fn,
             None,
@@ -85,9 +86,8 @@ where
         cpal::SampleFormat::I16 => device.build_input_stream(
             &stream_config,
             move |data: &[i16], _: &_| {
-                // Convert i16 to f32
                 let buffer: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                on_audio(&buffer);
+                on_audio(&buffer, ch);
             },
             err_fn,
             None,
@@ -95,12 +95,11 @@ where
         cpal::SampleFormat::U16 => device.build_input_stream(
             &stream_config,
             move |data: &[u16], _: &_| {
-                // Convert u16 to f32
                 let buffer: Vec<f32> = data
                     .iter()
                     .map(|&s| (s as f32 - u16::MAX as f32 / 2.0) / (u16::MAX as f32 / 2.0))
                     .collect();
-                on_audio(&buffer);
+                on_audio(&buffer, ch);
             },
             err_fn,
             None,
@@ -108,20 +107,19 @@ where
         _ => return Err(anyhow!("Unsupported sample format: {}", sample_format)),
     };
 
-    Ok((stream, sample_rate))
+    Ok((stream, sample_rate, channels))
 }
 
 pub fn setup_output_stream<F>(
     device_index: Option<usize>,
     preferred_sample_rate: Option<u32>,
     mut on_audio: F,
-) -> Result<(cpal::Stream, u32)>
+) -> Result<(cpal::Stream, u32, usize)>
 where
-    F: FnMut(&mut [f32]) + Send + 'static,
+    F: FnMut(&mut [f32], usize) + Send + 'static,
 {
     let host = cpal::default_host();
 
-    // Select device
     let device = if let Some(index) = device_index {
         host.output_devices()?
             .nth(index)
@@ -131,7 +129,6 @@ where
             .ok_or_else(|| anyhow!("No default output device available"))?
     };
 
-    // Configure stream
     let default_config = device.default_output_config()?;
     let default_sample_format = default_config.sample_format();
     let default_channels = default_config.channels();
@@ -162,14 +159,16 @@ where
     let sample_format = selected_config.sample_format();
     let stream_config: cpal::StreamConfig = selected_config.into();
     let sample_rate = stream_config.sample_rate.0;
+    let channels = stream_config.channels as usize;
 
     let err_fn = |err| eprintln!("an error occurred on output stream: {}", err);
+    let ch = channels;
 
     let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_output_stream(
             &stream_config,
             move |data: &mut [f32], _: &_| {
-                on_audio(data);
+                on_audio(data, ch);
             },
             err_fn,
             None,
@@ -178,7 +177,7 @@ where
             &stream_config,
             move |data: &mut [i16], _: &_| {
                 let mut buffer = vec![0.0; data.len()];
-                on_audio(&mut buffer);
+                on_audio(&mut buffer, ch);
                 for (i, sample) in buffer.into_iter().enumerate() {
                     data[i] = (sample * i16::MAX as f32) as i16;
                 }
@@ -190,7 +189,7 @@ where
             &stream_config,
             move |data: &mut [u16], _: &_| {
                 let mut buffer = vec![0.0; data.len()];
-                on_audio(&mut buffer);
+                on_audio(&mut buffer, ch);
                 for (i, sample) in buffer.into_iter().enumerate() {
                     data[i] = ((sample * (u16::MAX as f32 / 2.0)) + (u16::MAX as f32 / 2.0)) as u16;
                 }
@@ -201,5 +200,5 @@ where
         _ => return Err(anyhow!("Unsupported sample format: {}", sample_format)),
     };
 
-    Ok((stream, sample_rate))
+    Ok((stream, sample_rate, channels))
 }

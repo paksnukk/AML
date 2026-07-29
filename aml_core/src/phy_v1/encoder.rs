@@ -1,5 +1,5 @@
-use crate::profile::ProfileDefinition;
-use crate::protocol::SymbolValue;
+use crate::phy_v1::profile::ProfileDefinition;
+use crate::phy_v1::protocol::SymbolValue;
 use std::f32::consts::PI;
 
 pub struct Encoder {
