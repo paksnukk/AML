@@ -6,6 +6,9 @@ use std::collections::VecDeque;
 pub enum LinkState {
     Search,
     Locked,
+    /// No valid packet within `link_dead_ms` after the link was alive. Never
+    /// produced by `ModemRx` (phy lock only); set by `AmlModemRx`, which owns
+    /// link-dead detection.
     Dead,
 }
 
@@ -19,13 +22,16 @@ pub struct DemodResult {
 #[derive(Debug, Clone)]
 pub enum RxEvent {
     /// Demodulated body nibble after a successful preamble lock.
-    BodyNibble(DemodResult),
+    /// `end_sample` is the absolute stream position (samples pushed since
+    /// creation) one past the symbol period the nibble was read from.
+    BodyNibble {
+        result: DemodResult,
+        end_sample: u64,
+    },
     /// Preamble acquired; body collection starts.
     PreambleLocked { confidence_db: f32 },
     /// Lost lock mid-packet.
     SyncLost,
-    /// Link considered dead (no traffic within timeout after prior lock).
-    LinkDead,
     Metrics {
         state: LinkState,
         confidence_db: f32,
@@ -48,8 +54,8 @@ pub struct ModemRx {
     buffer: VecDeque<f32>,
     phase: RxPhase,
     link_state: LinkState,
-    samples_since_valid: u64,
-    ever_locked: bool,
+    /// Total samples pushed since creation (never reset).
+    samples_pushed: u64,
     last_confidence_db: f32,
     /// Expected body nibble count for the current packet (set by caller via `expect_body_nibbles`).
     expected_body_nibbles: usize,
@@ -64,8 +70,7 @@ impl ModemRx {
             buffer: VecDeque::with_capacity(4096),
             phase: RxPhase::Search,
             link_state: LinkState::Search,
-            samples_since_valid: 0,
-            ever_locked: false,
+            samples_pushed: 0,
             last_confidence_db: 0.0,
             expected_body_nibbles: 16, // default; encoder pads to multiple of interleave depth
         }
@@ -91,15 +96,24 @@ impl ModemRx {
         self.phase = RxPhase::Search;
         self.link_state = LinkState::Search;
         self.buffer.clear();
-        self.samples_since_valid = 0;
-        self.ever_locked = false;
+    }
+
+    /// Total samples pushed since creation (absolute stream position of the
+    /// input head).
+    pub fn samples_pushed(&self) -> u64 {
+        self.samples_pushed
+    }
+
+    /// Absolute stream position of the first sample still buffered.
+    fn stream_position(&self) -> u64 {
+        self.samples_pushed - self.buffer.len() as u64
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
         for &s in samples {
             self.buffer.push_back(s);
         }
-        self.samples_since_valid = self.samples_since_valid.saturating_add(samples.len() as u64);
+        self.samples_pushed += samples.len() as u64;
         self.process()
     }
 
@@ -108,17 +122,6 @@ impl ModemRx {
         let sym = self.config.symbol_samples();
         let period = self.config.samples_per_symbol_period();
         let hop = self.config.hop_samples();
-        let dead_samples =
-            (self.config.link_dead_ms as u64) * (self.config.sample_rate_hz as u64) / 1000;
-
-        if self.ever_locked
-            && self.link_state != LinkState::Dead
-            && self.samples_since_valid > dead_samples
-        {
-            self.link_state = LinkState::Dead;
-            self.phase = RxPhase::Search;
-            events.push(RxEvent::LinkDead);
-        }
 
         loop {
             match self.phase {
@@ -172,8 +175,6 @@ impl ModemRx {
                                     expected: self.expected_body_nibbles,
                                 };
                                 self.link_state = LinkState::Locked;
-                                self.ever_locked = true;
-                                self.samples_since_valid = 0;
                                 events.push(RxEvent::PreambleLocked {
                                     confidence_db: det.confidence_db,
                                 });
@@ -204,8 +205,10 @@ impl ModemRx {
                         {
                             self.consume(period);
                             self.last_confidence_db = det.confidence_db;
-                            self.samples_since_valid = 0;
-                            events.push(RxEvent::BodyNibble(det));
+                            events.push(RxEvent::BodyNibble {
+                                result: det,
+                                end_sample: self.stream_position(),
+                            });
                             let next = collected + 1;
                             if next >= expected {
                                 self.phase = RxPhase::Search;

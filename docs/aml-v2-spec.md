@@ -94,7 +94,17 @@ Block interleave with depth **4** over the packet nibble stream
 ### 4.4 Repetition
 
 Each packet is transmitted **K = 2** times (full preamble + interleaved body each time).
-The receiver accepts the first CRC-valid copy and suppresses duplicates with the same `SEQ`.
+The receiver accepts the first CRC-valid copy and suppresses later copies: a CRC-valid packet is
+dropped only if its packet bytes (same `SEQ`, type and payload) equal a packet accepted within the
+dedup window, measured in received samples:
+
+```
+repetition = (len(preamble) + 16 + 1) symbol periods      # preamble + body + inter-repetition gap
+window     = K × repetition + repetition / 2              # Robust ≈ 341 ms, Fast ≈ 86 ms
+```
+
+A packet with the same `SEQ` but a different payload, or one arriving after the window (TX restart,
+`SEQ` wrap), is delivered. The dedup history is cleared on link-dead.
 
 ### 4.5 On-wire order (one repetition)
 
@@ -126,14 +136,21 @@ Velocity and program use full 7-bit resolution (unlike V1 4-bit quantization).
 | NoteOn | `0x90, note, velocity` (velocity 0 treated as NoteOff) |
 | NoteOff | `0x80, note, 0x40` |
 | ProgramChange | `0xC0, program` |
-| Panic / link-dead | All Notes Off: `0xB0, 0x7B, 0x00` |
+| Panic / link-dead | Fail-safe burst, two messages in order: Sustain off `0xB0, 0x40, 0x00`, then All Notes Off `0xB0, 0x7B, 0x00` |
 | MscLite | Application-defined in POC (logged / evented; not SysEx) |
 
 ### 5.2 Fail-safe
 
 - Encoder emits Heartbeat every **500 ms** while running
-- Decoder marks link **dead** if no valid packet for **2000 ms** after having been locked
-- On link-dead or Panic: emit All Notes Off and reset decoder to search
+- Decoder marks link **dead** if no CRC-valid packet for **2000 ms** after the first valid packet.
+  This is the only link-dead detector. It is timed in received samples: it fires at sample
+  `end of last valid packet + 2000 ms`, independent of how audio is chunked, and is reported in the
+  processing call whose input contains that sample. It fires once per event; the next valid packet
+  re-arms it. Link state reads **Dead** from that moment until the next valid packet.
+- On link-dead or Panic: emit the fail-safe burst (§5.1) exactly once. The demodulator is already
+  back in search after each packet / during silence; its buffer is not flushed. Link-dead also clears
+  the dedup history (§4.4). A Panic is a valid packet, so a link that goes silent after it later
+  produces its own link-dead burst.
 - Bad-CRC / incomplete frames are discarded; return to search
 
 ## 6. Profiles

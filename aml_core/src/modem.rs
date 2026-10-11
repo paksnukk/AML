@@ -4,8 +4,9 @@ use crate::link::{
 };
 use crate::phy::{LinkState, ModemRx, ModemTx, PhyConfig, RxEvent};
 use crate::transport::{
-    message_to_midi, FailSafeAction, FailSafeMonitor, MessageType, TransportMessage,
+    fail_safe_burst, message_to_midi, FailSafeMonitor, MessageType, TransportMessage,
 };
+use std::collections::VecDeque;
 
 /// Fixed interleaved body size so RX can lock without knowing the type early.
 pub const MAX_BODY_NIBBLES: usize = 16;
@@ -89,7 +90,32 @@ impl AmlModemTx {
     }
 }
 
+/// Samples one on-wire repetition occupies: preamble + body symbol periods
+/// plus the one-period gap `AmlModemTx` inserts after each repetition.
+pub fn repetition_samples(config: &PhyConfig) -> u64 {
+    ((config.preamble.len() + MAX_BODY_NIBBLES + 1) * config.samples_per_symbol_period()) as u64
+}
+
+/// Duplicate-suppression window in samples (docs/aml-v2-spec.md §4.4): one
+/// full transmission of K repetitions plus half a repetition of margin.
+/// Robust: (2 + 0.5) x 6552 = 16380 samples (~341 ms @ 48 kHz);
+/// Fast: (1 + 0.5) x 2736 = 4104 samples (~86 ms).
+pub fn dedup_window_samples(config: &PhyConfig) -> u64 {
+    let rep = repetition_samples(config);
+    rep * config.repetition_k.max(1) as u64 + rep / 2
+}
+
 /// High-level RX: audio samples → transport messages + fail-safe.
+///
+/// Link state: `ModemRx` reports phy lock (`Search` / `Locked`); this type
+/// owns link-dead. `stats().link_state` is `Dead` from the moment link-dead
+/// fires until the next CRC-valid packet.
+///
+/// Link-dead timing is in absolute stream samples (see [`FailSafeMonitor`]):
+/// it fires at sample `end_of_last_valid_packet + link_dead_ms`, independent
+/// of chunking. It is reported by the `push_samples` call whose input contains
+/// that sample (resolution: one chunk); the exact sample is available from
+/// [`AmlModemRx::last_link_dead_sample`].
 pub struct AmlModemRx {
     phy: ModemRx,
     config: PhyConfig,
@@ -99,6 +125,11 @@ pub struct AmlModemRx {
     crc_pass: u64,
     crc_fail: u64,
     fail_safe: FailSafeMonitor,
+    link_dead: bool,
+    last_link_dead_sample: Option<u64>,
+    /// Recently accepted packets (raw bytes, end sample) for duplicate suppression.
+    recent: VecDeque<(Vec<u8>, u64)>,
+    dedup_window: u64,
 }
 
 impl AmlModemRx {
@@ -106,6 +137,7 @@ impl AmlModemRx {
         let mut phy = ModemRx::new(config.clone());
         phy.set_expected_body_nibbles(MAX_BODY_NIBBLES);
         let fail_safe = FailSafeMonitor::new(config.link_dead_ms, config.sample_rate_hz);
+        let dedup_window = dedup_window_samples(&config);
         Self {
             phy,
             config,
@@ -115,12 +147,20 @@ impl AmlModemRx {
             crc_pass: 0,
             crc_fail: 0,
             fail_safe,
+            link_dead: false,
+            last_link_dead_sample: None,
+            recent: VecDeque::new(),
+            dedup_window,
         }
     }
 
     pub fn stats(&self) -> ModemStats {
         ModemStats {
-            link_state: self.phy.link_state(),
+            link_state: if self.link_dead {
+                LinkState::Dead
+            } else {
+                self.phy.link_state()
+            },
             crc_pass: self.crc_pass,
             crc_fail: self.crc_fail,
             last_confidence_db: self.phy.last_confidence_db(),
@@ -128,6 +168,18 @@ impl AmlModemRx {
         }
     }
 
+    /// Total samples pushed so far (absolute stream position).
+    pub fn samples_processed(&self) -> u64 {
+        self.phy.samples_pushed()
+    }
+
+    /// Stream sample at which the most recent link-dead fired.
+    pub fn last_link_dead_sample(&self) -> Option<u64> {
+        self.last_link_dead_sample
+    }
+
+    /// Hard reset of the decoder: phy back to search with its buffer flushed.
+    /// Not used internally (flushing would make timing depend on chunking).
     pub fn reset(&mut self) {
         self.phy.reset();
         self.body_nibbles.clear();
@@ -137,18 +189,6 @@ impl AmlModemRx {
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<ModemOutput> {
         let mut outputs = Vec::new();
 
-        for action in self.fail_safe.on_samples(samples.len()) {
-            match action {
-                FailSafeAction::AllNotesOff => {
-                    outputs.push(ModemOutput::Midi(FailSafeMonitor::midi_for_action(&action)));
-                    outputs.push(ModemOutput::LinkDead);
-                }
-                FailSafeAction::ResetDecoder => {
-                    self.reset();
-                }
-            }
-        }
-
         let events = self.phy.push_samples(samples);
         for ev in events {
             match ev {
@@ -156,14 +196,12 @@ impl AmlModemRx {
                     self.collecting = true;
                     self.body_nibbles.clear();
                 }
-                RxEvent::BodyNibble(det) => {
+                RxEvent::BodyNibble { result, end_sample } => {
                     if self.collecting {
-                        self.body_nibbles.push(det.nibble);
+                        self.body_nibbles.push(result.nibble);
                         if self.body_nibbles.len() >= MAX_BODY_NIBBLES {
                             self.collecting = false;
-                            if let Some(out) = self.try_decode_body() {
-                                outputs.extend(out);
-                            }
+                            self.try_decode_body(end_sample, &mut outputs);
                         }
                     }
                 }
@@ -172,22 +210,41 @@ impl AmlModemRx {
                     self.body_nibbles.clear();
                     outputs.push(ModemOutput::SyncLost);
                 }
-                RxEvent::LinkDead => {
-                    outputs.push(ModemOutput::Midi(
-                        FailSafeMonitor::midi_for_action(&FailSafeAction::AllNotesOff),
-                    ));
-                    outputs.push(ModemOutput::LinkDead);
-                    self.reset();
-                }
                 RxEvent::Metrics { .. } => {}
             }
         }
+        self.poll_fail_safe(self.phy.samples_pushed(), &mut outputs);
 
         outputs.push(ModemOutput::Stats(self.stats()));
         outputs
     }
 
-    fn try_decode_body(&mut self) -> Option<Vec<ModemOutput>> {
+    /// Fire link-dead if its deadline sample lies before stream position `now`.
+    /// Emits one fail-safe burst (CC64=0, CC123) and `LinkDead`, then clears
+    /// the duplicate history. The phy is not flushed: during silence it is
+    /// already searching, and a packet still in flight may revive the link.
+    fn poll_fail_safe(&mut self, now: u64, outputs: &mut Vec<ModemOutput>) {
+        if let Some(at) = self.fail_safe.poll(now) {
+            outputs.extend(fail_safe_burst().into_iter().map(ModemOutput::Midi));
+            outputs.push(ModemOutput::LinkDead);
+            self.link_dead = true;
+            self.last_link_dead_sample = Some(at);
+            self.recent.clear();
+        }
+    }
+
+    /// Duplicate if the same packet bytes (same SEQ, type and payload) were
+    /// accepted within the dedup window before `end`.
+    fn is_duplicate(&mut self, bytes: &[u8], end: u64) -> bool {
+        let window = self.dedup_window;
+        self.recent
+            .retain(|(_, at)| end.saturating_sub(*at) <= window);
+        self.recent.iter().any(|(b, _)| b.as_slice() == bytes)
+    }
+
+    /// Decode the collected body; the last body symbol ended at stream
+    /// position `end`.
+    fn try_decode_body(&mut self, end: u64, outputs: &mut Vec<ModemOutput>) {
         let depth = self.config.interleave_depth;
         let deinterleaved = deinterleave(&self.body_nibbles, depth);
         let bytes = nibbles_to_bytes(&deinterleaved);
@@ -196,49 +253,47 @@ impl AmlModemRx {
         // each valid message size from the HDR type.
         if bytes.len() < 4 {
             self.crc_fail += 1;
-            return None;
+            return;
         }
 
         let hdr = bytes[0];
         let type_nibble = hdr & 0x0F;
-        let msg_type = MessageType::from_u8(type_nibble)?;
+        let Some(msg_type) = MessageType::from_u8(type_nibble) else {
+            return;
+        };
         let needed = 2 + msg_type.payload_len() + 2;
         if bytes.len() < needed {
             self.crc_fail += 1;
-            return None;
+            return;
         }
         let slice = &bytes[..needed];
         match decode_packet_bytes(slice) {
             Ok(packet) => {
                 self.crc_pass += 1;
-                self.fail_safe.on_valid_packet();
+                // A deadline that passed before this packet ended fires first.
+                self.poll_fail_safe(end, outputs);
+                self.fail_safe.on_valid_packet(end);
+                self.link_dead = false;
 
-                // Duplicate suppression
-                if self.last_seq == Some(packet.seq) {
-                    return Some(Vec::new());
+                if self.is_duplicate(slice, end) {
+                    return;
                 }
+                self.recent.push_back((slice.to_vec(), end));
                 self.last_seq = Some(packet.seq);
 
-                let msg = TransportMessage::from_type_payload(packet.msg_type, &packet.payload)?;
-                let mut outs = Vec::new();
-
-                if matches!(msg, TransportMessage::Panic) {
-                    outs.push(ModemOutput::Midi(message_to_midi(&msg)));
-                    outs.push(ModemOutput::Message(msg));
-                    self.reset();
-                    return Some(outs);
-                }
-
-                let midi = message_to_midi(&msg);
-                if !midi.is_empty() {
-                    outs.push(ModemOutput::Midi(midi));
-                }
-                outs.push(ModemOutput::Message(msg));
-                Some(outs)
+                let Some(msg) =
+                    TransportMessage::from_type_payload(packet.msg_type, &packet.payload)
+                else {
+                    return;
+                };
+                // Panic: the burst below is the only one; the phy has finished
+                // this packet and is back in search. The duplicate history is
+                // kept so the next repetition of the Panic is suppressed.
+                outputs.extend(message_to_midi(&msg).into_iter().map(ModemOutput::Midi));
+                outputs.push(ModemOutput::Message(msg));
             }
             Err(_) => {
                 self.crc_fail += 1;
-                None
             }
         }
     }
