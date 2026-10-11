@@ -65,8 +65,20 @@ Used for packet acquisition and symbol-boundary alignment. The preamble replaces
   noise peaks at ≈0.09 (robust, N=288) / ≈0.18 (fast, N=144).
 - Decodes from 0 dB down to at least −30 dB relative to the 0.8-peak
   transmit level.
-- Search mode hops by `symbol_samples / 4`
+- Search mode hops by `hop = symbol_samples / 4`
+- **Fine alignment:** on a preamble[0] hit at window position `t`, the lock
+  position is the window start in `[t − hop, t + symbol_samples]` that maximizes
+  the preamble[0] tone's Goertzel power (backward range clamped to the end of the
+  last decoded packet). Coarse grid of `hop / 2`, then halving refinement to one
+  sample. Residual error on a clean signal: ≤ 1 sample at every start offset (both
+  profiles). The receiver waits until `t + symbol_samples + period` has been
+  received before deciding, so the result does not depend on input chunking.
 - After preamble lock, advance by `symbol_samples + gap_samples` per symbol
+- **Resync:** a failed lock attempt (preamble symbol mismatch or a body symbol
+  that fails the gate) rewinds: search resumes at `t + hop`, as if the window
+  that triggered the attempt had been rejected. Samples read during the attempt
+  are kept until it resolves (at most one packet), so a real preamble that starts
+  inside a false lock is still found.
 
 ## 4. Link layer
 

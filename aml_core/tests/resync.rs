@@ -1,0 +1,128 @@
+//! Resync hardening (v1.1 plan A7): recovery from false preamble locks and
+//! symbol-boundary alignment accuracy.
+
+mod support;
+
+use aml_core::modem::{AmlModemTx, MAX_BODY_NIBBLES};
+use aml_core::phy::{ModemRx, PhyConfig, RxEvent};
+use aml_core::transport::TransportMessage;
+use std::f32::consts::PI;
+use support::decode_chunked;
+
+fn profiles() -> Vec<(&'static str, PhyConfig)> {
+    vec![("robust", PhyConfig::robust()), ("fast", PhyConfig::fast())]
+}
+
+/// Steady tone at `config.tone_hz(nibble)` and the transmit amplitude.
+fn tone(config: &PhyConfig, nibble: u8, len: usize, phase: f32) -> Vec<f32> {
+    let w = 2.0 * PI * config.tone_hz(nibble) / config.sample_rate_hz as f32;
+    (0..len)
+        .map(|i| config.amplitude * (w * i as f32 + phase).sin())
+        .collect()
+}
+
+/// Lock position error in samples: end of the first body symbol period as
+/// reported by the receiver minus its true position, or `None` if the
+/// receiver never locked.
+fn first_body_error(config: &PhyConfig, offset: usize, chunk: usize) -> Option<i64> {
+    let msg = TransportMessage::NoteOn {
+        note: (offset % 128) as u8,
+        velocity: 100,
+    };
+    let mut audio = vec![0.0; offset];
+    audio.extend(AmlModemTx::new(config.clone()).encode_message_with_seq(&msg, 7));
+    audio.extend(vec![0.0; 4096]);
+
+    let mut rx = ModemRx::new(config.clone());
+    rx.set_expected_body_nibbles(MAX_BODY_NIBBLES);
+    let period = config.samples_per_symbol_period();
+    let truth = (offset + (config.preamble.len() + 1) * period) as i64;
+    for c in audio.chunks(chunk) {
+        for ev in rx.push_samples(c) {
+            if let RxEvent::BodyNibble { end_sample, .. } = ev {
+                return Some(end_sample as i64 - truth);
+            }
+        }
+    }
+    None
+}
+
+/// Residual symbol-boundary error after preamble fine alignment on a clean
+/// signal, over every start offset within two symbol periods. Must be at most
+/// hop / 8 (Robust 9, Fast 4 samples) and independent of chunking.
+#[test]
+fn fine_alignment_residual_error() {
+    let mut failures = Vec::new();
+    for (name, config) in profiles() {
+        let period = config.samples_per_symbol_period();
+        let bound = config.hop_samples().div_ceil(8) as i64;
+        for (chunk, step) in [(4096usize, 1usize), (64, 5)] {
+            let mut errs = Vec::new();
+            for offset in (0..2 * period).step_by(step) {
+                let err = first_body_error(&config, offset, chunk)
+                    .unwrap_or_else(|| panic!("[{name}] offset {offset}: no lock"));
+                errs.push((offset, err));
+            }
+            let max = errs.iter().map(|e| e.1.abs()).max().unwrap();
+            let mean = errs.iter().map(|e| e.1.abs() as f64).sum::<f64>() / errs.len() as f64;
+            let min_signed = errs.iter().map(|e| e.1).min().unwrap();
+            let max_signed = errs.iter().map(|e| e.1).max().unwrap();
+            println!(
+                "[{name}] chunk {chunk}: |err| max {max} mean {mean:.2} samples \
+                 (signed {min_signed}..{max_signed}, bound {bound}, hop {})",
+                config.hop_samples()
+            );
+            let worst: Vec<_> = errs.iter().filter(|e| e.1.abs() > bound).take(8).collect();
+            if !worst.is_empty() {
+                failures.push(format!(
+                    "[{name}] chunk {chunk}: residual alignment error max {max} > {bound} \
+                     samples; (offset, err): {worst:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A burst of the preamble[0] tone directly in front of a packet makes the
+/// receiver lock on the burst; the preamble check then fails part-way into
+/// the real packet's preamble. The receiver must rewind and still find the
+/// real packet (single repetition, so nothing else can save it).
+#[test]
+fn false_preamble_lock_before_packet_recovers() {
+    let mut failures = Vec::new();
+    let mut total = 0usize;
+    for (name, mut config) in profiles() {
+        config.repetition_k = 1;
+        let period = config.samples_per_symbol_period();
+        let msg = TransportMessage::NoteOn {
+            note: 64,
+            velocity: 99,
+        };
+        let packet = AmlModemTx::new(config.clone()).encode_message_with_seq(&msg, 3);
+        for burst_len in (period / 4..=2 * period).step_by(period / 8) {
+            for phase in [0.0f32, 1.3, 2.9] {
+                for (offset, chunk) in [(0usize, 4096usize), (37, 64), (period / 2, 240)] {
+                    total += 1;
+                    let mut audio = vec![0.0; offset + 500];
+                    audio.extend(tone(&config, config.preamble[0], burst_len, phase));
+                    audio.extend_from_slice(&packet);
+                    let got = decode_chunked(config.clone(), &audio, chunk);
+                    if got != [msg.clone()] {
+                        failures.push(format!(
+                            "[{name}] burst {burst_len} phase {phase} offset {offset} \
+                             chunk {chunk}: got {got:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}/{} cases lost the packet after a false lock:\n{}",
+        failures.len(),
+        total,
+        failures.join("\n")
+    );
+}
