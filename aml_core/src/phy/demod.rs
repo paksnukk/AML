@@ -123,8 +123,11 @@ impl ModemRx {
         loop {
             match self.phase {
                 RxPhase::Search => {
-                    // Need a full symbol+gap period so consumption stays on the grid.
-                    if self.buffer.len() < period {
+                    // Need the full fine-alignment search range (up to `hop`) plus a
+                    // full symbol+gap period behind it, so that a preamble[0] hit is
+                    // always aligned before locking. Deciding with less would make the
+                    // alignment depend on how the caller chunks its input.
+                    if self.buffer.len() < period + hop {
                         break;
                     }
                     let window: Vec<f32> = self.buffer.iter().take(sym).copied().collect();
@@ -135,7 +138,8 @@ impl ModemRx {
                         {
                             // Fine-align within hop window
                             let align = self.best_preamble0_offset(sym, hop);
-                            if align > 0 && align + period <= self.buffer.len() {
+                            debug_assert!(align <= hop && align + period <= self.buffer.len());
+                            if align > 0 {
                                 self.buffer.drain(0..align);
                                 continue;
                             }
