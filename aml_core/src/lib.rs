@@ -13,4 +13,4 @@ pub use modem::{
     MAX_BODY_NIBBLES,
 };
 pub use phy::{LinkState, PhyConfig};
-pub use transport::{FailSafeAction, MessageType, MscCommand, TransportMessage};
+pub use transport::{MessageType, MscCommand, TransportMessage};

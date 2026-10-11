@@ -1,0 +1,376 @@
+//! Fail-safe (link-dead, Panic) and duplicate-suppression tests.
+//! See docs/aml-v2-spec.md §4.4 and §5.2.
+
+mod support;
+
+use aml_core::link::{bytes_to_nibbles, encode_packet_bytes, interleave, Packet};
+use aml_core::modem::{AmlModemRx, AmlModemTx, ModemOutput, MAX_BODY_NIBBLES};
+use aml_core::phy::{LinkState, ModemTx, PhyConfig};
+use aml_core::transport::TransportMessage;
+use support::ChannelSim;
+
+const SUSTAIN_OFF: [u8; 3] = [0xB0, 0x40, 0x00];
+const ALL_NOTES_OFF: [u8; 3] = [0xB0, 0x7B, 0x00];
+const CHUNK_SIZES: [usize; 3] = [64, 240, 4096];
+
+/// One output together with the stream range `[start, end)` of the
+/// `push_samples` call that produced it.
+struct Ev {
+    start: usize,
+    end: usize,
+    out: ModemOutput,
+}
+
+fn feed(rx: &mut AmlModemRx, stream: &[f32], chunk: usize, base: usize) -> Vec<Ev> {
+    let mut evs = Vec::new();
+    let mut pos = base;
+    for c in stream.chunks(chunk) {
+        let start = pos;
+        pos += c.len();
+        for out in rx.push_samples(c) {
+            evs.push(Ev {
+                start,
+                end: pos,
+                out,
+            });
+        }
+    }
+    evs
+}
+
+fn silence(config: &PhyConfig, ms: usize) -> Vec<f32> {
+    vec![0.0; config.sample_rate_hz as usize * ms / 1000]
+}
+
+fn note_on(note: u8) -> TransportMessage {
+    TransportMessage::NoteOn {
+        note,
+        velocity: 100,
+    }
+}
+
+fn messages(evs: &[Ev]) -> Vec<TransportMessage> {
+    evs.iter()
+        .filter_map(|e| match &e.out {
+            ModemOutput::Message(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn count_midi(evs: &[Ev], bytes: &[u8]) -> usize {
+    evs.iter()
+        .filter(|e| matches!(&e.out, ModemOutput::Midi(b) if b.as_slice() == bytes))
+        .count()
+}
+
+fn link_dead_events(evs: &[Ev]) -> Vec<&Ev> {
+    evs.iter()
+        .filter(|e| matches!(e.out, ModemOutput::LinkDead))
+        .collect()
+}
+
+fn link_dead_samples(config: &PhyConfig) -> usize {
+    config.link_dead_ms as usize * config.sample_rate_hz as usize / 1000
+}
+
+/// Audio for one packet repetition whose CRC is broken but whose preamble and
+/// symbol timing are intact (the phy locks and collects a full body).
+fn bad_crc_repetition(config: &PhyConfig, seq: u8) -> Vec<f32> {
+    let msg = note_on(60);
+    let packet = Packet {
+        msg_type: msg.msg_type(),
+        seq,
+        payload: msg.to_payload(),
+    };
+    let mut bytes = encode_packet_bytes(&packet).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x5A;
+    let mut nibbles = bytes_to_nibbles(&bytes);
+    nibbles.resize(MAX_BODY_NIBBLES, 0);
+    let body = interleave(&nibbles, config.interleave_depth);
+    let mut audio = ModemTx::new(config.clone()).synthesize_framed(&body);
+    audio.resize(audio.len() + config.samples_per_symbol_period(), 0.0);
+    audio
+}
+
+#[test]
+fn link_dead_fires_once_sample_accurate_and_dead_state_visible() {
+    for (name, config) in [("robust", PhyConfig::robust()), ("fast", PhyConfig::fast())] {
+        let limit = link_dead_samples(&config);
+        let mut tx = AmlModemTx::new(config.clone());
+        let first = tx.encode_message(&note_on(60));
+        let mut stream = first.clone();
+        stream.extend(silence(&config, config.link_dead_ms as usize + 500));
+        let revive_at = stream.len();
+        stream.extend(tx.encode_message(&note_on(61)));
+        stream.extend(silence(&config, 300));
+        let stream = ChannelSim::new(config.clone(), 1)
+            .offset(123)
+            .apply(&stream);
+        let revive_at = revive_at + 123;
+
+        // Fire position: end of the last (second, for K=2) body + limit.
+        let last_body_end = 123 + first.len() - config.samples_per_symbol_period();
+        let expected = (last_body_end + limit) as u64;
+        let tolerance = config.hop_samples() as u64;
+
+        let mut fire_samples = Vec::new();
+        for chunk in CHUNK_SIZES {
+            let mut rx = AmlModemRx::new(config.clone());
+            let evs = feed(&mut rx, &stream, chunk, 0);
+            let label = format!("{name} chunk {chunk}");
+
+            let dead = link_dead_events(&evs);
+            assert_eq!(dead.len(), 1, "{label}: link-dead events");
+            assert_eq!(count_midi(&evs, &SUSTAIN_OFF), 1, "{label}: CC64=0 count");
+            assert_eq!(count_midi(&evs, &ALL_NOTES_OFF), 1, "{label}: CC123 count");
+            assert_eq!(messages(&evs), vec![note_on(60), note_on(61)], "{label}");
+
+            // Reported by the chunk containing the exact fire sample.
+            let fire = rx.last_link_dead_sample().expect("link-dead sample");
+            let (s, e) = (dead[0].start as u64, dead[0].end as u64);
+            assert!(
+                s <= fire && fire < e,
+                "{label}: fire {fire} outside [{s},{e})"
+            );
+            assert!(
+                fire.abs_diff(expected) <= tolerance,
+                "{label}: fire {fire}, expected {expected} ± {tolerance}"
+            );
+            fire_samples.push(fire);
+
+            // Dead from the link-dead output until the next accepted message.
+            let dead_idx = evs
+                .iter()
+                .position(|e| matches!(e.out, ModemOutput::LinkDead))
+                .unwrap();
+            let revive_idx = evs
+                .iter()
+                .position(|e| matches!(&e.out, ModemOutput::Message(m) if *m == note_on(61)))
+                .unwrap();
+            assert!(revive_idx > dead_idx);
+            for ev in &evs[dead_idx..revive_idx] {
+                if let ModemOutput::Stats(st) = &ev.out {
+                    assert_eq!(
+                        st.link_state,
+                        LinkState::Dead,
+                        "{label}: stats at {}",
+                        ev.end
+                    );
+                }
+            }
+            assert!(evs[revive_idx].end >= revive_at);
+            for ev in &evs[revive_idx..] {
+                if let ModemOutput::Stats(st) = &ev.out {
+                    assert_ne!(st.link_state, LinkState::Dead, "{label}: after revive");
+                }
+            }
+            assert_ne!(rx.stats().link_state, LinkState::Dead, "{label}");
+        }
+        // The fire sample does not depend on chunking.
+        assert!(
+            fire_samples.windows(2).all(|w| w[0] == w[1]),
+            "{name}: fire samples differ across chunk sizes: {fire_samples:?}"
+        );
+    }
+}
+
+#[test]
+fn no_link_dead_before_first_packet() {
+    let config = PhyConfig::robust();
+    let stream = ChannelSim::new(config.clone(), 7)
+        .snr_db(10.0)
+        .apply(&silence(&config, 3 * config.link_dead_ms as usize));
+    for chunk in CHUNK_SIZES {
+        let mut rx = AmlModemRx::new(config.clone());
+        let evs = feed(&mut rx, &stream, chunk, 0);
+        assert!(link_dead_events(&evs).is_empty(), "chunk {chunk}");
+        assert_eq!(count_midi(&evs, &ALL_NOTES_OFF), 0, "chunk {chunk}");
+        assert_ne!(rx.stats().link_state, LinkState::Dead, "chunk {chunk}");
+    }
+}
+
+/// A valid packet, then > link_dead_ms of bad-CRC traffic (the phy keeps
+/// locking), then silence: exactly one link-dead burst.
+#[test]
+fn bad_crc_traffic_then_silence_single_burst() {
+    let config = PhyConfig::robust();
+    let mut tx = AmlModemTx::new(config.clone());
+    let mut stream = tx.encode_message(&note_on(60));
+    let target = stream.len() + link_dead_samples(&config) * 3 / 2;
+    let mut seq = 1u8;
+    while stream.len() < target {
+        stream.extend(bad_crc_repetition(&config, seq));
+        stream.extend(silence(&config, 50));
+        seq = seq.wrapping_add(1);
+    }
+    stream.extend(silence(&config, 3 * config.link_dead_ms as usize));
+    for chunk in CHUNK_SIZES {
+        let mut rx = AmlModemRx::new(config.clone());
+        let evs = feed(&mut rx, &stream, chunk, 0);
+        assert!(
+            rx.stats().crc_fail > 5,
+            "chunk {chunk}: bad-CRC traffic decoded"
+        );
+        assert_eq!(
+            link_dead_events(&evs).len(),
+            1,
+            "chunk {chunk}: link-dead events"
+        );
+        assert_eq!(
+            count_midi(&evs, &ALL_NOTES_OFF),
+            1,
+            "chunk {chunk}: CC123 count"
+        );
+        assert_eq!(
+            count_midi(&evs, &SUSTAIN_OFF),
+            1,
+            "chunk {chunk}: CC64=0 count"
+        );
+    }
+}
+
+#[test]
+fn panic_emits_exactly_one_burst() {
+    let config = PhyConfig::robust();
+    let mut tx = AmlModemTx::new(config.clone());
+    let mut stream = tx.encode_message(&TransportMessage::Panic);
+    // Up to just before the link-dead deadline that the Panic packet armed.
+    let quiet_ms = config.link_dead_ms as usize - 100;
+    stream.extend(silence(&config, quiet_ms));
+    let quiet_end = stream.len();
+    stream.extend(silence(&config, config.link_dead_ms as usize));
+    for chunk in CHUNK_SIZES {
+        let mut rx = AmlModemRx::new(config.clone());
+        let evs = feed(&mut rx, &stream, chunk, 0);
+        let (before, after): (Vec<&Ev>, Vec<&Ev>) =
+            evs.iter().partition(|e| e.end <= quiet_end - chunk);
+        assert_eq!(
+            messages_ref(&before),
+            vec![TransportMessage::Panic],
+            "chunk {chunk}"
+        );
+        assert_eq!(
+            count_midi_ref(&before, &ALL_NOTES_OFF),
+            1,
+            "chunk {chunk}: Panic CC123"
+        );
+        assert_eq!(
+            count_midi_ref(&before, &SUSTAIN_OFF),
+            1,
+            "chunk {chunk}: Panic CC64=0"
+        );
+        assert!(
+            before
+                .iter()
+                .all(|e| !matches!(e.out, ModemOutput::LinkDead)),
+            "chunk {chunk}: link-dead shortly after Panic"
+        );
+        // The link going silent afterwards is its own (single) link-dead event.
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| matches!(e.out, ModemOutput::LinkDead))
+                .count(),
+            1,
+            "chunk {chunk}: later link-dead"
+        );
+        assert_eq!(count_midi_ref(&after, &ALL_NOTES_OFF), 1, "chunk {chunk}");
+    }
+}
+
+fn messages_ref(evs: &[&Ev]) -> Vec<TransportMessage> {
+    evs.iter()
+        .filter_map(|e| match &e.out {
+            ModemOutput::Message(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn count_midi_ref(evs: &[&Ev], bytes: &[u8]) -> usize {
+    evs.iter()
+        .filter(|e| matches!(&e.out, ModemOutput::Midi(b) if b.as_slice() == bytes))
+        .count()
+}
+
+fn decode_stream(config: &PhyConfig, stream: &[f32], chunk: usize) -> Vec<TransportMessage> {
+    let mut s = stream.to_vec();
+    s.extend(silence(config, 300));
+    let mut rx = AmlModemRx::new(config.clone());
+    messages(&feed(&mut rx, &s, chunk, 0))
+}
+
+#[test]
+fn dedup_repetitions_delivered_once() {
+    let config = PhyConfig::robust();
+    assert_eq!(config.repetition_k, 2);
+    let mut tx = AmlModemTx::new(config.clone());
+    let msgs = [
+        note_on(60),
+        TransportMessage::NoteOff { note: 60 },
+        note_on(62),
+    ];
+    let mut stream = Vec::new();
+    for m in &msgs {
+        stream.extend(tx.encode_message(m));
+        stream.extend(silence(&config, 20));
+    }
+    for chunk in CHUNK_SIZES {
+        assert_eq!(
+            decode_stream(&config, &stream, chunk),
+            msgs.to_vec(),
+            "chunk {chunk}"
+        );
+    }
+}
+
+#[test]
+fn dedup_tx_restart_delivers_all() {
+    let config = PhyConfig::robust();
+    // Scenario 1: seq 0..3, restart, seq 0..3 again (identical messages).
+    let first: Vec<TransportMessage> = (0..4).map(|i| note_on(60 + i)).collect();
+    // Scenario 2: last packet seen before the restart had seq 0 and the
+    // first packet after it is the same message with seq 0.
+    let cases: [(&str, Vec<TransportMessage>); 2] =
+        [("seq 0..3", first), ("single seq 0", vec![note_on(60)])];
+    for (name, msgs) in cases {
+        let mut stream = Vec::new();
+        for _ in 0..2 {
+            let mut tx = AmlModemTx::new(config.clone());
+            for m in &msgs {
+                stream.extend(tx.encode_message(m));
+                stream.extend(silence(&config, 20));
+            }
+            // Pause longer than the dedup window, shorter than link-dead.
+            stream.extend(silence(&config, 600));
+        }
+        let mut expected = msgs.clone();
+        expected.extend(msgs.clone());
+        for chunk in CHUNK_SIZES {
+            assert_eq!(
+                decode_stream(&config, &stream, chunk),
+                expected,
+                "{name} chunk {chunk}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dedup_same_seq_different_payload_delivered() {
+    let config = PhyConfig::robust();
+    let tx = AmlModemTx::new(config.clone());
+    let a = note_on(60);
+    let b = TransportMessage::NoteOff { note: 60 };
+    let mut stream = tx.encode_message_with_seq(&a, 5);
+    stream.extend(tx.encode_message_with_seq(&b, 5));
+    for chunk in CHUNK_SIZES {
+        assert_eq!(
+            decode_stream(&config, &stream, chunk),
+            vec![a.clone(), b.clone()],
+            "chunk {chunk}"
+        );
+    }
+}
