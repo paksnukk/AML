@@ -46,8 +46,25 @@ Used for packet acquisition and symbol-boundary alignment. The preamble replaces
 ### 3.2 Detection
 
 - Goertzel bank over the 16 tone frequencies on each symbol window
-- Accept symbol if best power exceeds absolute floor **and**
-  `10 * log10(best / runner_up) >= min_confidence_db` (default 3.0 dB)
+  (`N` = `symbol_samples`)
+- Detection is level-independent. A symbol is accepted only if all hold:
+  1. **Silence floor:** window RMS `>= min_rms_dbfs` (−60 dBFS; full-scale
+     sine = −3 dBFS). Quieter windows are never detected.
+  2. **Tone purity:** `purity = P_best / (E * N / 2) >= min_tone_purity`,
+     where `P_best` is the best tone's Goertzel power and `E = sum(x^2)` the
+     window energy. A steady sinusoid filling the window on the target
+     frequency gives `P = (A N / 2)^2` and `E = A^2 N / 2`, so purity ≈ 1.0 at
+     any amplitude; ramps, misalignment, other tones and noise lower it
+     (white noise ≈ `2 / N` per bin). Thresholds: 0.25 robust, 0.30 fast.
+  3. **Confidence:** `10 * log10(best / runner_up) >= min_confidence_db`
+     (default 3.0 dB) for the first preamble symbol; `0.5 * min_confidence_db`
+     for the remaining preamble symbols and body symbols.
+- Measured purity of synthesized symbols (both profiles): ≈0.97 aligned
+  (attack/release ramps), ≈0.91 aligned at SNR 12 dB, ≥0.57 (fast) / ≥0.80
+  (robust) at ±hop/2 misalignment, ≥0.43 at ±hop; best-bin purity of white
+  noise peaks at ≈0.09 (robust, N=288) / ≈0.18 (fast, N=144).
+- Decodes from 0 dB down to at least −30 dB relative to the 0.8-peak
+  transmit level.
 - Search mode hops by `symbol_samples / 4`
 - After preamble lock, advance by `symbol_samples + gap_samples` per symbol
 
@@ -157,7 +174,7 @@ For clean dedicated chains only (LTC-like mental model: no EQ/comp/limiter on th
 | Preamble | `[0xA, 0x5]` (2 symbols) |
 | Repetition K | 1 |
 | Confidence | 2.0 dB |
-| Absolute power floor | 20 |
+| Min tone purity | 0.30 |
 
 First-copy on-wire for max body ≈ **54 ms** (2 + 16 symbols × 3 ms).
 

@@ -1,5 +1,13 @@
 //! Robust-profile physical-layer parameters (see docs/aml-v2-spec.md).
 
+// Tone-purity thresholds (see `goertzel::tone_purity`). Measured on
+// synthesized symbols: ~0.97 aligned, ~0.91 aligned at SNR 12 dB, >= 0.43 at a
+// full search hop of misalignment (>= 0.39 at SNR 12 dB). White-noise windows
+// peak at ~0.09 (robust, N = 288) and ~0.18 (fast, N = 144), so fast needs the
+// higher threshold to keep margin above noise.
+const PURITY_ROBUST: f32 = 0.25;
+const PURITY_FAST: f32 = 0.3;
+
 #[derive(Debug, Clone)]
 pub struct PhyConfig {
     pub sample_rate_hz: u32,
@@ -13,7 +21,12 @@ pub struct PhyConfig {
     pub n_tones: usize,
     pub preamble: Vec<u8>,
     pub min_confidence_db: f32,
-    pub absolute_power_min: f32,
+    /// Minimum level-independent tone purity (Goertzel power normalized by
+    /// window energy, see `goertzel::tone_purity`; 1.0 = pure steady tone).
+    pub min_tone_purity: f32,
+    /// Silence floor: windows whose RMS is below this (dBFS, full-scale sine
+    /// = -3 dBFS) are never detected as symbols.
+    pub min_rms_dbfs: f32,
     pub repetition_k: usize,
     pub interleave_depth: usize,
     pub link_dead_ms: u32,
@@ -40,7 +53,8 @@ impl PhyConfig {
             n_tones: 16,
             preamble: vec![0xA, 0x5, 0xC, 0x3],
             min_confidence_db: 3.0,
-            absolute_power_min: 50.0,
+            min_tone_purity: PURITY_ROBUST,
+            min_rms_dbfs: -60.0,
             repetition_k: 2,
             interleave_depth: 4,
             link_dead_ms: 2000,
@@ -63,7 +77,8 @@ impl PhyConfig {
             n_tones: 16,
             preamble: vec![0xA, 0x5],
             min_confidence_db: 2.0,
-            absolute_power_min: 20.0,
+            min_tone_purity: PURITY_FAST,
+            min_rms_dbfs: -60.0,
             repetition_k: 1,
             interleave_depth: 4,
             link_dead_ms: 2000,

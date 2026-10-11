@@ -1,5 +1,5 @@
 use super::config::PhyConfig;
-use super::goertzel::{best_tone, goertzel_power};
+use super::goertzel::{best_tone, goertzel_power, rms_dbfs, ToneDetection};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +14,8 @@ pub struct DemodResult {
     pub nibble: u8,
     pub power: f32,
     pub confidence_db: f32,
+    /// Level-independent tone purity (0..~1).
+    pub purity: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -133,7 +135,7 @@ impl ModemRx {
                     let window: Vec<f32> = self.buffer.iter().take(sym).copied().collect();
                     if let Some(det) = self.detect_nibble(&window) {
                         if det.nibble == self.config.preamble[0]
-                            && det.power >= self.config.absolute_power_min
+                            && self.level_ok(&det)
                             && det.confidence_db >= self.config.min_confidence_db
                         {
                             // Fine-align within hop window
@@ -160,7 +162,7 @@ impl ModemRx {
                     let expect = self.config.preamble[matched];
                     if let Some(det) = self.detect_nibble(&window) {
                         if det.nibble == expect
-                            && det.power >= self.config.absolute_power_min
+                            && self.level_ok(&det)
                             && det.confidence_db >= self.config.min_confidence_db * 0.5
                         {
                             self.consume(period);
@@ -199,7 +201,7 @@ impl ModemRx {
                     }
                     let window: Vec<f32> = self.buffer.iter().take(sym).copied().collect();
                     if let Some(det) = self.detect_nibble(&window) {
-                        if det.power >= self.config.absolute_power_min
+                        if self.level_ok(&det)
                             && det.confidence_db >= self.config.min_confidence_db * 0.5
                         {
                             self.consume(period);
@@ -236,13 +238,27 @@ impl ModemRx {
     }
 
     fn detect_nibble(&self, window: &[f32]) -> Option<DemodResult> {
-        let (nibble, power, confidence_db) =
-            best_tone(window, &self.tones, self.config.sample_rate_hz)?;
-        Some(DemodResult {
-            nibble,
+        let ToneDetection {
+            index,
             power,
             confidence_db,
+            purity,
+            energy,
+        } = best_tone(window, &self.tones, self.config.sample_rate_hz)?;
+        if rms_dbfs(energy, window.len()) < self.config.min_rms_dbfs {
+            return None;
+        }
+        Some(DemodResult {
+            nibble: index,
+            power,
+            confidence_db,
+            purity,
         })
+    }
+
+    /// Level-independent gate (silence floor is applied in `detect_nibble`).
+    fn level_ok(&self, det: &DemodResult) -> bool {
+        det.purity >= self.config.min_tone_purity
     }
 
     fn best_preamble0_offset(&self, sym: usize, hop: usize) -> usize {
