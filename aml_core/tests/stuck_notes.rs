@@ -15,21 +15,16 @@
 //!
 //! Run with `-- --nocapture` to see the per-configuration report.
 //!
-//! Known design gap (`all_notes_released_while_link_alive`, ignored): the only
-//! receiver-side cleanup is the link-dead burst, and heartbeats keep the link
-//! alive, so a lost NoteOff leaves its note sounding until the same pitch is
-//! released again or the transmitter stops. Measured on these streams: up to
-//! 160 s stuck (Robust p = 1 %) and 32 of 37 stuck episodes longer than
-//! `link_dead_ms` (Fast p = 2 %). The candidate fix is on the TX side: while
-//! idle, send a NoteOff for a recently released (and not re-pressed) note in
-//! the heartbeat slot instead of a bare Heartbeat, so redundant NoteOffs cost
-//! no extra airtime and still keep the link alive.
+//! Idle TX slots use [`TxScheduler`]: any non-zero gap can start one packet, the
+//! way the encoder does when it does not yet know the next note is coming.
+//! Recently released notes are repeated round-robin for 10 s. Heartbeats are
+//! sent only when that list is empty (v1.1 A8 / C1).
 
 mod support;
 
-use aml_core::modem::{AmlModemRx, AmlModemTx, ModemOutput};
+use aml_core::modem::{repetition_samples, AmlModemRx, AmlModemTx, ModemOutput};
 use aml_core::phy::PhyConfig;
-use aml_core::transport::TransportMessage;
+use aml_core::transport::{TransportMessage, TxScheduler};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use support::{ChannelSim, XorShift64};
@@ -132,23 +127,28 @@ struct Stream {
 
 struct StreamBuilder {
     tx: AmlModemTx,
+    scheduler: TxScheduler,
     period: usize,
-    heartbeat: usize,
+    message_len: usize,
     audio: Vec<f32>,
     sent: Vec<Sent>,
-    last_tx_start: usize,
     note_off_times: BTreeMap<u8, Vec<usize>>,
 }
 
 impl StreamBuilder {
     fn new(config: &PhyConfig) -> Self {
+        let message_samples = repetition_samples(config) * config.repetition_k.max(1) as u64;
+        let heartbeat_samples =
+            config.sample_rate_hz as u64 * config.heartbeat_interval_ms as u64 / 1000;
+        let mut tx = AmlModemTx::new(config.clone());
+        let message_len = tx.encode_message(&TransportMessage::Heartbeat).len();
         Self {
-            tx: AmlModemTx::new(config.clone()),
+            tx,
+            scheduler: TxScheduler::new(config.sample_rate_hz, heartbeat_samples, message_samples),
             period: config.samples_per_symbol_period(),
-            heartbeat: ms_to_samples(config, config.heartbeat_interval_ms as usize),
+            message_len,
             audio: Vec::new(),
             sent: Vec::new(),
-            last_tx_start: 0,
             note_off_times: BTreeMap::new(),
         }
     }
@@ -162,31 +162,56 @@ impl StreamBuilder {
         }
     }
 
-    fn send(&mut self, msg: TransportMessage) {
+    fn encode_polled(&mut self, msg: TransportMessage) {
         let start = self.audio.len();
         if let TransportMessage::NoteOff { note } = msg {
             self.note_off_times.entry(note).or_default().push(start);
         }
-        self.audio.extend(self.tx.encode_message(&msg));
+        let samples = if matches!(msg, TransportMessage::Heartbeat) {
+            self.tx.encode_heartbeat()
+        } else {
+            self.tx.encode_message(&msg)
+        };
+        self.audio.extend(samples);
         debug_assert_eq!(self.audio.len() % self.period, 0);
         self.sent.push(Sent { msg, start });
-        self.last_tx_start = start;
     }
 
-    /// Stay idle for `samples`, sending a Heartbeat whenever 500 ms passed
-    /// since the start of the previous transmission.
-    fn idle(&mut self, samples: usize) {
-        let target = self.audio.len() + samples;
-        loop {
-            let next_hb = self.last_tx_start + self.heartbeat;
-            if next_hb < target {
-                self.pad_to(next_hb);
-                self.send(TransportMessage::Heartbeat);
-            } else {
-                self.pad_to(target);
+    fn drain_until(&mut self, target: usize) {
+        while self.audio.len() < target {
+            let now = self.audio.len() as u64;
+            let remaining = target.saturating_sub(self.audio.len());
+            if self.scheduler.queued() == 0 && remaining < self.message_len {
+                // The leftover silence is shorter than a packet. The encoder
+                // still starts one if a refresh or heartbeat is due; the next
+                // note then waits out that packet.
+                if let Some(msg) = self.scheduler.poll(now) {
+                    self.encode_polled(msg);
+                } else {
+                    self.pad_to(target);
+                }
                 break;
             }
+            if let Some(msg) = self.scheduler.poll(now) {
+                self.encode_polled(msg);
+                continue;
+            }
+            let next = self.scheduler.next_keepalive_sample().max(now + 1) as usize;
+            self.pad_to(next.min(target));
         }
+    }
+
+    fn send(&mut self, msg: TransportMessage) {
+        let now = self.audio.len() as u64;
+        self.scheduler.push(msg, now);
+        if let Some(m) = self.scheduler.poll(now) {
+            self.encode_polled(m);
+        }
+    }
+
+    /// Stay idle for `samples`, emitting keepalive / NoteOff refresh via the scheduler.
+    fn idle(&mut self, samples: usize) {
+        self.drain_until(self.audio.len() + samples);
     }
 }
 
@@ -238,7 +263,7 @@ fn build_stream(config: &PhyConfig, pairs: usize, seed: u64) -> Stream {
         audio: b.audio,
         sent: b.sent,
         note_off_times: b.note_off_times,
-        message_len: b.tx.encode_message(&TransportMessage::Heartbeat).len(),
+        message_len: b.message_len,
         alive_checkpoint,
     }
 }
@@ -285,7 +310,7 @@ fn match_delivered(
     sent: &[Sent],
     delivered: &[TransportMessage],
 ) -> (Vec<usize>, Vec<TransportMessage>) {
-    const LOOKAHEAD: usize = 64;
+    const LOOKAHEAD: usize = 512;
     let mut matched = Vec::new();
     let mut unmatched = Vec::new();
     let mut next = 0usize;
@@ -517,9 +542,6 @@ fn all_notes_released_after_link_dead() {
 /// While the transmitter is alive and idle (heartbeats only), no note may keep
 /// sounding: a lost NoteOff must not leave a note stuck indefinitely.
 #[test]
-#[ignore = "design gap (v1.1 A6): a lost NoteOff leaves its note sounding for as long as \
-            heartbeats keep the link alive; link-dead (the only cleanup) never fires. \
-            Needs a TX-side fix (NoteOff refresh in idle slots), see the module docs"]
 fn all_notes_released_while_link_alive() {
     for r in results() {
         assert!(

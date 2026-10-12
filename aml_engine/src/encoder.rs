@@ -4,9 +4,9 @@ use crate::audio::{AudioOut, AudioSink};
 use crate::events::{AlarmKind, EngineEvent};
 use crate::midi::{self, MidiCallback, MidiIn};
 use crate::{closed_receiver, Emitter, Worker};
-use aml_core::modem::AmlModemTx;
+use aml_core::modem::{repetition_samples, AmlModemTx};
 use aml_core::phy::PhyConfig;
-use aml_core::transport::{midi_to_message, TransportMessage};
+use aml_core::transport::{midi_to_message, TransportMessage, TxScheduler};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,7 +104,6 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     let mut config = PhyConfig::from_name(&cfg.profile);
     let est_latency = config.estimated_first_copy_ms();
     let preferred_sample_rate = config.sample_rate_hz;
-    let heartbeat_ms = config.heartbeat_interval_ms as u64;
     let use_sim = cfg.simulate || matches!(cfg.midi_in, MidiIn::None);
 
     let on_midi = {
@@ -144,11 +143,12 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         },
     };
 
+    let ring_floor = (preferred_sample_rate as u64 * 5 / 1000).max(1) as usize;
+    let est_msg = repetition_samples(&config) * config.repetition_k.max(1) as u64;
+    let ring_samples = (est_msg * 2).max(ring_floor as u64) as usize;
+
     let drops = AtomicU64::new(0);
-    let mut sink = match cfg
-        .audio_out
-        .open(preferred_sample_rate, preferred_sample_rate as usize * 4)
-    {
+    let mut sink = match cfg.audio_out.open(preferred_sample_rate, ring_samples) {
         Ok(s) => s,
         Err(e) => {
             ev.log(format!("Audio output error: {}", e));
@@ -166,46 +166,71 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     if stream_sample_rate != preferred_sample_rate {
         config = config.with_sample_rate(stream_sample_rate);
     }
+    let message_samples = repetition_samples(&config) * config.repetition_k.max(1) as u64;
+    let heartbeat_samples =
+        config.sample_rate_hz as u64 * config.heartbeat_interval_ms as u64 / 1000;
+
     if let Err(e) = sink.start() {
         ev.log(format!("Failed to play output: {}", e));
         return;
     }
 
     let mut tx = AmlModemTx::new(config.clone());
-    let mut last_heartbeat = Instant::now();
+    let mut scheduler = TxScheduler::new(stream_sample_rate, heartbeat_samples, message_samples);
+    let stream_start = Instant::now();
     let mut note_idx = 0usize;
     let scale = [0u8, 2, 4, 5, 7, 9, 11, 12];
     let mut last_sim = Instant::now() - SIM_INTERVAL;
+    let mut sim_sounding: Option<u8> = None;
     let mut last_status = Instant::now();
     let sink = sink.as_mut();
 
     while !stop.load(Ordering::SeqCst) {
-        let msgs: Vec<TransportMessage> = match pending.lock() {
-            Ok(mut q) => q.drain(..).collect(),
-            Err(_) => Vec::new(),
-        };
-        for msg in msgs {
-            ev.log(format!("TX {:?}", msg));
-            push_audio(sink, &tx.encode_message(&msg), stop, &drops);
+        let tx_time = (stream_start.elapsed().as_secs_f64() * f64::from(stream_sample_rate)) as u64;
+
+        let incoming: Vec<TransportMessage> = pending
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        for msg in incoming {
+            scheduler.push(msg, tx_time);
+        }
+
+        if scheduler.stale_note_on_dropped {
+            ev.log("TX dropped stale NoteOn (queue airtime budget exceeded)");
+            scheduler.stale_note_on_dropped = false;
         }
 
         if use_sim && last_sim.elapsed() >= SIM_INTERVAL {
+            if let Some(prev) = sim_sounding.take() {
+                scheduler.push(TransportMessage::NoteOff { note: prev }, tx_time);
+            }
             let note = 60 + scale[note_idx % scale.len()];
-            let on = TransportMessage::NoteOn {
-                note,
-                velocity: 100,
-            };
-            push_audio(sink, &tx.encode_message(&on), stop, &drops);
-            let off = TransportMessage::NoteOff { note };
-            push_audio(sink, &tx.encode_message(&off), stop, &drops);
+            scheduler.push(
+                TransportMessage::NoteOn {
+                    note,
+                    velocity: 100,
+                },
+                tx_time,
+            );
+            sim_sounding = Some(note);
             ev.log(format!("TX sim Note {}", note));
             note_idx += 1;
             last_sim = Instant::now();
         }
 
-        if last_heartbeat.elapsed() >= Duration::from_millis(heartbeat_ms) {
-            push_audio(sink, &tx.encode_heartbeat(), stop, &drops);
-            last_heartbeat = Instant::now();
+        if (sink.buffered() as u64) < message_samples {
+            if let Some(result) = scheduler.poll_detailed(tx_time) {
+                if result.user {
+                    ev.log(format!("TX {:?}", result.msg));
+                }
+                let audio = if matches!(result.msg, TransportMessage::Heartbeat) {
+                    tx.encode_heartbeat()
+                } else {
+                    tx.encode_message(&result.msg)
+                };
+                let _ = push_audio(sink, &audio, stop, &drops);
+            }
         }
 
         while let Some(err) = sink.take_error() {
@@ -222,7 +247,7 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         }
 
         if last_status.elapsed() >= STATUS_INTERVAL {
-            let queued = pending.lock().map(|q| q.len()).unwrap_or(0);
+            let queued = scheduler.queued();
             let latency_ms = sink.buffered() as f32 * 1000.0 / stream_sample_rate.max(1) as f32;
             ev.send(EngineEvent::TxStatus { queued, latency_ms });
             last_status = Instant::now();
@@ -235,11 +260,17 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
 }
 
 /// Queue `samples`, waiting up to ~2 s per sample while the sink is full
-/// (then counting a drop). Returns early when `stop` is set.
-fn push_audio(sink: &mut dyn AudioSink, samples: &[f32], stop: &AtomicBool, drops: &AtomicU64) {
+/// (then counting a drop). Returns the number of samples actually queued.
+fn push_audio(
+    sink: &mut dyn AudioSink,
+    samples: &[f32],
+    stop: &AtomicBool,
+    drops: &AtomicU64,
+) -> usize {
+    let mut pushed = 0usize;
     for &sample in samples {
         if stop.load(Ordering::Relaxed) {
-            return;
+            break;
         }
         let mut attempts = 0;
         while sink.is_full() {
@@ -252,6 +283,9 @@ fn push_audio(sink: &mut dyn AudioSink, samples: &[f32], stop: &AtomicBool, drop
         }
         if sink.push(std::slice::from_ref(&sample)) == 0 {
             drops.fetch_add(1, Ordering::Relaxed);
+        } else {
+            pushed += 1;
         }
     }
+    pushed
 }
