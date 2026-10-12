@@ -71,12 +71,10 @@ name = "aml_cli"
 version = "0.1.0"
 dependencies = [
  "aml_core",
+ "aml_engine",
  "anyhow",
  "clap",
- "cpal",
  "hound",
- "midir",
- "ringbuf",
 ]
 
 [[package]]
