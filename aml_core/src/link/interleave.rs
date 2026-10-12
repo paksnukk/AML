@@ -5,7 +5,7 @@ pub fn interleave(nibbles: &[u8], depth: usize) -> Vec<u8> {
         return nibbles.to_vec();
     }
     let mut padded = nibbles.to_vec();
-    while padded.len() % depth != 0 {
+    while !padded.len().is_multiple_of(depth) {
         padded.push(0);
     }
     let cols = padded.len() / depth;

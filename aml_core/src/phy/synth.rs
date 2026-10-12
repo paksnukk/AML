@@ -23,7 +23,7 @@ impl ModemTx {
             out.extend(self.synthesize_symbol(self.config.tone_hz(idx)));
             let gap = self.config.gap_samples();
             if gap > 0 {
-                out.extend(std::iter::repeat(0.0).take(gap));
+                out.extend(std::iter::repeat_n(0.0, gap));
             }
         }
         out

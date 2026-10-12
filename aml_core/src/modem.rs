@@ -80,7 +80,7 @@ impl AmlModemTx {
             audio.extend(self.phy.synthesize_framed(&interleaved));
             // Small gap between repetitions
             let gap = self.config.samples_per_symbol_period();
-            audio.extend(std::iter::repeat(0.0).take(gap));
+            audio.extend(std::iter::repeat_n(0.0, gap));
         }
         audio
     }
@@ -331,7 +331,10 @@ pub fn encode_to_samples(config: PhyConfig, messages: &[TransportMessage]) -> Ve
     for msg in messages {
         all.extend(tx.encode_message(msg));
         // Inter-message silence
-        all.extend(std::iter::repeat(0.0).take(tx.config().samples_per_symbol_period() * 2));
+        all.extend(std::iter::repeat_n(
+            0.0,
+            tx.config().samples_per_symbol_period() * 2,
+        ));
     }
     all
 }
@@ -360,5 +363,6 @@ pub fn decode_samples(config: PhyConfig, samples: &[f32]) -> Vec<TransportMessag
 
 pub fn expected_body_nibbles_for(msg_type: MessageType, interleave_depth: usize) -> usize {
     let n = body_nibble_count(msg_type, interleave_depth);
-    n.max(MAX_BODY_NIBBLES).min(MAX_BODY_NIBBLES)
+    // Note: always MAX_BODY_NIBBLES (bodies are padded to that length).
+    n.clamp(MAX_BODY_NIBBLES, MAX_BODY_NIBBLES)
 }

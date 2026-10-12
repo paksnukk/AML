@@ -27,7 +27,7 @@ pub fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
 }
 
 pub fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity((nibbles.len() + 1) / 2);
+    let mut out = Vec::with_capacity(nibbles.len().div_ceil(2));
     let mut i = 0;
     while i + 1 < nibbles.len() {
         out.push(((nibbles[i] & 0x0F) << 4) | (nibbles[i + 1] & 0x0F));
@@ -98,7 +98,7 @@ pub fn body_nibble_count(msg_type: MessageType, interleave_depth: usize) -> usiz
     let raw_bytes = 2 + msg_type.payload_len() + 2; // hdr+seq+payload+crc
     let raw_nibbles = raw_bytes * 2;
     let depth = interleave_depth.max(1);
-    ((raw_nibbles + depth - 1) / depth) * depth
+    raw_nibbles.div_ceil(depth) * depth
 }
 
 #[cfg(test)]
