@@ -226,29 +226,12 @@ fn start_decoder(
     midi_out: Option<String>,
     profile: String,
 ) -> Result<(), String> {
-    start_decoder_with(
-        app,
-        state,
-        DeviceSelector::from_name(audio_in),
-        DeviceSelector::from_name(midi_out),
-        profile,
-    )
-}
-
-/// `midi_out` = `Default` means no MIDI output.
-fn start_decoder_with(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    audio_in: DeviceSelector,
-    midi_out: DeviceSelector,
-    profile: String,
-) -> Result<(), String> {
     let mut slot = state.decoder.lock().unwrap();
     shutdown(slot.take(), DecoderHandle::stop);
 
     let mut handle = DecoderHandle::start(DecoderConfig {
-        audio_in: AudioIn::Device(audio_in),
-        midi_out: match midi_out {
+        audio_in: AudioIn::Device(DeviceSelector::from_name(audio_in)),
+        midi_out: match DeviceSelector::from_name(midi_out) {
             DeviceSelector::Default => MidiOut::None,
             sel => MidiOut::Device(sel),
         },
@@ -281,31 +264,12 @@ fn start_encoder(
     profile: String,
     simulate: bool,
 ) -> Result<(), String> {
-    start_encoder_with(
-        app,
-        state,
-        DeviceSelector::from_name(audio_out),
-        DeviceSelector::from_name(midi_in),
-        profile,
-        simulate,
-    )
-}
-
-/// `midi_in` = `Default` means no MIDI input.
-fn start_encoder_with(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    audio_out: DeviceSelector,
-    midi_in: DeviceSelector,
-    profile: String,
-    simulate: bool,
-) -> Result<(), String> {
     let mut slot = state.encoder.lock().unwrap();
     shutdown(slot.take(), EncoderHandle::stop);
 
     let mut handle = EncoderHandle::start(EncoderConfig {
-        audio_out: AudioOut::Device(audio_out),
-        midi_in: match midi_in {
+        audio_out: AudioOut::Device(DeviceSelector::from_name(audio_out)),
+        midi_in: match DeviceSelector::from_name(midi_in) {
             DeviceSelector::Default => MidiIn::None,
             sel => MidiIn::Device(sel),
         },
@@ -325,49 +289,6 @@ fn stop_encoder(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-// Back-compat aliases used by older frontend bindings during transition
-// (index-based, as before devices were selected by name).
-#[tauri::command]
-fn start_listening(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    device_index: Option<usize>,
-) -> Result<(), String> {
-    start_decoder_with(
-        app,
-        state,
-        DeviceSelector::from_index(device_index),
-        DeviceSelector::Default,
-        "robust".into(),
-    )
-}
-
-#[tauri::command]
-fn stop_listening(state: State<'_, AppState>) -> Result<(), String> {
-    stop_decoder(state)
-}
-
-#[tauri::command]
-fn start_test_sequence(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    device_index: Option<usize>,
-) -> Result<(), String> {
-    start_encoder_with(
-        app,
-        state,
-        DeviceSelector::from_index(device_index),
-        DeviceSelector::Default,
-        "robust".into(),
-        true,
-    )
-}
-
-#[tauri::command]
-fn stop_playing(state: State<'_, AppState>) -> Result<(), String> {
-    stop_encoder(state)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -385,11 +306,7 @@ pub fn run() {
             start_decoder,
             stop_decoder,
             start_encoder,
-            stop_encoder,
-            start_listening,
-            stop_listening,
-            start_test_sequence,
-            stop_playing
+            stop_encoder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
