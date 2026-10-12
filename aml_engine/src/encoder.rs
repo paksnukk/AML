@@ -92,6 +92,9 @@ impl Drop for EncoderHandle {
 const TICK: Duration = Duration::from_millis(5);
 /// Simulated note interval.
 const SIM_INTERVAL: Duration = Duration::from_millis(1000);
+/// Buffered audio below which the next message is encoded. Above `TICK`, so
+/// back-to-back messages play without a gap.
+const REFILL_MS: u64 = 10;
 /// Minimum interval between `TxStatus` events.
 const STATUS_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -169,6 +172,7 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     let message_samples = repetition_samples(&config) * config.repetition_k.max(1) as u64;
     let heartbeat_samples =
         config.sample_rate_hz as u64 * config.heartbeat_interval_ms as u64 / 1000;
+    let refill_samples = config.sample_rate_hz as u64 * REFILL_MS / 1000;
 
     if let Err(e) = sink.start() {
         ev.log(format!("Failed to play output: {}", e));
@@ -196,9 +200,9 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
             scheduler.push(msg, tx_time);
         }
 
-        if scheduler.stale_note_on_dropped {
-            ev.log("TX dropped stale NoteOn (queue airtime budget exceeded)");
-            scheduler.stale_note_on_dropped = false;
+        if scheduler.note_on_dropped {
+            ev.log("TX dropped a queued NoteOn (queue airtime budget exceeded)");
+            scheduler.note_on_dropped = false;
         }
 
         if use_sim && last_sim.elapsed() >= SIM_INTERVAL {
@@ -219,8 +223,12 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
             last_sim = Instant::now();
         }
 
-        if (sink.buffered() as u64) < message_samples {
-            if let Some(result) = scheduler.poll_detailed(tx_time) {
+        // Choose the next message only when the current one has nearly
+        // played out, so a note that arrives meanwhile does not wait behind an
+        // already encoded refresh or heartbeat.
+        let buffered = sink.buffered() as u64;
+        if buffered < refill_samples {
+            if let Some(result) = scheduler.poll_detailed(tx_time + buffered) {
                 if result.user {
                     ev.log(format!("TX {:?}", result.msg));
                 }
@@ -247,8 +255,11 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         }
 
         if last_status.elapsed() >= STATUS_INTERVAL {
+            // The oldest queued message's wait so far plus the audio already
+            // buffered ahead of it.
             let queued = scheduler.queued();
-            let latency_ms = sink.buffered() as f32 * 1000.0 / stream_sample_rate.max(1) as f32;
+            let late = scheduler.oldest_wait_samples(tx_time) + sink.buffered() as u64;
+            let latency_ms = late as f32 * 1000.0 / stream_sample_rate.max(1) as f32;
             ev.send(EngineEvent::TxStatus { queued, latency_ms });
             last_status = Instant::now();
         }

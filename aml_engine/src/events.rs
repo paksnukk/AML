@@ -21,9 +21,9 @@ pub enum EngineEvent {
     /// ended (e.g. audio input resumed after a stall). Only sent for kinds
     /// whose end is observable: currently [`AlarmKind::AudioInputStalled`].
     AlarmCleared { kind: AlarmKind, message: String },
-    /// Encoder queue status, about every 200 ms. Best-effort for now:
-    /// `queued` = MIDI messages waiting to be encoded, `latency_ms` = audio
-    /// already queued ahead of the output (what a new message waits behind).
+    /// Encoder queue status, about every 200 ms. `queued` = messages waiting
+    /// in the TX scheduler, `latency_ms` = how long the oldest of them has
+    /// already waited plus the audio buffered ahead of the output.
     TxStatus { queued: usize, latency_ms: f32 },
     /// The worker has finished; no further events follow.
     Stopped,

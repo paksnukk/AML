@@ -24,15 +24,16 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 //!
-//! Hardware-free endpoints live in [`testing`] (feature `testing`).
+//! In-memory endpoints live in [`memory`]; test-only ones in [`testing`]
+//! (feature `testing`).
 
 pub mod audio;
 pub mod decoder;
 pub mod devices;
 pub mod encoder;
 pub mod events;
-#[cfg(any(test, feature = "testing"))]
 pub mod loopback;
+pub mod memory;
 pub mod midi;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -50,7 +51,6 @@ pub use decoder::{DecoderConfig, DecoderHandle};
 pub use devices::DeviceSelector;
 pub use encoder::{EncoderConfig, EncoderHandle};
 pub use events::{format_message, link_state_name, AlarmKind, EngineEvent, LinkStats};
-#[cfg(any(test, feature = "testing"))]
 pub use loopback::{
     jitter_ms, mean_ms, measure_midi_loopback, percentile_nearest_rank_ms, LatencySummary,
 };

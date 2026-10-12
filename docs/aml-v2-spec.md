@@ -209,23 +209,31 @@ scheduler when due; it is not queued with user traffic.
 no NoteOff parked behind a queued NoteOn, and the NoteOff refresh list is empty. While user
 messages or refreshes are pending, Heartbeat uses no airtime.
 
-**NoteOff refresh:** after a user NoteOff is transmitted, its note is kept for up to **10 s** (max
-**32** most recent releases). When nothing higher in the table is pending, each free packet sends
-a **NoteOff** for one refresh entry instead of waiting for Heartbeat: the note with the **fewest**
-refresh transmissions so far, then the **oldest** original release. A **NoteOn** for that note
-removes it from the refresh list. Refresh never runs ahead of a **NoteOn** already in the normal
-queue.
+**NoteOff refresh:** after a user NoteOff is transmitted, its note is repeated up to **6** times
+within **10 s** (max **32** most recent releases). When nothing higher in the table is pending, each
+free packet sends a **NoteOff** for one refresh entry instead of waiting for Heartbeat: the note with
+the **fewest** refresh transmissions so far, then the **oldest** original release. A **NoteOn** for
+that note removes it from the refresh list. Refresh never runs ahead of a **NoteOn** already in the
+normal queue. Each release therefore costs a bounded burst of airtime (6 messages: about 0.3 s on
+Fast, 1.6 s on Robust) that a NoteOn arriving meanwhile may wait behind for up to one message.
 
-**Parked NoteOff:** a NoteOff that arrives while its NoteOn is still queued is held and sent
-immediately after that NoteOn (the note is not dropped because the off arrived early).
+**Held NoteOff:** a NoteOff that arrives while a NoteOn for the same note is still queued is held
+with the latest such NoteOn and sent immediately after it, so the note is not released before it
+is struck. This also keeps off / on / off on a note that is already sounding (a trill or roll) in
+order.
+
+**Panic** removes NoteOns that are still queued (they would otherwise sound after the Panic).
 
 **Queue bounds:** queued **NoteOn** airtime is capped at **250 ms** (one on-wire message period per
-queued NoteOn, plus one extra period for its paired queued NoteOff when that off is still waiting
-on the NoteOn). Before accepting another NoteOn, the oldest queued NoteOn is dropped until the
-budget fits. Its NoteOff is dropped **only** when that NoteOn was never transmitted. A NoteOff for a
-note already on the air, and **Panic**, are never dropped.
+queued NoteOn, plus one extra period for a NoteOff held with it). Before accepting another NoteOn,
+the oldest queued NoteOn is dropped until the budget fits, but at least **4** queued NoteOns are
+always kept, so a chord survives even when one message is longer than the budget (Robust). A
+NoteOff held with a dropped NoteOn is dropped too, unless the note is still sounding from an earlier
+strike. A NoteOff for a note already on the air, and **Panic**, are never dropped.
 
-**Audio output ring:** sized to about **two** on-wire messages (one playing, room for the next). A new message is not encoded until buffered output has drained below one message length.
+**Audio output ring:** sized to about **two** on-wire messages. The next message is chosen and
+encoded only when buffered output has drained below **10 ms**, so a NoteOn that arrives while a
+message is playing waits for that message only, not for one already encoded behind it.
 
 ## 6. Profiles
 
@@ -255,9 +263,10 @@ First-copy on-wire for max body ≈ **54 ms** (2 + 16 symbols × 3 ms).
 ### 6.3 Throughput (airtime budgets)
 
 First-copy duration sets a practical sustained rate on a dedicated chain: Robust (**130–140 ms**
-per max-size message) supports about **3–4 messages/s**; Fast (**54 ms**) supports higher rates,
+per max-size message) supports about **3–4 messages/s**, and a chord of up to 4 notes is sent whole
+(later notes wait about one message each); Fast (**54 ms**) supports higher rates,
 and the TX scheduler keeps Fast **queue** latency under **250 ms** at **10 messages/s** by dropping
-stale queued NoteOns. These figures are on-wire airtime budgets for a clean dedicated path, not
+queued NoteOns beyond that budget. These figures are on-wire airtime budgets for a clean dedicated path, not
 guarantees through EQ, dynamics, or other processing on the AML bus.
 
 ## 7. Release assumptions (v1.0)

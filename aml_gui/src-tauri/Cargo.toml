@@ -26,4 +26,4 @@ dirs = "5"
 
 # Local dependencies
 aml_core = { path = "../../aml_core" }
-aml_engine = { path = "../../aml_engine", features = ["testing"] }
+aml_engine = { path = "../../aml_engine" }

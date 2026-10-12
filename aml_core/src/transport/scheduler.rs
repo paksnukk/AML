@@ -7,11 +7,18 @@
 //! where that transmission begins.
 
 use super::TransportMessage;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 const REFRESH_CAPACITY: usize = 32;
 const REFRESH_LIFETIME_MS: u64 = 10_000;
+/// Repeats per released note. Enough that no note stayed stuck past
+/// link-dead time in `tests/stuck_notes.rs` (up to 2 % symbol errors), while
+/// each release costs a bounded burst of airtime instead of every idle slot.
+const REFRESH_MAX_REPEATS: u32 = 6;
 const NOTEON_BUDGET_MS: u64 = 250;
+/// Queued NoteOns that are never dropped for the airtime budget, so a chord
+/// survives even when one message is longer than the budget (Robust).
+const MIN_KEPT_NOTE_ONS: usize = 4;
 
 #[derive(Clone, Copy)]
 struct RefreshEntry {
@@ -19,14 +26,29 @@ struct RefreshEntry {
     /// Stream sample when the original user NoteOff was emitted.
     emitted_at: u64,
     sent: u32,
-    /// Stream sample of the last refresh. `0` means none yet.
-    last_sent_at: u64,
 }
 
 struct Queued {
     msg: TransportMessage,
-    #[cfg_attr(not(test), allow(dead_code))]
     push_sample: u64,
+    /// NoteOn only: a NoteOff for this note arrived while this NoteOn was
+    /// still queued (push sample of that NoteOff). It is sent right after
+    /// this NoteOn, so a short note is not released before it is struck.
+    release_after: Option<u64>,
+}
+
+impl Queued {
+    fn new(msg: TransportMessage, push_sample: u64) -> Self {
+        Self {
+            msg,
+            push_sample,
+            release_after: None,
+        }
+    }
+
+    fn is_note_on(&self, note: u8) -> bool {
+        matches!(self.msg, TransportMessage::NoteOn { note: n, .. } if n == note)
+    }
 }
 
 /// Result of [`TxScheduler::poll_detailed`].
@@ -49,14 +71,12 @@ pub struct TxScheduler {
 
     /// Notes whose NoteOn has been emitted (sounding on the far side).
     sounding: HashSet<u8>,
-    /// NoteOff waiting for a NoteOn that is still queued. Sent immediately
-    /// after that NoteOn, so a short note is not cancelled before it is aired
-    /// and is not released before it is struck.
-    parked_off: HashMap<u8, u64>,
     refresh: VecDeque<RefreshEntry>,
 
     last_emit_sample: Option<u64>,
-    pub stale_note_on_dropped: bool,
+    /// Set when a queued NoteOn was dropped because the queue exceeded its
+    /// airtime budget. The caller reports and clears it.
+    pub note_on_dropped: bool,
 }
 
 impl TxScheduler {
@@ -71,15 +91,29 @@ impl TxScheduler {
             note_off_q: VecDeque::new(),
             normal_q: VecDeque::new(),
             sounding: HashSet::new(),
-            parked_off: HashMap::new(),
             refresh: VecDeque::new(),
             last_emit_sample: None,
-            stale_note_on_dropped: false,
+            note_on_dropped: false,
         }
     }
 
+    /// Messages waiting to be sent (a NoteOff held behind its NoteOn counts).
     pub fn queued(&self) -> usize {
-        self.panic_q.len() + self.note_off_q.len() + self.normal_q.len() + self.parked_off.len()
+        let held_offs = self
+            .normal_q
+            .iter()
+            .filter(|q| q.release_after.is_some())
+            .count();
+        self.panic_q.len() + self.note_off_q.len() + self.normal_q.len() + held_offs
+    }
+
+    /// How long the oldest queued message has waited at `now_samples`.
+    pub fn oldest_wait_samples(&self, now_samples: u64) -> u64 {
+        [&self.panic_q, &self.note_off_q, &self.normal_q]
+            .iter()
+            .filter_map(|q| q.iter().map(|e| e.push_sample).min())
+            .min()
+            .map_or(0, |oldest| now_samples.saturating_sub(oldest))
     }
 
     /// When the refresh list is empty, earliest sample for a Heartbeat.
@@ -93,39 +127,36 @@ impl TxScheduler {
     pub fn push(&mut self, msg: TransportMessage, push_sample: u64) {
         match msg {
             TransportMessage::Panic => {
-                self.panic_q.push_back(Queued { msg, push_sample });
+                // A NoteOn queued before the Panic would sound after it.
+                self.normal_q
+                    .retain(|q| !matches!(q.msg, TransportMessage::NoteOn { .. }));
+                self.panic_q.push_back(Queued::new(msg, push_sample));
             }
             TransportMessage::NoteOff { note } => {
-                if self.sounding.contains(&note) || !self.has_queued_note_on(note) {
-                    self.note_off_q.push_back(Queued {
-                        msg: TransportMessage::NoteOff { note },
-                        push_sample,
-                    });
-                } else {
-                    self.parked_off.insert(note, push_sample);
+                // Release after the latest queued strike of this note, if any;
+                // otherwise the note is (or will be) sounding from an earlier,
+                // already sent NoteOn and the release goes out with priority.
+                match self.normal_q.iter_mut().rev().find(|q| q.is_note_on(note)) {
+                    Some(on) => {
+                        on.release_after.get_or_insert(push_sample);
+                    }
+                    None => self.note_off_q.push_back(Queued::new(msg, push_sample)),
                 }
             }
-            TransportMessage::NoteOn { note, velocity } => {
+            TransportMessage::NoteOn { .. } => {
                 while self
                     .droppable_airtime_samples()
                     .saturating_add(self.message_samples)
                     > self.noteon_budget_samples
+                    && self.queued_note_ons() >= MIN_KEPT_NOTE_ONS
                 {
-                    if !self.drop_oldest_droppable_note_on() {
+                    if !self.drop_oldest_note_on() {
                         break;
                     }
                 }
-                self.normal_q.push_back(Queued {
-                    msg: TransportMessage::NoteOn { note, velocity },
-                    push_sample,
-                });
+                self.normal_q.push_back(Queued::new(msg, push_sample));
             }
-            other => {
-                self.normal_q.push_back(Queued {
-                    msg: other,
-                    push_sample,
-                });
-            }
+            other => self.normal_q.push_back(Queued::new(other, push_sample)),
         }
     }
 
@@ -135,76 +166,46 @@ impl TxScheduler {
 
     pub fn poll_detailed(&mut self, now_samples: u64) -> Option<PollResult> {
         if let Some(q) = self.panic_q.pop_front() {
-            return Some(PollResult {
-                msg: self.finish_emit(q.msg, now_samples, false),
-                user: true,
-            });
+            self.sounding.clear();
+            return Some(self.emit(q.msg, now_samples, true));
         }
         if let Some(q) = self.note_off_q.pop_front() {
-            return Some(PollResult {
-                msg: self.finish_emit(q.msg, now_samples, true),
-                user: true,
-            });
+            if let TransportMessage::NoteOff { note } = q.msg {
+                self.sounding.remove(&note);
+                self.push_refresh(note, now_samples);
+            }
+            return Some(self.emit(q.msg, now_samples, true));
         }
         if let Some(q) = self.normal_q.pop_front() {
-            let msg = q.msg;
-            if let TransportMessage::NoteOn { note, .. } = msg {
+            if let TransportMessage::NoteOn { note, .. } = q.msg {
                 self.cancel_refresh(note);
                 self.sounding.insert(note);
-                if let Some(push_sample) = self.parked_off.remove(&note) {
-                    self.note_off_q.push_back(Queued {
-                        msg: TransportMessage::NoteOff { note },
-                        push_sample,
-                    });
+                if let Some(push_sample) = q.release_after {
+                    self.note_off_q
+                        .push_back(Queued::new(TransportMessage::NoteOff { note }, push_sample));
                 }
             }
-            return Some(PollResult {
-                msg: self.finish_emit(msg, now_samples, false),
-                user: true,
-            });
+            return Some(self.emit(q.msg, now_samples, true));
         }
 
         self.prune_refresh(now_samples);
-        if self.keepalive_throttled(now_samples) {
+        if self.last_emit_sample == Some(now_samples) {
             return None;
         }
 
-        if let Some(note) = self.take_refresh(now_samples) {
-            let msg = TransportMessage::NoteOff { note };
-            return Some(PollResult {
-                msg: self.finish_emit(msg, now_samples, false),
-                user: false,
-            });
+        if let Some(note) = self.take_refresh() {
+            return Some(self.emit(TransportMessage::NoteOff { note }, now_samples, false));
         }
 
         if now_samples < self.next_keepalive_sample() {
             return None;
         }
-
-        Some(PollResult {
-            msg: self.finish_emit(TransportMessage::Heartbeat, now_samples, false),
-            user: false,
-        })
+        Some(self.emit(TransportMessage::Heartbeat, now_samples, false))
     }
 
-    fn keepalive_throttled(&self, now_samples: u64) -> bool {
-        self.last_emit_sample == Some(now_samples)
-    }
-
-    fn finish_emit(
-        &mut self,
-        msg: TransportMessage,
-        now_samples: u64,
-        track_refresh: bool,
-    ) -> TransportMessage {
-        if track_refresh {
-            if let TransportMessage::NoteOff { note } = msg {
-                self.sounding.remove(&note);
-                self.push_refresh(note, now_samples);
-            }
-        }
+    fn emit(&mut self, msg: TransportMessage, now_samples: u64, user: bool) -> PollResult {
         self.last_emit_sample = Some(now_samples);
-        msg
+        PollResult { msg, user }
     }
 
     fn push_refresh(&mut self, note: u8, emitted_at: u64) {
@@ -216,36 +217,21 @@ impl TxScheduler {
             note,
             emitted_at,
             sent: 0,
-            last_sent_at: 0,
         });
     }
 
-    /// Next note to repeat. Notes that have been repeated fewer times go first,
-    /// and among those the oldest release. A fresh NoteOff is not stuck behind
-    /// notes that already had several repeats, and the release that has waited
-    /// longest is not stuck behind newer ones.
-    fn take_refresh(&mut self, now_samples: u64) -> Option<u8> {
-        let mut best: Option<usize> = None;
-        for (i, e) in self.refresh.iter().enumerate() {
-            let better = match best {
-                None => true,
-                Some(b) => {
-                    let o = &self.refresh[b];
-                    e.sent < o.sent
-                        || (e.sent == o.sent && e.emitted_at < o.emitted_at)
-                        || (e.sent == o.sent
-                            && e.emitted_at == o.emitted_at
-                            && e.last_sent_at < o.last_sent_at)
-                }
-            };
-            if better {
-                best = Some(i);
-            }
-        }
-        let i = best?;
+    /// Next note to repeat. Notes that have been repeated fewer times go first, and among those the oldest
+    /// release. A fresh NoteOff is not stuck behind notes that already had
+    /// several repeats, and the release that has waited longest is not stuck
+    /// behind newer ones.
+    fn take_refresh(&mut self) -> Option<u8> {
+        let i = (0..self.refresh.len())
+            .min_by_key(|&i| (self.refresh[i].sent, self.refresh[i].emitted_at))?;
         let note = self.refresh[i].note;
-        self.refresh[i].sent = self.refresh[i].sent.saturating_add(1);
-        self.refresh[i].last_sent_at = now_samples;
+        self.refresh[i].sent += 1;
+        if self.refresh[i].sent >= REFRESH_MAX_REPEATS {
+            self.refresh.remove(i);
+        }
         Some(note)
     }
 
@@ -258,83 +244,48 @@ impl TxScheduler {
             .retain(|e| now_samples.saturating_sub(e.emitted_at) <= self.refresh_lifetime_samples);
     }
 
-    fn has_queued_note_on(&self, note: u8) -> bool {
+    fn queued_note_ons(&self) -> usize {
         self.normal_q
             .iter()
-            .any(|q| matches!(q.msg, TransportMessage::NoteOn { note: n, .. } if n == note))
+            .filter(|q| matches!(q.msg, TransportMessage::NoteOn { .. }))
+            .count()
     }
 
-    fn has_queued_note_off(&self, note: u8) -> bool {
-        self.parked_off.contains_key(&note)
-            || self
-                .note_off_q
-                .iter()
-                .any(|q| matches!(q.msg, TransportMessage::NoteOff { note: n } if n == note))
-    }
-
+    /// Airtime of queued NoteOns, plus the NoteOffs held behind them.
     fn droppable_airtime_samples(&self) -> u64 {
-        let mut total = 0u64;
-        for q in &self.normal_q {
-            if matches!(q.msg, TransportMessage::NoteOn { .. }) {
-                total = total.saturating_add(self.message_samples);
-                if let TransportMessage::NoteOn { note, .. } = q.msg {
-                    if self.has_queued_note_off(note) && !self.sounding.contains(&note) {
-                        total = total.saturating_add(self.message_samples);
-                    }
+        self.normal_q
+            .iter()
+            .filter(|q| matches!(q.msg, TransportMessage::NoteOn { .. }))
+            .map(|q| {
+                if q.release_after.is_some() {
+                    self.message_samples.saturating_mul(2)
+                } else {
+                    self.message_samples
                 }
-            }
-        }
-        total
+            })
+            .fold(0u64, u64::saturating_add)
     }
 
-    fn drop_oldest_droppable_note_on(&mut self) -> bool {
-        let note = match self.normal_q.iter().find_map(|q| {
-            if let TransportMessage::NoteOn { note, .. } = q.msg {
-                Some(note)
-            } else {
-                None
-            }
-        }) {
-            Some(n) => n,
-            None => return false,
-        };
-        let pos = self
+    fn drop_oldest_note_on(&mut self) -> bool {
+        let Some(pos) = self
             .normal_q
             .iter()
-            .position(|q| matches!(q.msg, TransportMessage::NoteOn { note: n, .. } if n == note))
-            .unwrap();
-        self.normal_q.remove(pos);
-        if !self.sounding.contains(&note) {
-            self.parked_off.remove(&note);
-            self.note_off_q
-                .retain(|q| !matches!(q.msg, TransportMessage::NoteOff { note: n } if n == note));
+            .position(|q| matches!(q.msg, TransportMessage::NoteOn { .. }))
+        else {
+            return false;
+        };
+        let q = self.normal_q.remove(pos).expect("position is in range");
+        // The held NoteOff goes with its NoteOn, unless the note is still
+        // sounding from an earlier strike: then the release must still go out.
+        if let (TransportMessage::NoteOn { note, .. }, Some(push_sample)) = (q.msg, q.release_after)
+        {
+            if self.sounding.contains(&note) {
+                self.note_off_q
+                    .push_back(Queued::new(TransportMessage::NoteOff { note }, push_sample));
+            }
         }
-        self.stale_note_on_dropped = true;
+        self.note_on_dropped = true;
         true
-    }
-
-    #[cfg(test)]
-    fn push_time(&mut self, msg: TransportMessage, push_sample: u64) {
-        self.push(msg, push_sample);
-    }
-
-    #[cfg(test)]
-    fn refresh_notes(&self) -> Vec<u8> {
-        self.refresh.iter().map(|e| e.note).collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn peek_next_wait(&self, now_samples: u64) -> Option<u64> {
-        if let Some(q) = self.panic_q.front() {
-            return Some(now_samples.saturating_sub(q.push_sample));
-        }
-        if let Some(q) = self.note_off_q.front() {
-            return Some(now_samples.saturating_sub(q.push_sample));
-        }
-        if let Some(q) = self.normal_q.front() {
-            return Some(now_samples.saturating_sub(q.push_sample));
-        }
-        None
     }
 }
 
@@ -343,39 +294,59 @@ mod tests {
     use super::*;
     use crate::modem::repetition_samples;
     use crate::phy::PhyConfig;
+    use TransportMessage::{Heartbeat, NoteOff, NoteOn, Panic};
 
-    fn fast_scheduler() -> TxScheduler {
-        let config = PhyConfig::fast();
-        let msg_samples = repetition_samples(&config) * config.repetition_k.max(1) as u64;
+    fn scheduler(config: &PhyConfig) -> TxScheduler {
+        let msg_samples = repetition_samples(config) * config.repetition_k.max(1) as u64;
         let hb = config.sample_rate_hz as u64 * config.heartbeat_interval_ms as u64 / 1000;
         TxScheduler::new(config.sample_rate_hz, hb, msg_samples)
     }
 
-    fn ms_samples(hz: u32, ms: u64) -> u64 {
-        hz as u64 * ms / 1000
+    fn fast_scheduler() -> TxScheduler {
+        scheduler(&PhyConfig::fast())
+    }
+
+    fn on(note: u8) -> TransportMessage {
+        NoteOn {
+            note,
+            velocity: 100,
+        }
+    }
+
+    /// Plays `note` and releases it; returns the sample after the release.
+    fn play_and_release(s: &mut TxScheduler, note: u8, t: u64) -> u64 {
+        let msg = s.message_samples;
+        s.push(on(note), t);
+        assert_eq!(s.poll(t), Some(on(note)));
+        s.push(NoteOff { note }, t + msg);
+        assert_eq!(s.poll(t + msg), Some(NoteOff { note }));
+        t + msg
+    }
+
+    fn refresh_notes(s: &TxScheduler) -> Vec<u8> {
+        s.refresh.iter().map(|e| e.note).collect()
     }
 
     #[test]
     fn priority_panic_note_off_note_on() {
         let mut s = fast_scheduler();
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100,
-            },
-            0,
-        );
-        s.push_time(TransportMessage::NoteOff { note: 70 }, 0);
-        s.push_time(TransportMessage::Panic, 0);
-        assert_eq!(s.poll(0), Some(TransportMessage::Panic));
-        assert_eq!(s.poll(0), Some(TransportMessage::NoteOff { note: 70 }));
-        assert_eq!(
-            s.poll(0),
-            Some(TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100
-            })
-        );
+        s.push(NoteOff { note: 70 }, 0);
+        s.push(Panic, 0);
+        s.push(on(60), 0);
+        assert_eq!(s.poll(0), Some(Panic));
+        assert_eq!(s.poll(0), Some(NoteOff { note: 70 }));
+        assert_eq!(s.poll(0), Some(on(60)));
+        assert_eq!(s.poll(0), None);
+    }
+
+    #[test]
+    fn panic_discards_note_ons_queued_before_it() {
+        let mut s = fast_scheduler();
+        s.push(on(60), 0);
+        s.push(on(61), 0);
+        s.push(Panic, 0);
+        assert_eq!(s.queued(), 1);
+        assert_eq!(s.poll(0), Some(Panic));
         assert_eq!(s.poll(0), None);
     }
 
@@ -383,300 +354,219 @@ mod tests {
     fn no_heartbeat_while_queued_then_wait_interval() {
         let mut s = fast_scheduler();
         let hb = s.heartbeat_interval_samples;
-        let msg = s.message_samples;
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 1,
-                velocity: 100,
-            },
-            0,
-        );
-        assert_eq!(
-            s.poll(0),
-            Some(TransportMessage::NoteOn {
-                note: 1,
-                velocity: 100
-            })
-        );
+        s.push(on(1), 0);
+        assert_eq!(s.poll(0), Some(on(1)));
         assert_eq!(s.poll(hb - 1), None);
-        assert_eq!(s.poll(hb), Some(TransportMessage::Heartbeat));
-        let _ = msg;
+        assert_eq!(s.poll(hb), Some(Heartbeat));
     }
 
     #[test]
-    fn refresh_immediately_after_note_off() {
+    fn refresh_right_after_note_off() {
         let mut s = fast_scheduler();
         let msg = s.message_samples;
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100,
-            },
-            0,
-        );
-        let _ = s.poll(0);
-        s.push_time(TransportMessage::NoteOff { note: 60 }, msg);
-        let _ = s.poll(msg);
-        assert_eq!(
-            s.poll(msg + msg),
-            Some(TransportMessage::NoteOff { note: 60 })
-        );
-        assert_eq!(s.poll(msg + msg), None);
-        assert_eq!(
-            s.poll(msg + msg + msg),
-            Some(TransportMessage::NoteOff { note: 60 })
-        );
+        let t = play_and_release(&mut s, 60, 0);
+        assert_eq!(s.poll(t), None);
+        assert_eq!(s.poll(t + msg), Some(NoteOff { note: 60 }));
+        assert_eq!(s.poll(t + msg), None);
+        assert_eq!(s.poll(t + 2 * msg), Some(NoteOff { note: 60 }));
     }
 
     #[test]
     fn two_notes_refresh_round_robin() {
         let mut s = fast_scheduler();
         let msg = s.message_samples;
-        for (note, t_on) in [(10u8, 0u64), (20, msg * 2)] {
-            s.push_time(
-                TransportMessage::NoteOn {
-                    note,
-                    velocity: 100,
-                },
-                t_on,
-            );
-            let _ = s.poll(t_on);
-            let t_off = t_on + msg;
-            s.push_time(TransportMessage::NoteOff { note }, t_off);
-            let _ = s.poll(t_off);
-        }
-        let base = msg * 4;
-        assert_eq!(s.poll(base), Some(TransportMessage::NoteOff { note: 10 }));
-        assert_eq!(
-            s.poll(base + msg),
-            Some(TransportMessage::NoteOff { note: 20 })
-        );
-        assert_eq!(
-            s.poll(base + msg * 2),
-            Some(TransportMessage::NoteOff { note: 10 })
-        );
+        play_and_release(&mut s, 10, 0);
+        let t = play_and_release(&mut s, 20, 2 * msg);
+        assert_eq!(s.poll(t + msg), Some(NoteOff { note: 10 }));
+        assert_eq!(s.poll(t + 2 * msg), Some(NoteOff { note: 20 }));
+        assert_eq!(s.poll(t + 3 * msg), Some(NoteOff { note: 10 }));
     }
 
     #[test]
     fn note_on_push_does_not_cancel_refresh() {
         let mut s = fast_scheduler();
-        let msg = s.message_samples;
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100,
-            },
-            0,
-        );
-        let _ = s.poll(0);
-        s.push_time(TransportMessage::NoteOff { note: 60 }, msg);
-        let _ = s.poll(msg);
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 70,
-                velocity: 80,
-            },
-            msg + 1,
-        );
-        assert!(s.refresh_notes().contains(&60));
-        assert_eq!(
-            s.poll(msg + msg),
-            Some(TransportMessage::NoteOn {
-                note: 70,
-                velocity: 80
-            })
-        );
-        assert!(s.refresh_notes().contains(&60));
+        let t = play_and_release(&mut s, 60, 0);
+        s.push(on(70), t + 1);
+        assert!(refresh_notes(&s).contains(&60));
+        assert_eq!(s.poll(t + s.message_samples), Some(on(70)));
+        assert!(refresh_notes(&s).contains(&60));
     }
 
     #[test]
     fn note_on_emit_cancels_refresh() {
         let mut s = fast_scheduler();
-        let msg = s.message_samples;
         let hb = s.heartbeat_interval_samples;
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100,
-            },
-            0,
-        );
-        let _ = s.poll(0);
-        s.push_time(TransportMessage::NoteOff { note: 60 }, msg);
-        let _ = s.poll(msg);
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 80,
-            },
-            msg + msg,
-        );
-        let _ = s.poll(msg + msg);
-        let t = msg + msg + msg + hb;
-        assert_eq!(s.poll(t), Some(TransportMessage::Heartbeat));
+        let t = play_and_release(&mut s, 60, 0);
+        s.push(on(60), t + 1);
+        assert_eq!(s.poll(t + 1), Some(on(60)));
+        assert!(refresh_notes(&s).is_empty());
+        assert_eq!(s.poll(t + 1 + hb), Some(Heartbeat));
     }
 
     #[test]
     fn refresh_evicts_oldest_at_capacity() {
         let mut s = fast_scheduler();
-        let msg = s.message_samples;
         let mut t = 0u64;
         for note in 0..33u8 {
-            s.push_time(
-                TransportMessage::NoteOn {
-                    note,
-                    velocity: 100,
-                },
-                t,
-            );
+            s.push(on(note), t);
             let _ = s.poll(t);
-            t += msg;
-            s.push_time(TransportMessage::NoteOff { note }, t);
-            let _ = s.poll(t);
-            t += msg;
+            s.push(NoteOff { note }, t + 1);
+            let _ = s.poll(t + 1);
+            t += 2;
         }
-        assert!(!s.refresh_notes().contains(&0));
-        assert_eq!(s.poll(t), Some(TransportMessage::NoteOff { note: 1 }));
+        assert!(!refresh_notes(&s).contains(&0));
+        assert_eq!(s.poll(t + s.message_samples), Some(NoteOff { note: 1 }));
     }
 
     #[test]
-    fn refresh_expires_after_10s() {
+    fn refresh_expires_after_lifetime() {
         let mut s = fast_scheduler();
         let hb = s.heartbeat_interval_samples;
+        let t = play_and_release(&mut s, 60, 0);
+        assert_eq!(s.poll(t + s.refresh_lifetime_samples + hb), Some(Heartbeat));
+    }
+
+    /// Each release costs a bounded number of repeats, then heartbeats resume.
+    #[test]
+    fn refresh_stops_after_max_repeats() {
+        let mut s = fast_scheduler();
         let msg = s.message_samples;
-        let lifetime = s.refresh_lifetime_samples;
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100,
-            },
-            0,
-        );
-        let _ = s.poll(0);
-        s.push_time(TransportMessage::NoteOff { note: 60 }, msg);
-        let _ = s.poll(msg);
-        let t = msg + lifetime + hb;
-        assert_eq!(s.poll(t), Some(TransportMessage::Heartbeat));
+        let mut t = play_and_release(&mut s, 60, 0);
+        for _ in 0..REFRESH_MAX_REPEATS {
+            t += msg;
+            assert_eq!(s.poll(t), Some(NoteOff { note: 60 }));
+        }
+        assert!(refresh_notes(&s).is_empty());
+        assert_eq!(s.poll(t + msg), None);
+        assert_eq!(s.poll(t + s.heartbeat_interval_samples), Some(Heartbeat));
     }
 
     #[test]
     fn note_off_while_note_on_queued_keeps_both_in_order() {
         let mut s = fast_scheduler();
         let msg = s.message_samples;
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100,
-            },
-            0,
-        );
-        s.push_time(TransportMessage::NoteOff { note: 60 }, 0);
+        s.push(on(60), 0);
+        s.push(NoteOff { note: 60 }, 0);
         assert_eq!(s.queued(), 2);
+        assert_eq!(s.poll(0), Some(on(60)));
+        assert_eq!(s.poll(msg), Some(NoteOff { note: 60 }));
+    }
+
+    /// Off, on, off on a note that is already sounding (a trill or a roll)
+    /// must end released, not with the NoteOn sent last.
+    #[test]
+    fn retrigger_while_sounding_keeps_order() {
+        let mut s = fast_scheduler();
+        let msg = s.message_samples;
+        s.push(on(60), 0);
+        assert_eq!(s.poll(0), Some(on(60)));
+        s.push(NoteOff { note: 60 }, 10);
+        s.push(on(60), 20);
+        s.push(NoteOff { note: 60 }, 30);
+        s.push(on(60), 40);
+        s.push(NoteOff { note: 60 }, 50);
+        let sent: Vec<_> = (1..=5).map(|i| s.poll(i * msg).unwrap()).collect();
         assert_eq!(
-            s.poll(0),
-            Some(TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100
-            })
+            sent,
+            vec![
+                NoteOff { note: 60 },
+                on(60),
+                NoteOff { note: 60 },
+                on(60),
+                NoteOff { note: 60 }
+            ]
         );
-        assert_eq!(s.poll(msg), Some(TransportMessage::NoteOff { note: 60 }));
+        assert_eq!(s.queued(), 0);
+        assert_eq!(refresh_notes(&s), vec![60]);
     }
 
     #[test]
     fn emitted_note_off_never_dropped() {
         let mut s = fast_scheduler();
         let msg = s.message_samples;
-        s.push_time(
-            TransportMessage::NoteOn {
-                note: 60,
-                velocity: 100,
-            },
-            0,
-        );
+        s.push(on(60), 0);
         let _ = s.poll(0);
-        s.push_time(TransportMessage::NoteOff { note: 60 }, msg);
+        s.push(NoteOff { note: 60 }, msg);
         for i in 0..50u8 {
-            s.push_time(
-                TransportMessage::NoteOn {
-                    note: 70 + i,
-                    velocity: 100,
-                },
-                msg + i as u64,
-            );
+            s.push(on(70 + i), msg + i as u64);
         }
-        assert!(!s.note_off_q.is_empty());
-        assert_eq!(s.poll(msg), Some(TransportMessage::NoteOff { note: 60 }));
+        assert_eq!(s.poll(msg), Some(NoteOff { note: 60 }));
     }
 
     #[test]
     fn noteon_budget_drops_oldest_not_panic() {
         let mut s = fast_scheduler();
-        let budget = s.noteon_budget_samples;
-        let msg = s.message_samples;
-        let max_noteons = (budget / msg).max(1) as usize;
+        let max_noteons = (s.noteon_budget_samples / s.message_samples).max(1) as usize;
         for i in 0..max_noteons + 2 {
-            s.push_time(
-                TransportMessage::NoteOn {
-                    note: i as u8,
-                    velocity: 100,
-                },
-                0,
-            );
+            s.push(on(i as u8), 0);
         }
-        assert!(s.stale_note_on_dropped);
-        s.push_time(TransportMessage::Panic, 0);
-        assert_eq!(s.poll(0), Some(TransportMessage::Panic));
+        assert!(s.note_on_dropped);
+        s.push(Panic, 0);
+        assert_eq!(s.poll(0), Some(Panic));
+    }
+
+    /// A Robust message is longer than the airtime budget; a chord pushed at
+    /// once must still be sent whole.
+    #[test]
+    fn robust_chord_is_not_dropped() {
+        let mut s = scheduler(&PhyConfig::robust());
+        assert!(s.message_samples > s.noteon_budget_samples);
+        for n in [60u8, 64, 67, 72] {
+            s.push(on(n), 0);
+        }
+        assert!(!s.note_on_dropped);
+        let sent: Vec<_> = (0..4).map(|i| s.poll(i * s.message_samples)).collect();
+        assert_eq!(
+            sent,
+            vec![Some(on(60)), Some(on(64)), Some(on(67)), Some(on(72))]
+        );
+    }
+
+    /// Dropping a queued re-strike must not lose the release of the note
+    /// that is still sounding from its earlier strike.
+    #[test]
+    fn dropped_restrike_keeps_release_of_sounding_note() {
+        let mut s = fast_scheduler();
+        s.push(on(60), 0);
+        assert_eq!(s.poll(0), Some(on(60)));
+        s.push(on(60), 1);
+        s.push(NoteOff { note: 60 }, 2);
+        for n in 70..80u8 {
+            s.push(on(n), 3);
+        }
+        assert!(s.note_on_dropped);
+        assert_eq!(s.poll(4), Some(NoteOff { note: 60 }));
     }
 
     #[test]
     fn fast_10_per_sec_60s_latency_under_250ms() {
-        let config = PhyConfig::fast();
-        let hz = config.sample_rate_hz;
-        let msg = repetition_samples(&config) * config.repetition_k.max(1) as u64;
-        let hb = hz as u64 * config.heartbeat_interval_ms as u64 / 1000;
-        let mut s = TxScheduler::new(hz, hb, msg);
-        let interval = hz as u64 / 10;
-        let duration = hz as u64 * 60;
-        let mut next_push = 0u64;
-        let mut stream = 0u64;
-        let mut max_wait = 0u64;
-        let budget = ms_samples(hz, NOTEON_BUDGET_MS);
-        let mut note = 0u8;
-        let mut user_emitted = 0u64;
+        let mut s = fast_scheduler();
+        let hz = PhyConfig::fast().sample_rate_hz as u64;
+        let msg = s.message_samples;
+        let interval = hz / 10;
+        let duration = hz * 60;
+        let budget = s.noteon_budget_samples;
+        let (mut next_push, mut stream, mut max_wait) = (0u64, 0u64, 0u64);
+        let (mut note, mut user_emitted) = (0u8, 0u64);
 
         while stream < duration || s.queued() > 0 {
             while next_push <= stream && next_push < duration {
-                s.push(
-                    TransportMessage::NoteOn {
-                        note,
-                        velocity: 100,
-                    },
-                    next_push,
-                );
+                s.push(on(note), next_push);
                 note = note.wrapping_add(1);
                 next_push += interval;
             }
-            let wait = s.peek_next_wait(stream);
+            let wait = s.oldest_wait_samples(stream);
             if let Some(result) = s.poll_detailed(stream) {
                 if result.user {
                     user_emitted += 1;
-                    if let Some(w) = wait {
-                        max_wait = max_wait.max(w);
-                    }
+                    max_wait = max_wait.max(wait);
                 }
                 stream += msg;
-            } else if s.queued() == 0 {
-                stream = stream.saturating_add(1);
             } else {
                 stream += 1;
             }
         }
-        assert!(
-            user_emitted >= duration / interval,
-            "expected ~{} user messages, got {}",
-            duration / interval,
-            user_emitted
-        );
+        assert!(user_emitted >= duration / interval);
         assert!(
             max_wait <= budget,
             "max queue wait {} samples (> {} = 250 ms)",

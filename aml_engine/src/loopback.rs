@@ -1,8 +1,8 @@
 //! MIDI-in → audio → MIDI-out latency measurement (hardware-free, paced).
 //!
-//! Built on [`crate::testing`] endpoints; enabled with the `testing` feature.
+//! Built on the in-memory endpoints in [`crate::memory`].
 
-use crate::testing::{MemoryAudio, MemoryMidiInput, RecordingMidiSink};
+use crate::memory::{MemoryAudio, MemoryMidiInjector, MemoryMidiInput, RecordingMidiSink};
 use crate::{
     AudioIn, AudioOut, DecoderConfig, DecoderHandle, EncoderConfig, EncoderHandle, MidiIn, MidiOut,
 };
@@ -13,6 +13,15 @@ use std::time::{Duration, Instant};
 
 const RATE: u32 = 48_000;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Each note is held this long after its NoteOn arrives, then released ...
+const HOLD: Duration = Duration::from_millis(150);
+/// ... and the next note is struck 150–450 ms after the release (a fixed
+/// spread, so notes do not lock to the heartbeat cadence and always land on
+/// the same point of it). Releases make the encoder repeat NoteOffs, which a
+/// following NoteOn may wait behind.
+fn rest(i: usize) -> Duration {
+    Duration::from_millis(150 + (i as u64 * 7919 % 31) * 10)
+}
 
 /// Summary of one loopback run (milliseconds).
 #[derive(Debug, Clone, PartialEq)]
@@ -75,8 +84,9 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
-/// Measure wall-clock MIDI-in → MIDI-out latency for `profile` (`"fast"` /
-/// `"robust"`), injecting `note_count` NoteOn messages (no NoteOff).
+/// Measure wall-clock MIDI-in → MIDI-out NoteOn latency for `profile`
+/// (`"fast"` / `"robust"`) over `note_count` notes, each held for [`HOLD`],
+/// released, and followed by a [`rest`] before the next one.
 pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<LatencySummary> {
     if note_count == 0 {
         return Err(anyhow!("note_count must be at least 1"));
@@ -84,8 +94,6 @@ pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<Latency
 
     let config = PhyConfig::from_name(profile);
     let packet_samples = repetition_samples(&config) * config.repetition_k.max(1) as u64;
-    let packet_duration =
-        Duration::from_secs_f64(packet_samples as f64 / config.sample_rate_hz as f64);
     let sink_capacity = (packet_samples * 2).max(512) as usize;
 
     let (sink, source) = MemoryAudio::pair(RATE, sink_capacity);
@@ -99,16 +107,36 @@ pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<Latency
     })?;
 
     let (midi_in, injector) = MemoryMidiInput::new();
-    let mut enc = EncoderHandle::start(EncoderConfig {
+    let mut enc = match EncoderHandle::start(EncoderConfig {
         audio_out: AudioOut::Custom(Box::new(sink)),
         midi_in: MidiIn::Custom(Box::new(midi_in)),
         profile: profile.into(),
         simulate: false,
-    })?;
+    }) {
+        Ok(enc) => enc,
+        Err(e) => {
+            let _ = dec.stop();
+            return Err(e);
+        }
+    };
 
+    let result = play_notes(&injector, &rec, note_count);
+    let enc_stopped = enc.stop();
+    let dec_stopped = dec.stop();
+    let latencies = result?;
+    if !enc_stopped || !dec_stopped {
+        return Err(anyhow!("loopback workers did not stop"));
+    }
+    Ok(summary_from_latencies(&latencies))
+}
+
+/// Plays the notes and returns each NoteOn's latency in milliseconds.
+fn play_notes(
+    injector: &MemoryMidiInjector,
+    rec: &RecordingMidiSink,
+    note_count: usize,
+) -> Result<Vec<f64>> {
     if !wait_until(Duration::from_secs(5), || injector.inject(&[0xF6])) {
-        let _ = enc.stop();
-        let _ = dec.stop();
         return Err(anyhow!("MIDI input did not connect"));
     }
 
@@ -124,8 +152,6 @@ pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<Latency
 
         let t0 = Instant::now();
         if !injector.inject(&expected) {
-            let _ = enc.stop();
-            let _ = dec.stop();
             return Err(anyhow!("MIDI inject failed on note {}", note));
         }
 
@@ -135,8 +161,6 @@ pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<Latency
                 .any(|m| m.as_slice() == expected.as_slice())
         });
         if !delivered {
-            let _ = enc.stop();
-            let _ = dec.stop();
             return Err(anyhow!(
                 "NoteOn note={} not delivered within {:.0} s",
                 note,
@@ -145,21 +169,11 @@ pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<Latency
         }
         latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
 
-        if i + 1 < note_count {
-            std::thread::sleep(packet_duration);
+        std::thread::sleep(HOLD);
+        if !injector.inject(&[0x80, note, 0]) {
+            return Err(anyhow!("MIDI inject failed on note {}", note));
         }
+        std::thread::sleep(rest(i));
     }
-
-    assert!(enc.stop());
-    assert!(dec.stop());
-
-    if latencies.len() < note_count {
-        return Err(anyhow!(
-            "only {} of {} NoteOns delivered",
-            latencies.len(),
-            note_count
-        ));
-    }
-
-    Ok(summary_from_latencies(&latencies))
+    Ok(latencies)
 }

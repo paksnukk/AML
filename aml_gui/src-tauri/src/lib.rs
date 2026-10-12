@@ -265,21 +265,21 @@ fn format_latency_line(profile: &str, s: &aml_engine::LatencySummary) -> String 
     )
 }
 
+/// Runs on a blocking worker thread: the measurement plays notes in real time
+/// for several seconds and must not stall the UI.
 #[tauri::command]
-fn run_self_test() -> Result<Vec<String>, String> {
-    let mut lines = Vec::new();
-    for profile in ["fast", "robust"] {
-        let s = aml_engine::measure_midi_loopback(profile, SELF_TEST_NOTES)
-            .map_err(|e| e.to_string())?;
-        if s.n < SELF_TEST_NOTES {
-            return Err(format!(
-                "{}: only {} of {} NoteOns delivered",
-                profile, s.n, SELF_TEST_NOTES
-            ));
+async fn run_self_test() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut lines = Vec::new();
+        for profile in ["fast", "robust"] {
+            let s = aml_engine::measure_midi_loopback(profile, SELF_TEST_NOTES)
+                .map_err(|e| format!("{}: {}", profile, e))?;
+            lines.push(format_latency_line(profile, &s));
         }
-        lines.push(format_latency_line(profile, &s));
-    }
-    Ok(lines)
+        Ok(lines)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

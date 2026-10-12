@@ -17,8 +17,8 @@
 //!
 //! Idle TX slots use [`TxScheduler`]: any non-zero gap can start one packet, the
 //! way the encoder does when it does not yet know the next note is coming.
-//! Recently released notes are repeated round-robin for 10 s. Heartbeats are
-//! sent only when that list is empty (v1.1 A8 / C1).
+//! Recently released notes are repeated round-robin, up to 6 times each within
+//! 10 s. Heartbeats are sent only when that list is empty (v1.1 A8 / C1).
 
 mod support;
 
