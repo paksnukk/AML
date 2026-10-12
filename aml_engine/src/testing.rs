@@ -7,6 +7,7 @@ use crate::midi::{MidiCallback, MidiInputGuard, MidiSink, MidiSource};
 use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 type Pipe = Arc<Mutex<VecDeque<f32>>>;
 
@@ -104,6 +105,17 @@ impl MemorySource {
     pub fn errors(&self) -> DeviceErrorQueue {
         self.errors.clone()
     }
+
+    /// Same pipe, but samples are delivered at real-time rate when pulled.
+    pub fn into_paced(self) -> PacedMemorySource {
+        PacedMemorySource {
+            pipe: self.pipe,
+            sample_rate: self.sample_rate,
+            clock: Instant::now(),
+            delivered: 0,
+            errors: self.errors,
+        }
+    }
 }
 
 impl AudioSource for MemorySource {
@@ -130,6 +142,66 @@ impl AudioSource for MemorySource {
 }
 
 impl OpenAudioSource for MemorySource {
+    fn open(
+        self: Box<Self>,
+        _preferred_rate: u32,
+        _buffer_samples: usize,
+    ) -> Result<Box<dyn AudioSource>> {
+        Ok(self)
+    }
+}
+
+/// Like [`MemorySource`], but releases samples only as wall-clock time × sample
+/// rate allows (real-time pacing for loopback latency tests).
+pub struct PacedMemorySource {
+    pipe: Pipe,
+    sample_rate: u32,
+    clock: Instant,
+    delivered: u64,
+    errors: DeviceErrorQueue,
+}
+
+impl AudioSource for PacedMemorySource {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    fn channels(&self) -> usize {
+        1
+    }
+    fn start(&mut self) -> Result<()> {
+        self.clock = Instant::now();
+        self.delivered = 0;
+        Ok(())
+    }
+    fn pull(&mut self, out: &mut [f32]) -> usize {
+        // Silence must not accumulate playback credit. A packet pushed after
+        // an idle stretch is then released over its own duration, which is
+        // the airtime a real device would take.
+        if self.pipe.lock().unwrap().is_empty() {
+            self.clock = Instant::now();
+            self.delivered = 0;
+            return 0;
+        }
+        let elapsed = self.clock.elapsed().as_secs_f64();
+        let target = (elapsed * self.sample_rate as f64).floor() as u64;
+        let budget = target.saturating_sub(self.delivered) as usize;
+        if budget == 0 {
+            return 0;
+        }
+        let mut q = self.pipe.lock().unwrap();
+        let n = out.len().min(budget).min(q.len());
+        for (dst, src) in out.iter_mut().zip(q.drain(..n)) {
+            *dst = src;
+        }
+        self.delivered += n as u64;
+        n
+    }
+    fn take_error(&mut self) -> Option<String> {
+        self.errors.pop()
+    }
+}
+
+impl OpenAudioSource for PacedMemorySource {
     fn open(
         self: Box<Self>,
         _preferred_rate: u32,

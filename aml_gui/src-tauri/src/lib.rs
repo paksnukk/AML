@@ -14,7 +14,6 @@
 
 pub mod settings;
 
-use aml_core::modem::{decode_samples, encode_to_samples};
 use aml_core::phy::PhyConfig;
 use aml_engine::{
     audio, format_message, link_state_name, midi, AudioIn, AudioOut, DecoderConfig, DecoderHandle,
@@ -111,6 +110,13 @@ enum FrontendEvent {
     Alarm(AlarmEvent),
     AlarmCleared(AlarmEvent),
     WorkerStopped(WorkerStoppedEvent),
+    TxStatus(TxStatusEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct TxStatusEvent {
+    queued: usize,
+    latency_ms: f32,
 }
 
 impl FrontendEvent {
@@ -123,6 +129,7 @@ impl FrontendEvent {
             FrontendEvent::Alarm(p) => app.emit("alarm", p),
             FrontendEvent::AlarmCleared(p) => app.emit("alarm_cleared", p),
             FrontendEvent::WorkerStopped(p) => app.emit("worker_stopped", p),
+            FrontendEvent::TxStatus(p) => app.emit("tx_status", p),
         }
     }
 }
@@ -170,8 +177,9 @@ fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
             role: run.role,
             run_id: run.id,
         }),
-        // No frontend listener yet (queue/latency UI is D2).
-        EngineEvent::TxStatus { .. } => return None,
+        EngineEvent::TxStatus { queued, latency_ms } => {
+            FrontendEvent::TxStatus(TxStatusEvent { queued, latency_ms })
+        }
     })
 }
 
@@ -248,35 +256,40 @@ fn get_profile_info(profile: String) -> Result<serde_json::Value, String> {
     }))
 }
 
+const SELF_TEST_NOTES: usize = 8;
+
+fn format_latency_line(profile: &str, s: &aml_engine::LatencySummary) -> String {
+    format!(
+        "{}: n={} mean={:.1} ms p95={:.1} ms jitter={:.1} ms (measured)",
+        profile, s.n, s.mean_ms, s.p95_ms, s.jitter_ms
+    )
+}
+
 #[tauri::command]
-fn run_self_test(profile: String) -> Result<String, String> {
-    let config = parse_profile(&profile);
-    let messages = vec![
-        TransportMessage::NoteOn {
-            note: 60,
-            velocity: 100,
-        },
-        TransportMessage::NoteOff { note: 60 },
-        TransportMessage::Heartbeat,
-    ];
-    let samples = encode_to_samples(config.clone(), &messages);
-    let decoded = decode_samples(config.clone(), &samples);
-    let ok = decoded
-        .iter()
-        .any(|m| matches!(m, TransportMessage::NoteOn { .. }))
-        && decoded
-            .iter()
-            .any(|m| matches!(m, TransportMessage::NoteOff { .. }));
-    if ok {
-        Ok(format!(
-            "Self-test OK ({}). est latency {:.0} ms. Decoded {} msgs.",
-            profile,
-            config.estimated_first_copy_ms(),
-            decoded.len()
-        ))
-    } else {
-        Err(format!("Self-test FAILED. Got: {:?}", decoded))
+fn run_self_test() -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for profile in ["fast", "robust"] {
+        let s = aml_engine::measure_midi_loopback(profile, SELF_TEST_NOTES)
+            .map_err(|e| e.to_string())?;
+        if s.n < SELF_TEST_NOTES {
+            return Err(format!(
+                "{}: only {} of {} NoteOns delivered",
+                profile, s.n, SELF_TEST_NOTES
+            ));
+        }
+        lines.push(format_latency_line(profile, &s));
     }
+    Ok(lines)
+}
+
+#[tauri::command]
+fn encoder_panic(state: State<'_, AppState>) -> Result<(), String> {
+    let slot = state.encoder.lock().unwrap();
+    let Some(running) = slot.as_ref() else {
+        return Err("Encoder is not running".into());
+    };
+    running.handle.send(TransportMessage::Panic);
+    Ok(())
 }
 
 /// Start the decoder. `audio_in` / `midi_out` are device names as listed by
@@ -379,6 +392,7 @@ pub fn run() {
             set_settings,
             get_profile_info,
             run_self_test,
+            encoder_panic,
             start_decoder,
             stop_decoder,
             start_encoder,
@@ -452,12 +466,15 @@ mod tests {
         assert_eq!(
             to_frontend(
                 EngineEvent::TxStatus {
-                    queued: 0,
-                    latency_ms: 0.0
+                    queued: 3,
+                    latency_ms: 12.5
                 },
                 RUN
             ),
-            None
+            Some(FrontendEvent::TxStatus(TxStatusEvent {
+                queued: 3,
+                latency_ms: 12.5
+            }))
         );
     }
 

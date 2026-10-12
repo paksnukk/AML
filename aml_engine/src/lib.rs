@@ -31,11 +31,16 @@ pub mod decoder;
 pub mod devices;
 pub mod encoder;
 pub mod events;
+#[cfg(any(test, feature = "testing"))]
+pub mod loopback;
 pub mod midi;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod loopback_tests;
 
 pub use aml_core::transport::TransportMessage;
 pub use audio::{
@@ -45,6 +50,10 @@ pub use decoder::{DecoderConfig, DecoderHandle};
 pub use devices::DeviceSelector;
 pub use encoder::{EncoderConfig, EncoderHandle};
 pub use events::{format_message, link_state_name, AlarmKind, EngineEvent, LinkStats};
+#[cfg(any(test, feature = "testing"))]
+pub use loopback::{
+    jitter_ms, mean_ms, measure_midi_loopback, percentile_nearest_rank_ms, LatencySummary,
+};
 pub use midi::{MidiCallback, MidiIn, MidiInputGuard, MidiOut, MidiSink, MidiSource};
 
 use std::sync::atomic::{AtomicBool, Ordering};

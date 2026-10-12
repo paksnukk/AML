@@ -1,7 +1,7 @@
-use aml_core::modem::{AmlModemRx, AmlModemTx, ModemOutput};
 use aml_core::phy::PhyConfig;
 use aml_core::transport::TransportMessage;
 use aml_core::wav::{read_wav_f32, write_wav_f32};
+use aml_engine::measure_midi_loopback;
 use aml_engine::{
     audio, midi, AlarmKind, AudioIn, AudioOut, DecoderConfig, DecoderHandle, DeviceSelector,
     EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
@@ -9,7 +9,6 @@ use aml_engine::{
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
 
 /// Profile the real-time CLI modes run (no flag yet).
 const PROFILE: &str = "robust";
@@ -206,56 +205,25 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+const LOOPBACK_NOTES: usize = 20;
+
 fn run_loopback_metrics() -> Result<()> {
-    println!("AML V2 in-process loopback latency measurement...");
-    let config = PhyConfig::robust();
-    let mut tx = AmlModemTx::new(config.clone());
-    let mut rx = AmlModemRx::new(config.clone());
-
-    let mut latencies_ms = Vec::new();
-    for note in [60u8, 62, 64, 65, 67] {
-        let msg = TransportMessage::NoteOn { note, velocity: 90 };
-        let t0 = Instant::now();
-        let audio = tx.encode_message(&msg);
-        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        let t1 = Instant::now();
-        let mut got = None;
-        for chunk in audio.chunks(256) {
-            for out in rx.push_samples(chunk) {
-                if let ModemOutput::Message(m) = out {
-                    if got.is_none() {
-                        got = Some(m);
-                    }
-                }
-            }
+    println!("AML engine loopback latency (paced MIDI in → MIDI out)...");
+    for profile in ["fast", "robust"] {
+        let s = measure_midi_loopback(profile, LOOPBACK_NOTES)?;
+        if s.n < LOOPBACK_NOTES {
+            return Err(anyhow!(
+                "{}: only {} of {} NoteOns delivered",
+                profile,
+                s.n,
+                LOOPBACK_NOTES
+            ));
         }
-        let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        let audio_ms = audio.len() as f64 * 1000.0 / config.sample_rate_hz as f64;
-        // One repetition duration approximates delivery latency (K=2 sends two copies)
-        let one_rep_ms = audio_ms / config.repetition_k.max(1) as f64;
-
         println!(
-            "note {}: encode={:.2}ms decode_cpu={:.2}ms audio_total={:.1}ms ~e2e_first_copy={:.1}ms got={:?}",
-            note, encode_ms, decode_ms, audio_ms, one_rep_ms, got
+            "{}: n={} mean={:.1} ms p95={:.1} ms jitter={:.1} ms",
+            profile, s.n, s.mean_ms, s.p95_ms, s.jitter_ms
         );
-        assert_eq!(got, Some(msg));
-        latencies_ms.push(one_rep_ms);
     }
-
-    let avg = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
-    let min = latencies_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = latencies_ms
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    println!(
-        "Latency (first repetition audio duration): avg={:.1}ms min={:.1}ms max={:.1}ms jitter={:.1}ms",
-        avg,
-        min,
-        max,
-        max - min
-    );
     Ok(())
 }
 

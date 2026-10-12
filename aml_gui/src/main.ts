@@ -30,6 +30,14 @@ const saveSettingsBtn = document.getElementById(
 const selfTestBtn = document.getElementById(
   "self-test-btn",
 ) as HTMLButtonElement;
+const selfTestResults = document.getElementById(
+  "self-test-results",
+) as HTMLElement;
+const panicBtn = document.getElementById("panic-btn") as HTMLButtonElement;
+const txQueuedEl = document.getElementById("tx-queued") as HTMLElement;
+const txQueueLatencyEl = document.getElementById(
+  "tx-queue-latency",
+) as HTMLElement;
 
 const startListenBtn = document.getElementById(
   "start-listening-btn",
@@ -177,14 +185,18 @@ async function refreshProfileHint() {
     const info = await invoke<{ est_latency_ms: number }>("get_profile_info", {
       profile: profileSelect.value,
     });
-    linkLatencyEl.textContent = info.est_latency_ms.toFixed(0);
     profileHint.textContent =
       profileSelect.value === "fast"
-        ? `Fast ≈ ${info.est_latency_ms.toFixed(0)} ms — clean dedicated chain only.`
-        : `Robust ≈ ${info.est_latency_ms.toFixed(0)} ms — preferred default.`;
+        ? `Fast — notes on a clean dedicated line (no EQ, compression, or limiter). ≈ ${info.est_latency_ms.toFixed(0)} ms first-copy airtime.`
+        : `Robust — cue and program-change triggers on an uncertain chain, about 3–4 messages per second. ≈ ${info.est_latency_ms.toFixed(0)} ms first-copy airtime.`;
   } catch (e) {
     log(`Profile info error: ${e}`);
   }
+}
+
+function clearTxQueueDisplay() {
+  txQueuedEl.textContent = "—";
+  txQueueLatencyEl.textContent = "—";
 }
 
 async function loadDevices() {
@@ -284,13 +296,17 @@ document.querySelectorAll('input[name="mode"]').forEach((el) => {
 });
 
 selfTestBtn.addEventListener("click", async () => {
+  selfTestBtn.disabled = true;
+  selfTestResults.textContent = "Measuring loopback latency (paced)…";
   try {
-    const result = await invoke<string>("run_self_test", {
-      profile: profileSelect.value,
-    });
-    log(result);
+    const lines = await invoke<string[]>("run_self_test");
+    for (const line of lines) log(line);
+    selfTestResults.textContent = lines.join(" · ");
   } catch (e) {
+    selfTestResults.textContent = "";
     log(`Self-test failed: ${e}`);
+  } finally {
+    selfTestBtn.disabled = false;
   }
 });
 
@@ -325,9 +341,11 @@ function setRunningUi(role: Role, running: boolean) {
   } else {
     startEncodeBtn.disabled = running;
     stopEncodeBtn.disabled = !running;
+    panicBtn.disabled = !running;
     outputDeviceSelect.disabled = running;
     midiInSelect.disabled = running;
     simulateCheck.disabled = running;
+    if (!running) clearTxQueueDisplay();
   }
 }
 
@@ -419,6 +437,15 @@ stopEncodeBtn.addEventListener("click", async () => {
   }
 });
 
+panicBtn.addEventListener("click", async () => {
+  try {
+    await invoke("encoder_panic");
+    log("Encoder panic sent (All Notes Off).");
+  } catch (error) {
+    log(`Panic failed: ${error}`);
+  }
+});
+
 async function bindEvents() {
   // A worker ended (missing/failed device, panic, or a deliberate stop).
   // Only the run the UI shows as running is reset; see `currentRun`.
@@ -495,6 +522,12 @@ async function bindEvents() {
   await listen<{ kind: string; message: string }>("alarm_cleared", (event) => {
     if (alarmKind === event.payload.kind) clearAlarm();
     log(event.payload.message);
+  });
+
+  await listen<{ queued: number; latency_ms: number }>("tx_status", (event) => {
+    const { queued, latency_ms } = event.payload;
+    txQueuedEl.textContent = String(queued);
+    txQueueLatencyEl.textContent = latency_ms.toFixed(0);
   });
 }
 
