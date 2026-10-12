@@ -59,57 +59,55 @@ pub enum MidiIn {
     Custom(Box<dyn MidiSource>),
 }
 
-fn port_names<T: midir::MidiIO>(io: &T) -> Vec<String> {
-    io.ports()
+/// Names of `ports` (as returned by `io.ports()`), in the same order.
+fn port_names<T: midir::MidiIO>(io: &T, ports: &[T::Port]) -> Vec<String> {
+    ports
         .iter()
         .map(|p| io.port_name(p).unwrap_or_else(|_| "Unknown".into()))
         .collect()
 }
 
-/// MIDI input port names in enumeration order (index = [`DeviceSelector::Index`]).
+/// MIDI input port names in enumeration order (index = [`DeviceSelector::Index`];
+/// each name is valid for [`DeviceSelector::Name`]).
 pub fn list_inputs() -> Result<Vec<String>> {
     let midi_in = midir::MidiInput::new("aml list in").map_err(|e| anyhow!("{}", e))?;
-    Ok(port_names(&midi_in))
+    Ok(port_names(&midi_in, &midi_in.ports()))
 }
 
-/// MIDI output port names in enumeration order (index = [`DeviceSelector::Index`]).
+/// MIDI output port names in enumeration order (index = [`DeviceSelector::Index`];
+/// each name is valid for [`DeviceSelector::Name`]).
 pub fn list_outputs() -> Result<Vec<String>> {
     let midi_out = midir::MidiOutput::new("aml list out").map_err(|e| anyhow!("{}", e))?;
-    Ok(port_names(&midi_out))
+    Ok(port_names(&midi_out, &midi_out.ports()))
 }
 
-fn port_index(selector: &DeviceSelector, dir: &str) -> Result<usize> {
+/// Position of the selected port in `names` (MIDI has no default port).
+fn port_index<S: AsRef<str>>(selector: &DeviceSelector, names: &[S], dir: &str) -> Result<usize> {
     selector
-        .index()
+        .resolve(names, &format!("MIDI {}", dir))?
         .ok_or_else(|| anyhow!("No MIDI {} port selected", dir))
 }
 
 /// Name of the selected input port (errors if it does not exist).
 pub fn input_port_name(selector: &DeviceSelector) -> Result<String> {
-    let index = port_index(selector, "in")?;
-    list_inputs()?
-        .into_iter()
-        .nth(index)
-        .ok_or_else(|| anyhow!("MIDI in index {} not found", index))
+    let mut names = list_inputs()?;
+    let index = port_index(selector, &names, "in")?;
+    Ok(names.swap_remove(index))
 }
 
 /// Name of the selected output port (errors if it does not exist).
 pub fn output_port_name(selector: &DeviceSelector) -> Result<String> {
-    let index = port_index(selector, "out")?;
-    list_outputs()?
-        .into_iter()
-        .nth(index)
-        .ok_or_else(|| anyhow!("MIDI out index {} not found", index))
+    let mut names = list_outputs()?;
+    let index = port_index(selector, &names, "out")?;
+    Ok(names.swap_remove(index))
 }
 
 /// Connect to the selected output port.
 pub fn open_output(selector: &DeviceSelector) -> Result<midir::MidiOutputConnection> {
-    let index = port_index(selector, "out")?;
     let midi_out = midir::MidiOutput::new("aml decode out").map_err(|e| anyhow!("{}", e))?;
     let ports = midi_out.ports();
-    let port = ports
-        .get(index)
-        .ok_or_else(|| anyhow!("MIDI out index {} not found", index))?;
+    let index = port_index(selector, &port_names(&midi_out, &ports), "out")?;
+    let port = &ports[index];
     midi_out
         .connect(port, "aml out")
         .map_err(|e| anyhow!("MIDI connect: {}", e))
@@ -120,12 +118,10 @@ pub fn open_input(
     selector: &DeviceSelector,
     mut on_message: MidiCallback,
 ) -> Result<midir::MidiInputConnection<()>> {
-    let index = port_index(selector, "in")?;
     let midi_in = midir::MidiInput::new("aml encode in").map_err(|e| anyhow!("{}", e))?;
     let ports = midi_in.ports();
-    let port = ports
-        .get(index)
-        .ok_or_else(|| anyhow!("MIDI in index {} not found", index))?;
+    let index = port_index(selector, &port_names(&midi_in, &ports), "in")?;
+    let port = &ports[index];
     midi_in
         .connect(
             port,
@@ -134,4 +130,37 @@ pub fn open_input(
             (),
         )
         .map_err(|e| anyhow!("MIDI connect: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_index_by_name_index_and_default() {
+        let names = ["Midi Through", "UM-ONE"];
+        let by_name = DeviceSelector::Name("UM-ONE".into());
+        assert_eq!(port_index(&by_name, &names, "out").unwrap(), 1);
+        assert_eq!(
+            port_index(&DeviceSelector::Index(0), &names, "in").unwrap(),
+            0
+        );
+        let missing = DeviceSelector::Name("iRig".into());
+        assert_eq!(
+            port_index(&missing, &names, "out").unwrap_err().to_string(),
+            "MIDI out \"iRig\" not found (available: Midi Through, UM-ONE)"
+        );
+        assert_eq!(
+            port_index(&DeviceSelector::Index(2), &names, "in")
+                .unwrap_err()
+                .to_string(),
+            "MIDI in index 2 not found"
+        );
+        assert_eq!(
+            port_index(&DeviceSelector::Default, &names, "out")
+                .unwrap_err()
+                .to_string(),
+            "No MIDI out port selected"
+        );
+    }
 }

@@ -184,24 +184,24 @@ pub fn host_name() -> &'static str {
     cpal::default_host().id().name()
 }
 
-/// Input device names in enumeration order (index = [`DeviceSelector::Index`]).
-pub fn list_input_devices() -> Result<Vec<String>> {
-    let host = cpal::default_host();
-    let devices = host
-        .input_devices()?
-        .map(|d| d.name().unwrap_or_else(|_| "Unknown Device".to_string()))
-        .collect();
-    Ok(devices)
+fn device_name(device: &cpal::Device) -> String {
+    device
+        .name()
+        .unwrap_or_else(|_| "Unknown Device".to_string())
 }
 
-/// Output device names in enumeration order (index = [`DeviceSelector::Index`]).
+/// Input device names in enumeration order (index = [`DeviceSelector::Index`];
+/// each name is valid for [`DeviceSelector::Name`]).
+pub fn list_input_devices() -> Result<Vec<String>> {
+    let host = cpal::default_host();
+    Ok(host.input_devices()?.map(|d| device_name(&d)).collect())
+}
+
+/// Output device names in enumeration order (index = [`DeviceSelector::Index`];
+/// each name is valid for [`DeviceSelector::Name`]).
 pub fn list_output_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();
-    let devices = host
-        .output_devices()?
-        .map(|d| d.name().unwrap_or_else(|_| "Unknown Device".to_string()))
-        .collect();
-    Ok(devices)
+    Ok(host.output_devices()?.map(|d| device_name(&d)).collect())
 }
 
 /// Use `preferred_rate` if a supported range with the default channel count
@@ -267,13 +267,13 @@ where
 {
     let host = cpal::default_host();
 
-    let device = if let Some(index) = selector.index() {
-        host.input_devices()?
-            .nth(index)
-            .ok_or_else(|| anyhow!("Input device index {} not found", index))?
-    } else {
-        host.default_input_device()
-            .ok_or_else(|| anyhow!("No default input device available"))?
+    let mut devices: Vec<cpal::Device> = host.input_devices()?.collect();
+    let names: Vec<String> = devices.iter().map(device_name).collect();
+    let device = match selector.resolve(&names, "Input device")? {
+        Some(index) => devices.swap_remove(index),
+        None => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("No default input device available"))?,
     };
 
     let default_config = device.default_input_config()?;
@@ -339,13 +339,13 @@ where
 {
     let host = cpal::default_host();
 
-    let device = if let Some(index) = selector.index() {
-        host.output_devices()?
-            .nth(index)
-            .ok_or_else(|| anyhow!("Output device index {} not found", index))?
-    } else {
-        host.default_output_device()
-            .ok_or_else(|| anyhow!("No default output device available"))?
+    let mut devices: Vec<cpal::Device> = host.output_devices()?.collect();
+    let names: Vec<String> = devices.iter().map(device_name).collect();
+    let device = match selector.resolve(&names, "Output device")? {
+        Some(index) => devices.swap_remove(index),
+        None => host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("No default output device available"))?,
     };
 
     let default_config = device.default_output_config()?;

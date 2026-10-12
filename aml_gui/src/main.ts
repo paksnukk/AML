@@ -73,13 +73,14 @@ const confidenceMeter = document.getElementById(
   "confidence-meter",
 ) as HTMLDivElement;
 
+/** Devices are stored by name (they survive restarts and re-plugging). */
 interface AppSettings {
   profile: string;
   mode: string;
-  audio_in: number | null;
-  audio_out: number | null;
-  midi_in: number | null;
-  midi_out: number | null;
+  audio_in: string | null;
+  audio_out: string | null;
+  midi_in: string | null;
+  midi_out: string | null;
 }
 
 function log(msg: string) {
@@ -103,33 +104,47 @@ function clearAlarm() {
   alarmBox.classList.remove("visible");
 }
 
-function selectedIndex(select: HTMLSelectElement): number | null {
-  const v = parseInt(select.value, 10);
-  return Number.isNaN(v) ? null : v;
+/** Selected device name (option values are device names), or null. */
+function selectedName(select: HTMLSelectElement): string | null {
+  return select.value === "" ? null : select.value;
 }
 
+/**
+ * Fill `select` with device names and select `preferred` by name. If the
+ * preferred device is not connected, it stays selected as a marked
+ * placeholder (starting with it fails in the engine) instead of silently
+ * selecting another device; returns a description of it for the warning.
+ */
 function populateSelect(
   select: HTMLSelectElement,
   devices: string[],
-  preferred?: number | null,
-) {
+  preferred: string | null,
+  label: string,
+): string | null {
   select.innerHTML = "";
+  devices.forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.text = name;
+    select.add(opt);
+  });
+  if (preferred && !devices.includes(preferred)) {
+    const opt = document.createElement("option");
+    opt.value = preferred;
+    opt.text = `${preferred} (not connected)`;
+    select.add(opt, 0);
+    select.value = preferred;
+    return `${label} "${preferred}"`;
+  }
   if (devices.length === 0) {
     const opt = document.createElement("option");
     opt.text = "No devices found";
     opt.value = "";
     select.add(opt);
-    return;
+    return null;
   }
-  devices.forEach((name, index) => {
-    const opt = document.createElement("option");
-    opt.value = String(index);
-    opt.text = name;
-    select.add(opt);
-  });
-  if (preferred != null && preferred >= 0 && preferred < devices.length) {
-    select.selectedIndex = preferred;
-  }
+  if (preferred) select.value = preferred;
+  return null;
 }
 
 function currentMode(): string {
@@ -171,10 +186,44 @@ async function loadDevices() {
       invoke<AppSettings>("get_settings"),
     ]);
 
-    populateSelect(inputDeviceSelect, audioIn, settings.audio_in);
-    populateSelect(outputDeviceSelect, audioOut, settings.audio_out);
-    populateSelect(midiInSelect, midiIn, settings.midi_in);
-    populateSelect(midiOutSelect, midiOut, settings.midi_out);
+    // Keep the current selection on refresh; otherwise restore the saved one.
+    const pick = (select: HTMLSelectElement, saved: string | null) =>
+      selectedName(select) ?? saved;
+    const missing = [
+      populateSelect(
+        inputDeviceSelect,
+        audioIn,
+        pick(inputDeviceSelect, settings.audio_in),
+        "Audio in",
+      ),
+      populateSelect(
+        outputDeviceSelect,
+        audioOut,
+        pick(outputDeviceSelect, settings.audio_out),
+        "Audio out",
+      ),
+      populateSelect(
+        midiInSelect,
+        midiIn,
+        pick(midiInSelect, settings.midi_in),
+        "MIDI in",
+      ),
+      populateSelect(
+        midiOutSelect,
+        midiOut,
+        pick(midiOutSelect, settings.midi_out),
+        "MIDI out",
+      ),
+    ].filter((m): m is string => m !== null);
+    if (missing.length > 0) {
+      const msg =
+        `Saved device not connected: ${missing.join(", ")}. ` +
+        "Reconnect it and press Refresh Devices, or choose another device.";
+      log(`WARNING: ${msg}`);
+      showAlarm("device_missing", msg);
+    } else if (alarmKind === "device_missing") {
+      clearAlarm();
+    }
 
     profileSelect.value = settings.profile || "robust";
     const modeRadio = document.querySelector(
@@ -196,10 +245,10 @@ async function persistSettings() {
   const settings: AppSettings = {
     profile: profileSelect.value,
     mode: currentMode(),
-    audio_in: selectedIndex(inputDeviceSelect),
-    audio_out: selectedIndex(outputDeviceSelect),
-    midi_in: selectedIndex(midiInSelect),
-    midi_out: selectedIndex(midiOutSelect),
+    audio_in: selectedName(inputDeviceSelect),
+    audio_out: selectedName(outputDeviceSelect),
+    midi_in: selectedName(midiInSelect),
+    midi_out: selectedName(midiOutSelect),
   };
   await invoke("set_settings", { settings });
   log("Settings saved.");
@@ -230,8 +279,8 @@ selfTestBtn.addEventListener("click", async () => {
 startListenBtn.addEventListener("click", async () => {
   try {
     await invoke("start_decoder", {
-      audioIn: selectedIndex(inputDeviceSelect),
-      midiOut: selectedIndex(midiOutSelect),
+      audioIn: selectedName(inputDeviceSelect),
+      midiOut: selectedName(midiOutSelect),
       profile: profileSelect.value,
     });
     startListenBtn.disabled = true;
@@ -262,9 +311,9 @@ stopListenBtn.addEventListener("click", async () => {
 
 startEncodeBtn.addEventListener("click", async () => {
   try {
-    const midiIn = selectedIndex(midiInSelect);
+    const midiIn = selectedName(midiInSelect);
     await invoke("start_encoder", {
-      audioOut: selectedIndex(outputDeviceSelect),
+      audioOut: selectedName(outputDeviceSelect),
       midiIn,
       profile: profileSelect.value,
       simulate: simulateCheck.checked || midiIn === null,

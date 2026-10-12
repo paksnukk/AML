@@ -24,28 +24,50 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the real-time encoder (MIDI -> Audio)
+    ///
+    /// Devices are chosen by index or by exact name (see `list-devices`);
+    /// a name that is not present is an error, never another device.
     Encode {
         /// Input MIDI device index
         #[arg(short, long)]
         midi_in: Option<usize>,
 
-        /// Output Audio device index
+        /// Input MIDI port by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "midi_in")]
+        midi_in_name: Option<String>,
+
+        /// Output Audio device index (default device if neither is given)
         #[arg(short, long)]
         audio_out: Option<usize>,
+
+        /// Output Audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_out")]
+        audio_out_name: Option<String>,
 
         /// Simulate a C-major scale if no MIDI device is used
         #[arg(long, default_value_t = false)]
         simulate: bool,
     },
     /// Start the real-time decoder (Audio -> MIDI)
+    ///
+    /// Devices are chosen by index or by exact name (see `list-devices`);
+    /// a name that is not present is an error, never another device.
     Decode {
-        /// Input Audio device index
+        /// Input Audio device index (default device if neither is given)
         #[arg(short, long)]
         audio_in: Option<usize>,
+
+        /// Input Audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_in")]
+        audio_in_name: Option<String>,
 
         /// Output MIDI device index
         #[arg(short, long)]
         midi_out: Option<usize>,
+
+        /// Output MIDI port by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "midi_out")]
+        midi_out_name: Option<String>,
     },
     /// List available Audio and MIDI devices
     ListDevices,
@@ -68,13 +90,27 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Encode {
             midi_in,
+            midi_in_name,
             audio_out,
+            audio_out_name,
             simulate,
         } => {
-            run_encoder(*midi_in, *audio_out, *simulate)?;
+            run_encoder(
+                selector(*midi_in, midi_in_name),
+                selector(*audio_out, audio_out_name),
+                *simulate,
+            )?;
         }
-        Commands::Decode { audio_in, midi_out } => {
-            run_decoder(*audio_in, *midi_out)?;
+        Commands::Decode {
+            audio_in,
+            audio_in_name,
+            midi_out,
+            midi_out_name,
+        } => {
+            run_decoder(
+                selector(*audio_in, audio_in_name),
+                selector(*midi_out, midi_out_name),
+            )?;
         }
         Commands::ListDevices => {
             list_all_devices()?;
@@ -88,6 +124,15 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Device from an index flag or a name flag (clap rejects both at once);
+/// `Default` when neither is given.
+fn selector(index: Option<usize>, name: &Option<String>) -> DeviceSelector {
+    match (index, name) {
+        (_, Some(n)) => DeviceSelector::Name(n.clone()),
+        (i, None) => DeviceSelector::from_index(i),
+    }
 }
 
 fn list_all_devices() -> Result<()> {
@@ -226,19 +271,18 @@ fn print_events(events: &Receiver<EngineEvent>, what: &str) -> Result<()> {
     Err(anyhow!("{} stopped", what))
 }
 
-fn run_decoder(audio_in_index: Option<usize>, midi_out_index: Option<usize>) -> Result<()> {
+fn run_decoder(audio_in: DeviceSelector, midi_out: DeviceSelector) -> Result<()> {
     println!("Initializing AML V2 Decoder...");
-    let midi_out = match midi_out_index {
-        Some(idx) => {
-            let sel = DeviceSelector::Index(idx);
+    let midi_out = match midi_out {
+        DeviceSelector::Default => MidiOut::None,
+        sel => {
             // Fail fast on a bad port, as before the engine.
             println!("MIDI Out: {}", midi::output_port_name(&sel)?);
             MidiOut::Device(sel)
         }
-        None => MidiOut::None,
     };
     let dec = DecoderHandle::start(DecoderConfig {
-        audio_in: AudioIn::Device(DeviceSelector::from_index(audio_in_index)),
+        audio_in: AudioIn::Device(audio_in),
         midi_out,
         profile: PROFILE.into(),
         link_dead_ms: None,
@@ -246,26 +290,21 @@ fn run_decoder(audio_in_index: Option<usize>, midi_out_index: Option<usize>) -> 
     print_events(dec.events(), "Decoder")
 }
 
-fn run_encoder(
-    midi_in_index: Option<usize>,
-    audio_out_index: Option<usize>,
-    simulate: bool,
-) -> Result<()> {
+fn run_encoder(midi_in: DeviceSelector, audio_out: DeviceSelector, simulate: bool) -> Result<()> {
     println!("Initializing AML V2 Encoder...");
-    let midi_in = match midi_in_index {
-        Some(idx) => {
-            let sel = DeviceSelector::Index(idx);
+    let midi_in = match midi_in {
+        DeviceSelector::Default => MidiIn::None,
+        sel => {
             // Fail fast on a bad port, as before the engine.
             println!("MIDI In: {}", midi::input_port_name(&sel)?);
             MidiIn::Device(sel)
         }
-        None => MidiIn::None,
     };
-    if simulate || midi_in_index.is_none() {
+    if simulate || matches!(midi_in, MidiIn::None) {
         println!("Simulation mode: C-major scale + heartbeats");
     }
     let enc = EncoderHandle::start(EncoderConfig {
-        audio_out: AudioOut::Device(DeviceSelector::from_index(audio_out_index)),
+        audio_out: AudioOut::Device(audio_out),
         midi_in,
         profile: PROFILE.into(),
         simulate,

@@ -124,7 +124,7 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         MidiIn::None => None,
         MidiIn::Device(sel) => match midi::open_input(&sel, on_midi()) {
             Ok(c) => {
-                ev.log(format!("MIDI in index {} connected.", sel));
+                ev.log(format!("MIDI in {} connected.", sel));
                 Some(midi::MidiInputGuard::new(c))
             }
             Err(e) => {
