@@ -1,7 +1,16 @@
 //! Tauri shell over `aml_engine`: commands start/stop engine handles kept in
 //! app state, and one forwarder thread per handle turns `EngineEvent`s into
 //! the frontend's Tauri events (`log`, `input_level`, `decoded_frame`,
-//! `link_stats`, `alarm`, `alarm_cleared`).
+//! `link_stats`, `alarm`, `alarm_cleared`, `worker_stopped`).
+//!
+//! Each start command returns a run id that is also carried by that run's
+//! `worker_stopped` event, so the frontend can tell "the worker I just
+//! started died" (missing device, open error, device error, panic) from a
+//! late `worker_stopped` of an earlier run. Ordering alone is not enough:
+//! a stop that times out (`STOP_TIMEOUT`) detaches the old worker and its
+//! forwarder, whose `worker_stopped` may then arrive at any later time, and
+//! Tauri does not promise that an event emitted during a command reaches the
+//! webview before that command's response.
 
 pub mod settings;
 
@@ -12,6 +21,7 @@ use aml_engine::{
     DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut, TransportMessage,
 };
 use settings::{load_settings, save_settings, AppSettings};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -27,21 +37,44 @@ struct Running<H> {
 struct AppState {
     decoder: Mutex<Option<Running<DecoderHandle>>>,
     encoder: Mutex<Option<Running<EncoderHandle>>>,
+    /// Last run id handed out (shared by both roles; ids start at 1).
+    last_run_id: AtomicU64,
 }
 
-#[derive(Clone, serde::Serialize)]
+impl AppState {
+    fn next_run_id(&self) -> u64 {
+        self.last_run_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// Which worker a forwarder belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Role {
+    Decoder,
+    Encoder,
+}
+
+/// The run a forwarder serves: its role and the id its start command returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    role: Role,
+    id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct DecodedFrameEvent {
     frame_type: String,
     payload: String,
     is_heartbeat: bool,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct LogEvent {
     message: String,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct LinkStatsEvent {
     state: String,
     crc_pass: u64,
@@ -55,74 +88,106 @@ struct LinkStatsEvent {
     buffer_drops: u64,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct AlarmEvent {
     kind: String,
     message: String,
+}
+
+/// Payload of `worker_stopped`: `{ "role": "decoder" | "encoder", "run_id": n }`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct WorkerStoppedEvent {
+    role: Role,
+    run_id: u64,
+}
+
+/// A Tauri event for the frontend: name plus typed payload.
+#[derive(Debug, Clone, PartialEq)]
+enum FrontendEvent {
+    Log(LogEvent),
+    InputLevel(f32),
+    DecodedFrame(DecodedFrameEvent),
+    LinkStats(LinkStatsEvent),
+    Alarm(AlarmEvent),
+    AlarmCleared(AlarmEvent),
+    WorkerStopped(WorkerStoppedEvent),
+}
+
+impl FrontendEvent {
+    fn emit(self, app: &AppHandle) -> tauri::Result<()> {
+        match self {
+            FrontendEvent::Log(p) => app.emit("log", p),
+            FrontendEvent::InputLevel(p) => app.emit("input_level", p),
+            FrontendEvent::DecodedFrame(p) => app.emit("decoded_frame", p),
+            FrontendEvent::LinkStats(p) => app.emit("link_stats", p),
+            FrontendEvent::Alarm(p) => app.emit("alarm", p),
+            FrontendEvent::AlarmCleared(p) => app.emit("alarm_cleared", p),
+            FrontendEvent::WorkerStopped(p) => app.emit("worker_stopped", p),
+        }
+    }
 }
 
 fn parse_profile(profile: &str) -> PhyConfig {
     PhyConfig::from_name(profile)
 }
 
-/// Map one engine event to the frontend's Tauri event (same names and
-/// payloads as before the engine existed).
-fn forward_event(app: &AppHandle, event: EngineEvent) {
-    let _ = match event {
-        EngineEvent::Log(message) => app.emit("log", LogEvent { message }),
-        EngineEvent::Level(rms) => app.emit("input_level", rms),
+/// Map one engine event of `run` to the frontend's Tauri event, if it has
+/// one (same names and payloads as before the engine existed, plus
+/// `worker_stopped`). Pure, so the mapping is testable without a Tauri app.
+fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
+    Some(match event {
+        EngineEvent::Log(message) => FrontendEvent::Log(LogEvent { message }),
+        EngineEvent::Level(rms) => FrontendEvent::InputLevel(rms),
         EngineEvent::Decoded(msg) => {
             let (frame_type, payload) = format_message(&msg);
-            app.emit(
-                "decoded_frame",
-                DecodedFrameEvent {
-                    frame_type,
-                    payload,
-                    is_heartbeat: matches!(msg, TransportMessage::Heartbeat),
-                },
-            )
+            FrontendEvent::DecodedFrame(DecodedFrameEvent {
+                frame_type,
+                payload,
+                is_heartbeat: matches!(msg, TransportMessage::Heartbeat),
+            })
         }
-        EngineEvent::Stats(s) => app.emit(
-            "link_stats",
-            LinkStatsEvent {
-                state: link_state_name(s.state).into(),
-                crc_pass: s.crc_pass,
-                crc_fail: s.crc_fail,
-                confidence_db: s.confidence_db,
-                last_seq: s.last_seq,
-                sync_lost: s.sync_lost,
-                crc_pass_rate: s.crc_pass_rate,
-                est_latency_ms: s.est_latency_ms,
-                link_alive: s.link_alive,
-                buffer_drops: s.buffer_drops,
-            },
-        ),
-        EngineEvent::Alarm { kind, message } => app.emit(
-            "alarm",
-            AlarmEvent {
-                kind: kind.as_str().into(),
-                message,
-            },
-        ),
-        EngineEvent::AlarmCleared { kind, message } => app.emit(
-            "alarm_cleared",
-            AlarmEvent {
-                kind: kind.as_str().into(),
-                message,
-            },
-        ),
+        EngineEvent::Stats(s) => FrontendEvent::LinkStats(LinkStatsEvent {
+            state: link_state_name(s.state).into(),
+            crc_pass: s.crc_pass,
+            crc_fail: s.crc_fail,
+            confidence_db: s.confidence_db,
+            last_seq: s.last_seq,
+            sync_lost: s.sync_lost,
+            crc_pass_rate: s.crc_pass_rate,
+            est_latency_ms: s.est_latency_ms,
+            link_alive: s.link_alive,
+            buffer_drops: s.buffer_drops,
+        }),
+        EngineEvent::Alarm { kind, message } => FrontendEvent::Alarm(AlarmEvent {
+            kind: kind.as_str().into(),
+            message,
+        }),
+        EngineEvent::AlarmCleared { kind, message } => FrontendEvent::AlarmCleared(AlarmEvent {
+            kind: kind.as_str().into(),
+            message,
+        }),
+        EngineEvent::Stopped => FrontendEvent::WorkerStopped(WorkerStoppedEvent {
+            role: run.role,
+            run_id: run.id,
+        }),
         // No frontend listener yet (queue/latency UI is D2).
-        EngineEvent::TxStatus { .. } | EngineEvent::Stopped => Ok(()),
-    };
+        EngineEvent::TxStatus { .. } => return None,
+    })
 }
 
 /// Forward events until the worker drops its sender.
-fn spawn_forwarder(app: AppHandle, events: Receiver<EngineEvent>) -> Option<JoinHandle<()>> {
+fn spawn_forwarder(
+    app: AppHandle,
+    events: Receiver<EngineEvent>,
+    run: Run,
+) -> Option<JoinHandle<()>> {
     thread::Builder::new()
         .name("aml-gui-events".into())
         .spawn(move || {
             for event in events {
-                forward_event(&app, event);
+                if let Some(ev) = to_frontend(event, run) {
+                    let _ = ev.emit(&app);
+                }
             }
         })
         .ok()
@@ -217,7 +282,8 @@ fn run_self_test(profile: String) -> Result<String, String> {
 /// Start the decoder. `audio_in` / `midi_out` are device names as listed by
 /// `get_input_devices` / `get_midi_outputs` (`None` = default audio input /
 /// no MIDI out). A name that is not present fails in the engine (reported as
-/// a log line); no other device is picked.
+/// a log line); no other device is picked. Returns the run id carried by
+/// this run's `worker_stopped` event.
 #[tauri::command]
 fn start_decoder(
     app: AppHandle,
@@ -225,7 +291,7 @@ fn start_decoder(
     audio_in: Option<String>,
     midi_out: Option<String>,
     profile: String,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let mut slot = state.decoder.lock().unwrap();
     shutdown(slot.take(), DecoderHandle::stop);
 
@@ -239,9 +305,13 @@ fn start_decoder(
         link_dead_ms: None,
     })
     .map_err(|e| e.to_string())?;
-    let forwarder = spawn_forwarder(app, handle.take_events());
+    let run = Run {
+        role: Role::Decoder,
+        id: state.next_run_id(),
+    };
+    let forwarder = spawn_forwarder(app, handle.take_events(), run);
     *slot = Some(Running { handle, forwarder });
-    Ok(())
+    Ok(run.id)
 }
 
 #[tauri::command]
@@ -254,7 +324,9 @@ fn stop_decoder(state: State<'_, AppState>) -> Result<(), String> {
 /// Start the encoder. `audio_out` / `midi_in` are device names as listed by
 /// `get_output_devices` / `get_midi_inputs` (`None` = default audio output /
 /// no MIDI in). A name that is not present fails in the engine; no other
-/// device is picked.
+/// device is picked. Returns the run id carried by this run's
+/// `worker_stopped` event. With no MIDI in, the engine sends the simulated
+/// test scale regardless of `simulate`.
 #[tauri::command]
 fn start_encoder(
     app: AppHandle,
@@ -263,7 +335,7 @@ fn start_encoder(
     midi_in: Option<String>,
     profile: String,
     simulate: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let mut slot = state.encoder.lock().unwrap();
     shutdown(slot.take(), EncoderHandle::stop);
 
@@ -277,9 +349,13 @@ fn start_encoder(
         simulate,
     })
     .map_err(|e| e.to_string())?;
-    let forwarder = spawn_forwarder(app, handle.take_events());
+    let run = Run {
+        role: Role::Encoder,
+        id: state.next_run_id(),
+    };
+    let forwarder = spawn_forwarder(app, handle.take_events(), run);
     *slot = Some(Running { handle, forwarder });
-    Ok(())
+    Ok(run.id)
 }
 
 #[tauri::command]
@@ -310,4 +386,86 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aml_engine::AlarmKind;
+
+    const RUN: Run = Run {
+        role: Role::Encoder,
+        id: 7,
+    };
+
+    #[test]
+    fn stopped_maps_to_worker_stopped_with_role_and_run_id() {
+        assert_eq!(
+            to_frontend(EngineEvent::Stopped, RUN),
+            Some(FrontendEvent::WorkerStopped(WorkerStoppedEvent {
+                role: Role::Encoder,
+                run_id: 7,
+            }))
+        );
+        let dec = Run {
+            role: Role::Decoder,
+            id: 1,
+        };
+        let Some(FrontendEvent::WorkerStopped(p)) = to_frontend(EngineEvent::Stopped, dec) else {
+            panic!("Stopped must map to worker_stopped");
+        };
+        assert_eq!(
+            serde_json::to_value(p).unwrap(),
+            serde_json::json!({ "role": "decoder", "run_id": 1 })
+        );
+    }
+
+    #[test]
+    fn other_events_keep_their_mapping() {
+        assert_eq!(
+            to_frontend(EngineEvent::Log("hi".into()), RUN),
+            Some(FrontendEvent::Log(LogEvent {
+                message: "hi".into()
+            }))
+        );
+        assert_eq!(
+            to_frontend(EngineEvent::Decoded(TransportMessage::Heartbeat), RUN),
+            Some(FrontendEvent::DecodedFrame(DecodedFrameEvent {
+                frame_type: "Heartbeat".into(),
+                payload: String::new(),
+                is_heartbeat: true,
+            }))
+        );
+        assert_eq!(
+            to_frontend(
+                EngineEvent::Alarm {
+                    kind: AlarmKind::AudioDeviceError,
+                    message: "x".into()
+                },
+                RUN
+            ),
+            Some(FrontendEvent::Alarm(AlarmEvent {
+                kind: "audio_device_error".into(),
+                message: "x".into()
+            }))
+        );
+        assert_eq!(
+            to_frontend(
+                EngineEvent::TxStatus {
+                    queued: 0,
+                    latency_ms: 0.0
+                },
+                RUN
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn run_ids_are_unique_and_increasing() {
+        let state = AppState::default();
+        let a = state.next_run_id();
+        let b = state.next_run_id();
+        assert!(a >= 1 && b > a);
+    }
 }

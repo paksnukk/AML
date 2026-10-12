@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 pub struct AppSettings {
     pub profile: String,
     pub mode: String,
-    /// Device / port names as listed by the `get_*` commands; `None` = not set.
+    /// Device / port names as listed by the `get_*` commands; `None` = not set
+    /// (audio: first listed device; MIDI: the UI's "None" entry, i.e. no MIDI).
     pub audio_in: Option<String>,
     pub audio_out: Option<String>,
     pub midi_in: Option<String>,
