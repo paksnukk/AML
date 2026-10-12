@@ -1,7 +1,7 @@
 //! Tauri shell over `aml_engine`: commands start/stop engine handles kept in
 //! app state, and one forwarder thread per handle turns `EngineEvent`s into
 //! the frontend's Tauri events (`log`, `input_level`, `decoded_frame`,
-//! `link_stats`, `alarm`).
+//! `link_stats`, `alarm`, `alarm_cleared`).
 
 pub mod settings;
 
@@ -99,6 +99,13 @@ fn forward_event(app: &AppHandle, event: EngineEvent) {
         ),
         EngineEvent::Alarm { kind, message } => app.emit(
             "alarm",
+            AlarmEvent {
+                kind: kind.as_str().into(),
+                message,
+            },
+        ),
+        EngineEvent::AlarmCleared { kind, message } => app.emit(
+            "alarm_cleared",
             AlarmEvent {
                 kind: kind.as_str().into(),
                 message,
@@ -225,6 +232,7 @@ fn start_decoder(
             None => MidiOut::None,
         },
         profile,
+        link_dead_ms: None,
     })
     .map_err(|e| e.to_string())?;
     let forwarder = spawn_forwarder(app, handle.take_events());

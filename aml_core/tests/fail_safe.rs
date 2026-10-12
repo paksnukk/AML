@@ -374,3 +374,41 @@ fn dedup_same_seq_different_payload_delivered() {
         );
     }
 }
+
+/// A watchdog declares link-dead mid-outage: no burst from the modem, state
+/// `Dead`, and resuming samples (silence longer than link-dead) do not fire a
+/// second burst for the same outage. The next valid packet re-arms.
+#[test]
+fn declared_link_dead_suppresses_sample_burst_until_next_packet() {
+    let config = PhyConfig::fast();
+    let mut tx = AmlModemTx::new(config.clone());
+    let mut rx = AmlModemRx::new(config.clone());
+    assert!(!rx.is_link_armed());
+    assert!(!rx.declare_link_dead(), "not armed before any packet");
+
+    let mut stream = tx.encode_message(&note_on(60));
+    stream.extend(silence(&config, 100));
+    let evs = feed(&mut rx, &stream, 512, 0);
+    assert_eq!(messages(&evs), vec![note_on(60)]);
+    assert!(rx.is_link_armed());
+
+    assert!(rx.declare_link_dead());
+    assert!(!rx.is_link_armed());
+    assert_eq!(rx.stats().link_state, LinkState::Dead);
+    assert_eq!(rx.last_link_dead_sample(), Some(stream.len() as u64));
+    assert!(!rx.declare_link_dead(), "only once per outage");
+
+    let quiet = silence(&config, 2 * config.link_dead_ms as usize);
+    let evs = feed(&mut rx, &quiet, 512, stream.len());
+    assert!(link_dead_events(&evs).is_empty());
+    assert_eq!(count_midi(&evs, &ALL_NOTES_OFF), 0);
+    assert_eq!(rx.stats().link_state, LinkState::Dead);
+
+    // A new packet revives and re-arms; its own outage fires normally.
+    let mut stream2 = tx.encode_message(&note_on(61));
+    stream2.extend(silence(&config, config.link_dead_ms as usize + 200));
+    let evs = feed(&mut rx, &stream2, 512, 0);
+    assert_eq!(messages(&evs), vec![note_on(61)]);
+    assert_eq!(link_dead_events(&evs).len(), 1);
+    assert_eq!(count_midi(&evs, &ALL_NOTES_OFF), 1);
+}

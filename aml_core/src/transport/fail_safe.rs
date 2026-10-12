@@ -43,6 +43,12 @@ impl FailSafeMonitor {
         self.armed = true;
     }
 
+    /// Disarm without firing (link-dead was declared by someone else, e.g. a
+    /// wall-clock watchdog). Returns true if the monitor was armed.
+    pub fn disarm(&mut self) -> bool {
+        std::mem::replace(&mut self.armed, false)
+    }
+
     /// Stream sample at which link-dead fires if no valid packet arrives first.
     pub fn deadline(&self) -> Option<u64> {
         self.armed
@@ -78,5 +84,17 @@ mod tests {
         assert_eq!(m.poll(50_000), None, "fires once");
         m.on_valid_packet(60_000);
         assert_eq!(m.poll(62_001), Some(62_000));
+    }
+
+    #[test]
+    fn disarm_suppresses_pending_deadline() {
+        let mut m = FailSafeMonitor::new(2000, 1000);
+        assert!(!m.disarm(), "never armed");
+        m.on_valid_packet(100);
+        assert!(m.disarm());
+        assert!(!m.is_armed());
+        assert_eq!(m.poll(10_000), None);
+        m.on_valid_packet(20_000);
+        assert_eq!(m.poll(22_001), Some(22_000), "re-armed by next packet");
     }
 }

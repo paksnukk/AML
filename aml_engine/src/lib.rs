@@ -10,6 +10,7 @@
 //!     audio_in: AudioIn::Device(DeviceSelector::Default),
 //!     midi_out: MidiOut::Device(DeviceSelector::Index(0)),
 //!     profile: "robust".into(),
+//!     link_dead_ms: None,
 //! })?;
 //! let enc = EncoderHandle::start(EncoderConfig {
 //!     audio_out: AudioOut::Device(DeviceSelector::Default),
@@ -37,7 +38,9 @@ pub mod testing;
 mod tests;
 
 pub use aml_core::transport::TransportMessage;
-pub use audio::{AudioIn, AudioOut, AudioSink, AudioSource, OpenAudioSink, OpenAudioSource};
+pub use audio::{
+    AudioIn, AudioOut, AudioSink, AudioSource, DeviceErrorQueue, OpenAudioSink, OpenAudioSource,
+};
 pub use decoder::{DecoderConfig, DecoderHandle};
 pub use devices::DeviceSelector;
 pub use encoder::{EncoderConfig, EncoderHandle};

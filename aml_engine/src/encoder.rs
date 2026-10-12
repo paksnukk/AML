@@ -1,7 +1,7 @@
 //! TX worker: MIDI in / injected messages → `AmlModemTx` → audio out.
 
 use crate::audio::{AudioOut, AudioSink};
-use crate::events::EngineEvent;
+use crate::events::{AlarmKind, EngineEvent};
 use crate::midi::{self, MidiCallback, MidiIn};
 use crate::{closed_receiver, Emitter, Worker};
 use aml_core::modem::AmlModemTx;
@@ -206,6 +206,14 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         if last_heartbeat.elapsed() >= Duration::from_millis(heartbeat_ms) {
             push_audio(sink, &tx.encode_heartbeat(), stop, &drops);
             last_heartbeat = Instant::now();
+        }
+
+        while let Some(err) = sink.take_error() {
+            ev.send(EngineEvent::Alarm {
+                kind: AlarmKind::AudioDeviceError,
+                message: format!("Audio output device error: {}", err),
+            });
+            ev.log(format!("Audio output device error: {}", err));
         }
 
         let d = drops.load(Ordering::Relaxed);

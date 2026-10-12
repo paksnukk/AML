@@ -217,6 +217,8 @@ fn print_events(events: &Receiver<EngineEvent>, what: &str) -> Result<()> {
                 kind: AlarmKind::LinkDead,
                 ..
             } => println!("[LINK DEAD] All Notes Off"),
+            EngineEvent::Alarm { message, .. } => println!("[ALARM] {}", message),
+            EngineEvent::AlarmCleared { message, .. } => println!("[ALARM CLEARED] {}", message),
             EngineEvent::Stopped => break,
             EngineEvent::Level(_) | EngineEvent::Stats(_) | EngineEvent::TxStatus { .. } => {}
         }
@@ -239,6 +241,7 @@ fn run_decoder(audio_in_index: Option<usize>, midi_out_index: Option<usize>) -> 
         audio_in: AudioIn::Device(DeviceSelector::from_index(audio_in_index)),
         midi_out,
         profile: PROFILE.into(),
+        link_dead_ms: None,
     })?;
     print_events(dec.events(), "Decoder")
 }

@@ -89,6 +89,20 @@ function log(msg: string) {
   logContainer.scrollTop = logContainer.scrollHeight;
 }
 
+/** Kind of the alarm the banner currently shows (null when hidden). */
+let alarmKind: string | null = null;
+
+function showAlarm(kind: string, message: string) {
+  alarmKind = kind;
+  alarmBox.textContent = message;
+  alarmBox.classList.add("visible");
+}
+
+function clearAlarm() {
+  alarmKind = null;
+  alarmBox.classList.remove("visible");
+}
+
 function selectedIndex(select: HTMLSelectElement): number | null {
   const v = parseInt(select.value, 10);
   return Number.isNaN(v) ? null : v;
@@ -225,7 +239,7 @@ startListenBtn.addEventListener("click", async () => {
     inputDeviceSelect.disabled = true;
     midiOutSelect.disabled = true;
     decodedDisplay.innerHTML = '<span style="color: #3d9a7a">Listening…</span>';
-    alarmBox.classList.remove("visible");
+    clearAlarm();
     await persistSettings();
   } catch (error) {
     log(`Error starting decoder: ${error}`);
@@ -337,9 +351,15 @@ async function bindEvents() {
   });
 
   await listen<{ kind: string; message: string }>("alarm", (event) => {
-    alarmBox.textContent = event.payload.message;
-    alarmBox.classList.add("visible");
+    showAlarm(event.payload.kind, event.payload.message);
     log(`ALARM: ${event.payload.message}`);
+  });
+
+  // The engine reports when an alarm's condition has ended (e.g. audio input
+  // resumed after a stall): drop the banner if it still shows that alarm.
+  await listen<{ kind: string; message: string }>("alarm_cleared", (event) => {
+    if (alarmKind === event.payload.kind) clearAlarm();
+    log(event.payload.message);
   });
 }
 

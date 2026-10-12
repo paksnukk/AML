@@ -2,7 +2,7 @@
 //!
 //! Available under `cfg(test)` and with the `testing` feature.
 
-use crate::audio::{AudioSink, AudioSource, OpenAudioSink, OpenAudioSource};
+use crate::audio::{AudioSink, AudioSource, DeviceErrorQueue, OpenAudioSink, OpenAudioSource};
 use crate::midi::{MidiCallback, MidiInputGuard, MidiSink, MidiSource};
 use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
@@ -12,7 +12,11 @@ type Pipe = Arc<Mutex<VecDeque<f32>>>;
 
 /// An in-memory audio cable: whatever the [`MemorySink`] receives, the
 /// [`MemorySource`] delivers, in order, as fast as it is pulled (there is no
-/// real-time clock and no silence is inserted when the pipe runs dry).
+/// real-time clock and no silence is inserted when the pipe runs dry). A pipe
+/// that runs dry therefore behaves like a stalled audio device.
+///
+/// Each end has a [`DeviceErrorQueue`] (see `errors()`) through which tests
+/// inject device errors, as cpal's error callback would.
 pub struct MemoryAudio;
 
 impl MemoryAudio {
@@ -25,8 +29,13 @@ impl MemoryAudio {
                 pipe: pipe.clone(),
                 sample_rate,
                 capacity,
+                errors: DeviceErrorQueue::new(),
             },
-            MemorySource { pipe, sample_rate },
+            MemorySource {
+                pipe,
+                sample_rate,
+                errors: DeviceErrorQueue::new(),
+            },
         )
     }
 }
@@ -36,6 +45,14 @@ pub struct MemorySink {
     pipe: Pipe,
     sample_rate: u32,
     capacity: usize,
+    errors: DeviceErrorQueue,
+}
+
+impl MemorySink {
+    /// Handle for injecting device errors (reported via `take_error`).
+    pub fn errors(&self) -> DeviceErrorQueue {
+        self.errors.clone()
+    }
 }
 
 impl AudioSink for MemorySink {
@@ -60,6 +77,9 @@ impl AudioSink for MemorySink {
     fn buffered(&self) -> usize {
         self.pipe.lock().unwrap().len()
     }
+    fn take_error(&mut self) -> Option<String> {
+        self.errors.pop()
+    }
 }
 
 impl OpenAudioSink for MemorySink {
@@ -76,6 +96,14 @@ impl OpenAudioSink for MemorySink {
 pub struct MemorySource {
     pipe: Pipe,
     sample_rate: u32,
+    errors: DeviceErrorQueue,
+}
+
+impl MemorySource {
+    /// Handle for injecting device errors (reported via `take_error`).
+    pub fn errors(&self) -> DeviceErrorQueue {
+        self.errors.clone()
+    }
 }
 
 impl AudioSource for MemorySource {
@@ -95,6 +123,9 @@ impl AudioSource for MemorySource {
             *dst = src;
         }
         n
+    }
+    fn take_error(&mut self) -> Option<String> {
+        self.errors.pop()
     }
 }
 

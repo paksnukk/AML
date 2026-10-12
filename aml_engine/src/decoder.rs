@@ -1,12 +1,30 @@
 //! RX worker: audio in → `AmlModemRx` → MIDI out + events.
+//!
+//! Besides the sample-driven link-dead of `AmlModemRx`, the worker runs a
+//! **wall-clock watchdog** (v1.1 goal 4): if the audio source delivers no
+//! samples for `link_dead_ms`, the sample clock stops too and link-dead could
+//! never fire. Then the worker
+//! - emits `Alarm { AudioInputStalled }` and a log line (once per stall);
+//! - if the link is alive (a valid packet received and link-dead not fired
+//!   since), declares link-dead on the modem and sends the fail-safe burst
+//!   (CC64=0 + CC123) to the MIDI sink, exactly once.
+//!
+//! When samples resume it emits `AlarmCleared { AudioInputStalled }`. The
+//! outage has already been handled: `declare_link_dead` disarmed the modem's
+//! monitor, so the samples arriving after the stall do not fire a second
+//! burst for it. The link stays `Dead` until the next valid packet, which
+//! re-arms link-dead as usual.
+//!
+//! Device errors reported by the source (cpal's error callback) are polled
+//! every loop iteration and emitted as `Alarm { AudioDeviceError }`.
 
 use crate::audio::AudioIn;
 use crate::events::{AlarmKind, EngineEvent, LinkStats};
 use crate::midi::{self, MidiOut, MidiSink};
 use crate::{closed_receiver, Emitter, Worker};
-use aml_core::modem::{AmlModemRx, ModemOutput};
+use aml_core::modem::{AmlModemRx, ModemOutput, ModemStats};
 use aml_core::phy::{LinkState, PhyConfig};
-use aml_core::transport::TransportMessage;
+use aml_core::transport::{fail_safe_burst, TransportMessage};
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -19,6 +37,10 @@ pub struct DecoderConfig {
     pub midi_out: MidiOut,
     /// PHY profile name ("robust" / "fast"; unknown names mean robust).
     pub profile: String,
+    /// Override the profile's link-dead timeout in ms (both the modem's
+    /// sample-based link-dead and the wall-clock input watchdog). `None`
+    /// uses the profile value; mainly for tests.
+    pub link_dead_ms: Option<u32>,
 }
 
 /// A running decoder worker. Dropping it stops the worker.
@@ -76,6 +98,10 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
     ev.log(format!("Starting decoder (profile={})...", cfg.profile));
 
     let mut config = PhyConfig::from_name(&cfg.profile);
+    if let Some(ms) = cfg.link_dead_ms {
+        config.link_dead_ms = ms;
+    }
+    let link_dead_timeout = Duration::from_millis(config.link_dead_ms as u64);
     let est_latency = config.estimated_first_copy_ms();
     let preferred_sample_rate = config.sample_rate_hz;
 
@@ -133,10 +159,37 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
     let mut sync_lost: u64 = 0;
     let mut link_alive = false;
     let mut buf = [0.0f32; CHUNK];
+    // Wall-clock watchdog state: when the last sample was pulled, and whether
+    // the current gap has already been reported as a stall.
+    let mut last_sample_at = Instant::now();
+    let mut stalled = false;
 
     while !stop.load(Ordering::SeqCst) {
+        while let Some(err) = source.take_error() {
+            ev.send(EngineEvent::Alarm {
+                kind: AlarmKind::AudioDeviceError,
+                message: format!("Audio input device error: {}", err),
+            });
+            ev.log(format!("Audio input device error: {}", err));
+        }
+
         let n = source.pull(&mut buf);
         let chunk = &buf[..n];
+        if n > 0 {
+            let gap = last_sample_at.elapsed();
+            last_sample_at = Instant::now();
+            if std::mem::take(&mut stalled) {
+                let message = format!(
+                    "Audio input resumed after {} ms without samples",
+                    gap.as_millis()
+                );
+                ev.log(message.clone());
+                ev.send(EngineEvent::AlarmCleared {
+                    kind: AlarmKind::AudioInputStalled,
+                    message,
+                });
+            }
+        }
         for &sample in chunk {
             rms_accumulator += sample * sample;
             sample_count_for_meter += 1;
@@ -149,6 +202,43 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
         }
 
         if chunk.is_empty() {
+            if !stalled && last_sample_at.elapsed() >= link_dead_timeout {
+                stalled = true;
+                let silent_ms = last_sample_at.elapsed().as_millis();
+                if rx.declare_link_dead() {
+                    if let Some(sink) = midi_out.as_mut() {
+                        for bytes in fail_safe_burst() {
+                            let _ = sink.send(&bytes);
+                        }
+                    }
+                    link_alive = false;
+                    let message = format!(
+                        "Audio input stalled ({} ms without samples) — All Notes Off sent",
+                        silent_ms
+                    );
+                    ev.send(EngineEvent::Alarm {
+                        kind: AlarmKind::AudioInputStalled,
+                        message: message.clone(),
+                    });
+                    ev.log(message);
+                    let stats = rx.stats();
+                    ev.send(EngineEvent::Stats(link_stats(
+                        &stats,
+                        sync_lost,
+                        est_latency,
+                        link_alive,
+                        source.dropped(),
+                    )));
+                    last_stats_emit = Instant::now();
+                } else {
+                    let message = format!("Audio input stalled ({} ms without samples)", silent_ms);
+                    ev.send(EngineEvent::Alarm {
+                        kind: AlarmKind::AudioInputStalled,
+                        message: message.clone(),
+                    });
+                    ev.log(message);
+                }
+            }
             thread::sleep(IDLE_SLEEP);
             continue;
         }
@@ -179,30 +269,19 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
                 }
                 ModemOutput::Stats(stats) => {
                     if last_stats_emit.elapsed() >= STATS_INTERVAL {
-                        let total = stats.crc_pass + stats.crc_fail;
-                        let rate = if total == 0 {
-                            100.0
-                        } else {
-                            100.0 * stats.crc_pass as f32 / total as f32
-                        };
                         if matches!(stats.link_state, LinkState::Locked) {
                             link_alive = true;
                         }
                         if matches!(stats.link_state, LinkState::Dead) {
                             link_alive = false;
                         }
-                        ev.send(EngineEvent::Stats(LinkStats {
-                            state: stats.link_state,
-                            crc_pass: stats.crc_pass,
-                            crc_fail: stats.crc_fail,
-                            confidence_db: stats.last_confidence_db,
-                            last_seq: stats.last_seq,
+                        ev.send(EngineEvent::Stats(link_stats(
+                            &stats,
                             sync_lost,
-                            crc_pass_rate: rate,
-                            est_latency_ms: est_latency,
+                            est_latency,
                             link_alive,
-                            buffer_drops: source.dropped(),
-                        }));
+                            source.dropped(),
+                        )));
                         last_stats_emit = Instant::now();
                     }
                 }
@@ -211,4 +290,31 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
     }
 
     ev.log("Decoder stopped.");
+}
+
+fn link_stats(
+    stats: &ModemStats,
+    sync_lost: u64,
+    est_latency_ms: f32,
+    link_alive: bool,
+    buffer_drops: u64,
+) -> LinkStats {
+    let total = stats.crc_pass + stats.crc_fail;
+    let crc_pass_rate = if total == 0 {
+        100.0
+    } else {
+        100.0 * stats.crc_pass as f32 / total as f32
+    };
+    LinkStats {
+        state: stats.link_state,
+        crc_pass: stats.crc_pass,
+        crc_fail: stats.crc_fail,
+        confidence_db: stats.last_confidence_db,
+        last_seq: stats.last_seq,
+        sync_lost,
+        crc_pass_rate,
+        est_latency_ms,
+        link_alive,
+        buffer_drops,
+    }
 }

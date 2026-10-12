@@ -17,6 +17,10 @@ pub enum EngineEvent {
     Stats(LinkStats),
     /// A condition the operator should see.
     Alarm { kind: AlarmKind, message: String },
+    /// The condition behind an earlier [`EngineEvent::Alarm`] of `kind` has
+    /// ended (e.g. audio input resumed after a stall). Only sent for kinds
+    /// whose end is observable: currently [`AlarmKind::AudioInputStalled`].
+    AlarmCleared { kind: AlarmKind, message: String },
     /// Encoder queue status, about every 200 ms. Best-effort for now:
     /// `queued` = MIDI messages waiting to be encoded, `latency_ms` = audio
     /// already queued ahead of the output (what a new message waits behind).
@@ -47,13 +51,22 @@ pub struct LinkStats {
 pub enum AlarmKind {
     /// No valid packet for `link_dead_ms`; All Notes Off was sent.
     LinkDead,
+    /// The audio input delivered no samples for `link_dead_ms` (device
+    /// unplugged, driver stall). If the link was alive, All Notes Off was
+    /// sent. Cleared by [`EngineEvent::AlarmCleared`] when samples resume.
+    AudioInputStalled,
+    /// The audio device (input or output stream) reported an error.
+    AudioDeviceError,
 }
 
 impl AlarmKind {
-    /// Stable identifier used by the GUI (`"link_dead"`).
+    /// Stable identifier used by the GUI (`"link_dead"`,
+    /// `"audio_input_stalled"`, `"audio_device_error"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             AlarmKind::LinkDead => "link_dead",
+            AlarmKind::AudioInputStalled => "audio_input_stalled",
+            AlarmKind::AudioDeviceError => "audio_device_error",
         }
     }
 }

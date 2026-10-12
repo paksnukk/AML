@@ -178,6 +178,31 @@ impl AmlModemRx {
         self.last_link_dead_sample
     }
 
+    /// True while link-dead is pending: a CRC-valid packet has been received
+    /// and link-dead has not fired (or been declared) since.
+    pub fn is_link_armed(&self) -> bool {
+        self.fail_safe.is_armed()
+    }
+
+    /// Declare the link dead from outside the sample clock, e.g. when a
+    /// wall-clock watchdog sees the audio input stop delivering samples.
+    ///
+    /// Same effect as link-dead firing (state `Dead`, duplicate history
+    /// cleared, monitor disarmed until the next valid packet) except that
+    /// **no output is produced**: the caller sends the fail-safe burst itself.
+    /// Because the monitor is disarmed, the same outage does not fire a second
+    /// burst when samples resume. Returns false (and does nothing) if the link
+    /// was not armed.
+    pub fn declare_link_dead(&mut self) -> bool {
+        if !self.fail_safe.disarm() {
+            return false;
+        }
+        self.link_dead = true;
+        self.last_link_dead_sample = Some(self.samples_processed());
+        self.recent.clear();
+        true
+    }
+
     /// Hard reset of the decoder: phy back to search with its buffer flushed.
     /// Not used internally (flushing would make timing depend on chunking).
     pub fn reset(&mut self) {
