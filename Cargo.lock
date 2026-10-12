@@ -91,6 +91,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aml_engine"
+version = "0.1.0"
+dependencies = [
+ "aml_core",
+ "anyhow",
+ "cpal",
+ "midir",
+ "ringbuf",
+]
+
+[[package]]
 name = "aml_gui"
 version = "1.0.0"
 dependencies = [

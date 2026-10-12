@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "aml_core",
+    "aml_engine",
     "aml_cli",
     "aml_gui/src-tauri"
 ]
