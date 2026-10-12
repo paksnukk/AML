@@ -106,10 +106,10 @@ pub fn best_tone(samples: &[f32], tones: &[f32], sample_rate: u32) -> Option<Ton
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::phy::{ModemTx, PhyConfig};
     use crate::link::{bytes_to_nibbles, encode_packet_bytes, interleave, Packet};
-    use crate::transport::TransportMessage;
     use crate::modem::MAX_BODY_NIBBLES;
+    use crate::phy::{ModemTx, PhyConfig};
+    use crate::transport::TransportMessage;
 
     #[test]
     fn perfect_grid_demod_note60() {

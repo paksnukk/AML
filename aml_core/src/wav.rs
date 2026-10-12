@@ -4,7 +4,11 @@ use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
-pub fn write_wav_f32(path: impl AsRef<Path>, sample_rate: u32, samples: &[f32]) -> Result<(), String> {
+pub fn write_wav_f32(
+    path: impl AsRef<Path>,
+    sample_rate: u32,
+    samples: &[f32],
+) -> Result<(), String> {
     let spec = WavSpec {
         channels: 1,
         sample_rate,

@@ -44,9 +44,14 @@ pub enum RxEvent {
 enum RxPhase {
     Search,
     /// Collecting remaining preamble symbols after first matched.
-    ConfirmPreamble { matched: usize },
+    ConfirmPreamble {
+        matched: usize,
+    },
     /// Reading body nibbles for the current packet repetition.
-    Body { collected: usize, expected: usize },
+    Body {
+        collected: usize,
+        expected: usize,
+    },
 }
 
 /// Streaming MFSK-16 receiver with preamble search and symbol clock.
@@ -323,7 +328,6 @@ impl ModemRx {
     fn level_ok(&self, det: &DemodResult) -> bool {
         det.purity >= self.config.min_tone_purity
     }
-
 
     /// Symbol-boundary fine alignment around a preamble[0] hit at `trigger`.
     ///

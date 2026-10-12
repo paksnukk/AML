@@ -171,7 +171,12 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
 
     let samples = if let Some(path) = wav_in {
         let (rate, samples) = read_wav_f32(path).map_err(|e| anyhow!(e))?;
-        println!("Loaded {} samples @ {} Hz from {}", samples.len(), rate, path);
+        println!(
+            "Loaded {} samples @ {} Hz from {}",
+            samples.len(),
+            rate,
+            path
+        );
         samples
     } else {
         let samples = aml_core::encode_to_samples(config.clone(), &messages);
@@ -190,8 +195,12 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
 
     if wav_in.is_none() {
         // Filter heartbeats optionally — expect at least note on/off/program
-        assert!(decoded.iter().any(|m| matches!(m, TransportMessage::NoteOn { .. })));
-        assert!(decoded.iter().any(|m| matches!(m, TransportMessage::NoteOff { .. })));
+        assert!(decoded
+            .iter()
+            .any(|m| matches!(m, TransportMessage::NoteOn { .. })));
+        assert!(decoded
+            .iter()
+            .any(|m| matches!(m, TransportMessage::NoteOff { .. })));
         println!("Test Passed!");
     }
     Ok(())
@@ -205,10 +214,7 @@ fn run_loopback_metrics() -> Result<()> {
 
     let mut latencies_ms = Vec::new();
     for note in [60u8, 62, 64, 65, 67] {
-        let msg = TransportMessage::NoteOn {
-            note,
-            velocity: 90,
-        };
+        let msg = TransportMessage::NoteOn { note, velocity: 90 };
         let t0 = Instant::now();
         let audio = tx.encode_message(&msg);
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -239,7 +245,10 @@ fn run_loopback_metrics() -> Result<()> {
 
     let avg = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
     let min = latencies_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = latencies_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max = latencies_ms
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     println!(
         "Latency (first repetition audio duration): avg={:.1}ms min={:.1}ms max={:.1}ms jitter={:.1}ms",
         avg,
@@ -249,7 +258,6 @@ fn run_loopback_metrics() -> Result<()> {
     );
     Ok(())
 }
-
 
 /// Print engine events until the worker stops (it only stops on its own
 /// after a device error, so that is reported as a failure).

@@ -211,8 +211,8 @@ fn build_stream(config: &PhyConfig, pairs: usize, seed: u64) -> Stream {
     let mut ons = 0usize;
     while ons < pairs || !held.is_empty() {
         b.idle(ms_to_samples(config, gap_ms(&mut rng)));
-        let start_note = ons < pairs
-            && (held.is_empty() || (held.len() < MAX_HELD && rng.next_f64() < 0.55));
+        let start_note =
+            ons < pairs && (held.is_empty() || (held.len() < MAX_HELD && rng.next_f64() < 0.55));
         if start_note {
             let note = loop {
                 let n = 36 + rng.below(61) as u8;

@@ -39,8 +39,8 @@ impl ModemTx {
 
     fn synthesize_symbol(&self, freq: f32) -> Vec<f32> {
         let total = self.config.symbol_samples();
-        let attack = ((self.config.attack_ms / 1000.0) * self.config.sample_rate_hz as f32).round()
-            as usize;
+        let attack =
+            ((self.config.attack_ms / 1000.0) * self.config.sample_rate_hz as f32).round() as usize;
         let release = ((self.config.release_ms / 1000.0) * self.config.sample_rate_hz as f32)
             .round() as usize;
         let amp = self.config.amplitude;
