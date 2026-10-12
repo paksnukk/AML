@@ -106,11 +106,8 @@ name = "aml_gui"
 version = "1.0.0"
 dependencies = [
  "aml_core",
- "anyhow",
- "cpal",
+ "aml_engine",
  "dirs 5.0.1",
- "midir",
- "ringbuf",
  "serde",
  "serde_json",
  "tauri",
