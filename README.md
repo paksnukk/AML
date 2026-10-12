@@ -50,3 +50,77 @@ Supported messages: NoteOn, NoteOff, Program Change, MSC (Go / Stop / Resume / L
 
 \* MIDI in → MIDI out through the engine, in-process (`aml_cli loopback`), while notes are being played *and
 released*. Real audio interfaces add their own buffering on top. Run the measurement yourself rather than
+trusting this table.
+
+## Quick start
+
+You need a Rust toolchain. On Linux you also need ALSA headers (`libasound2-dev`). The GUI additionally needs
+Node.js and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/).
+
+```sh
+# What audio and MIDI devices are there?
+cargo run -p aml_cli -- list-devices
+
+# Sending side: MIDI in → tones out (by index or by exact name)
+cargo run -p aml_cli -- encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2"
+
+# Receiving side: tones in → MIDI out
+cargo run -p aml_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
+
+# No hardware at hand? Encoder plays a C-major scale on its own
+cargo run -p aml_cli -- encode --simulate
+
+# How fast is it, really? (both profiles, no hardware needed)
+cargo run --release -p aml_cli -- loopback
+```
+
+Devices are remembered **by name**, so unplugging and replugging an interface doesn't silently pick another
+one. A name that isn't present is an error.
+
+### The GUI
+
+```sh
+cd aml_gui
+npm install
+npm run tauri dev
+```
+
+The GUI has the encoder and decoder side by side. It shows live link stats (state, confidence, CRC pass
+rate, sync losses), the TX queue and its latency, alarms for missing or stalled devices, a big red
+**Panic** button, and a **Self-Test** that measures real loopback latency for both profiles.
+
+## Project layout
+
+| Crate | What lives there |
+|---|---|
+| [`aml_core`](aml_core) | The modem: tone synthesis and detection, packets, CRC, interleaving, TX scheduler, fail-safe. Pure Rust, no I/O. |
+| [`aml_engine`](aml_engine) | The real-time part: audio/MIDI devices, encoder and decoder workers, events, loopback latency measurement. |
+| [`aml_cli`](aml_cli) | Command-line front end. |
+| [`aml_gui`](aml_gui) | Tauri 2 desktop app (TypeScript + Rust). |
+
+## Testing
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+The tests don't need hardware. A channel simulator in [`aml_core/tests/support`](aml_core/tests/support)
+puts packets through offsets, odd chunk sizes, gain changes, noise, clock drift, low-pass filtering and
+random symbol corruption. In [`stuck_notes.rs`](aml_core/tests/stuck_notes.rs), a thousand NoteOn/NoteOff
+pairs go through a corrupted channel, and every note must be released. CI runs all of the above on
+every push.
+
+## Docs
+
+- [`docs/aml-v2-spec.md`](docs/aml-v2-spec.md): the protocol and physical layer as implemented.
+- [`docs/v1.1-plan.md`](docs/v1.1-plan.md): what v1.1 set out to fix, and how.
+- [`CHANGELOG.md`](CHANGELOG.md): what changed.
+
+## Status
+
+v1.1 is unreleased. Everything above is tested in software and through the channel simulator, but **not yet
+on a real show chain**. Use it as a backup line before you trust it with the main cue. Field reports are
+very welcome, especially your chain (Dante? analog? any processing?) and what the decoder's link stats
+said.
