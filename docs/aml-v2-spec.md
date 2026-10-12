@@ -46,10 +46,39 @@ Used for packet acquisition and symbol-boundary alignment. The preamble replaces
 ### 3.2 Detection
 
 - Goertzel bank over the 16 tone frequencies on each symbol window
-- Accept symbol if best power exceeds absolute floor **and**
-  `10 * log10(best / runner_up) >= min_confidence_db` (default 3.0 dB)
-- Search mode hops by `symbol_samples / 4`
+  (`N` = `symbol_samples`)
+- Detection is level-independent. A symbol is accepted only if all hold:
+  1. **Silence floor:** window RMS `>= min_rms_dbfs` (−60 dBFS; full-scale
+     sine = −3 dBFS). Quieter windows are never detected.
+  2. **Tone purity:** `purity = P_best / (E * N / 2) >= min_tone_purity`,
+     where `P_best` is the best tone's Goertzel power and `E = sum(x^2)` the
+     window energy. A steady sinusoid filling the window on the target
+     frequency gives `P = (A N / 2)^2` and `E = A^2 N / 2`, so purity ≈ 1.0 at
+     any amplitude; ramps, misalignment, other tones and noise lower it
+     (white noise ≈ `2 / N` per bin). Thresholds: 0.25 robust, 0.30 fast.
+  3. **Confidence:** `10 * log10(best / runner_up) >= min_confidence_db`
+     (default 3.0 dB) for the first preamble symbol; `0.5 * min_confidence_db`
+     for the remaining preamble symbols and body symbols.
+- Measured purity of synthesized symbols (both profiles): ≈0.97 aligned
+  (attack/release ramps), ≈0.91 aligned at SNR 12 dB, ≥0.57 (fast) / ≥0.80
+  (robust) at ±hop/2 misalignment, ≥0.43 at ±hop; best-bin purity of white
+  noise peaks at ≈0.09 (robust, N=288) / ≈0.18 (fast, N=144).
+- Decodes from 0 dB down to at least −30 dB relative to the 0.8-peak
+  transmit level.
+- Search mode hops by `hop = symbol_samples / 4`
+- **Fine alignment:** on a preamble[0] hit at window position `t`, the lock
+  position is the window start in `[t − hop, t + symbol_samples]` that maximizes
+  the preamble[0] tone's Goertzel power (backward range clamped to the end of the
+  last decoded packet). Coarse grid of `hop / 2`, then halving refinement to one
+  sample. Residual error on a clean signal: ≤ 1 sample at every start offset (both
+  profiles). The receiver waits until `t + symbol_samples + period` has been
+  received before deciding, so the result does not depend on input chunking.
 - After preamble lock, advance by `symbol_samples + gap_samples` per symbol
+- **Resync:** a failed lock attempt (preamble symbol mismatch or a body symbol
+  that fails the gate) rewinds: search resumes at `t + hop`, as if the window
+  that triggered the attempt had been rejected. Samples read during the attempt
+  are kept until it resolves (at most one packet), so a real preamble that starts
+  inside a false lock is still found.
 
 ## 4. Link layer
 
@@ -94,7 +123,17 @@ Block interleave with depth **4** over the packet nibble stream
 ### 4.4 Repetition
 
 Each packet is transmitted **K = 2** times (full preamble + interleaved body each time).
-The receiver accepts the first CRC-valid copy and suppresses duplicates with the same `SEQ`.
+The receiver accepts the first CRC-valid copy and suppresses later copies: a CRC-valid packet is
+dropped only if its packet bytes (same `SEQ`, type and payload) equal a packet accepted within the
+dedup window, measured in received samples:
+
+```
+repetition = (len(preamble) + 16 + 1) symbol periods      # preamble + body + inter-repetition gap
+window     = K × repetition + repetition / 2              # Robust ≈ 341 ms, Fast ≈ 86 ms
+```
+
+A packet with the same `SEQ` but a different payload, or one arriving after the window (TX restart,
+`SEQ` wrap), is delivered. The dedup history is cleared on link-dead.
 
 ### 4.5 On-wire order (one repetition)
 
@@ -126,15 +165,75 @@ Velocity and program use full 7-bit resolution (unlike V1 4-bit quantization).
 | NoteOn | `0x90, note, velocity` (velocity 0 treated as NoteOff) |
 | NoteOff | `0x80, note, 0x40` |
 | ProgramChange | `0xC0, program` |
-| Panic / link-dead | All Notes Off: `0xB0, 0x7B, 0x00` |
+| Panic / link-dead | Fail-safe burst, two messages in order: Sustain off `0xB0, 0x40, 0x00`, then All Notes Off `0xB0, 0x7B, 0x00` |
 | MscLite | Application-defined in POC (logged / evented; not SysEx) |
 
 ### 5.2 Fail-safe
 
-- Encoder emits Heartbeat every **500 ms** while running
-- Decoder marks link **dead** if no valid packet for **2000 ms** after having been locked
-- On link-dead or Panic: emit All Notes Off and reset decoder to search
+- Decoder marks link **dead** if no CRC-valid packet for **`link_dead_ms`** (default **2000 ms**)
+  after the first valid packet. This **sample-clock** link-dead detector is timed in received
+  samples: it fires at sample `end of last valid packet + link_dead_ms`, independent of how audio
+  is chunked, and is reported in the processing call whose input contains that sample. It fires
+  once per event; the next valid packet re-arms it. Link state reads **Dead** from that moment
+  until the next valid packet.
+- **Wall-clock input watchdog** (engine RX, distinct from sample-clock link-dead): if the capture
+  device delivers no audio samples for **`link_dead_ms`** while the link has been alive (at least
+  one valid packet received and sample-clock link-dead not yet fired), the worker emits the
+  fail-safe burst (§5.1) exactly once (when the modem still considers the link alive), raises an
+  **audio-input-stalled** alarm, and disarms sample-clock link-dead for that outage. When samples
+  resume, the stall alarm clears; link state stays **Dead** until the next valid packet, as usual.
+  Sample-clock link-dead is unchanged when samples keep arriving but packets do not.
+- On link-dead (either detector), or on Panic: emit the fail-safe burst (§5.1) exactly once. The
+  demodulator is already back in search after each packet / during silence; its buffer is not
+  flushed. Link-dead also clears the dedup history (§4.4). A Panic is a valid packet, so a link
+  that goes silent after it later produces its own link-dead burst.
 - Bad-CRC / incomplete frames are discarded; return to search
+- Idle **Heartbeat** timing and keepalive airtime are defined by the TX scheduler (§5.3).
+
+### 5.3 TX scheduler
+
+The encoder schedules transport messages before modem encoding. **Heartbeat** is generated by the
+scheduler when due; it is not queued with user traffic.
+
+**Priority** (next message to encode):
+
+| Order | Messages |
+|-------|----------|
+| 1 | Panic |
+| 2 | NoteOff (user queue) |
+| 3 | NoteOn, ProgramChange, MscLite |
+| 4 | NoteOff refresh (idle keepalive; see below) |
+| 5 | Heartbeat |
+
+**Heartbeat:** every **500 ms** only when fully idle: no Panic, NoteOff, or normal message queued,
+no NoteOff parked behind a queued NoteOn, and the NoteOff refresh list is empty. While user
+messages or refreshes are pending, Heartbeat uses no airtime.
+
+**NoteOff refresh:** after a user NoteOff is transmitted, its note is repeated up to **6** times
+within **10 s** (max **32** most recent releases). When nothing higher in the table is pending, each
+free packet sends a **NoteOff** for one refresh entry instead of waiting for Heartbeat: the note with
+the **fewest** refresh transmissions so far, then the **oldest** original release. A **NoteOn** for
+that note removes it from the refresh list. Refresh never runs ahead of a **NoteOn** already in the
+normal queue. Each release therefore costs a bounded burst of airtime (6 messages: about 0.3 s on
+Fast, 1.6 s on Robust) that a NoteOn arriving meanwhile may wait behind for up to one message.
+
+**Held NoteOff:** a NoteOff that arrives while a NoteOn for the same note is still queued is held
+with the latest such NoteOn and sent immediately after it, so the note is not released before it
+is struck. This also keeps off / on / off on a note that is already sounding (a trill or roll) in
+order.
+
+**Panic** removes NoteOns that are still queued (they would otherwise sound after the Panic).
+
+**Queue bounds:** queued **NoteOn** airtime is capped at **250 ms** (one on-wire message period per
+queued NoteOn, plus one extra period for a NoteOff held with it). Before accepting another NoteOn,
+the oldest queued NoteOn is dropped until the budget fits, but at least **4** queued NoteOns are
+always kept, so a chord survives even when one message is longer than the budget (Robust). A
+NoteOff held with a dropped NoteOn is dropped too, unless the note is still sounding from an earlier
+strike. A NoteOff for a note already on the air, and **Panic**, are never dropped.
+
+**Audio output ring:** sized to about **two** on-wire messages. The next message is chosen and
+encoded only when buffered output has drained below **10 ms**, so a NoteOn that arrives while a
+message is playing waits for that message only, not for one already encoded behind it.
 
 ## 6. Profiles
 
@@ -157,9 +256,18 @@ For clean dedicated chains only (LTC-like mental model: no EQ/comp/limiter on th
 | Preamble | `[0xA, 0x5]` (2 symbols) |
 | Repetition K | 1 |
 | Confidence | 2.0 dB |
-| Absolute power floor | 20 |
+| Min tone purity | 0.30 |
 
 First-copy on-wire for max body ≈ **54 ms** (2 + 16 symbols × 3 ms).
+
+### 6.3 Throughput (airtime budgets)
+
+First-copy duration sets a practical sustained rate on a dedicated chain: Robust (**130–140 ms**
+per max-size message) supports about **3–4 messages/s**, and a chord of up to 4 notes is sent whole
+(later notes wait about one message each); Fast (**54 ms**) supports higher rates,
+and the TX scheduler keeps Fast **queue** latency under **250 ms** at **10 messages/s** by dropping
+queued NoteOns beyond that budget. These figures are on-wire airtime budgets for a clean dedicated path, not
+guarantees through EQ, dynamics, or other processing on the AML bus.
 
 ## 7. Release assumptions (v1.0)
 

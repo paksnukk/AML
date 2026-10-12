@@ -23,7 +23,7 @@ impl ModemTx {
             out.extend(self.synthesize_symbol(self.config.tone_hz(idx)));
             let gap = self.config.gap_samples();
             if gap > 0 {
-                out.extend(std::iter::repeat(0.0).take(gap));
+                out.extend(std::iter::repeat_n(0.0, gap));
             }
         }
         out
@@ -39,8 +39,8 @@ impl ModemTx {
 
     fn synthesize_symbol(&self, freq: f32) -> Vec<f32> {
         let total = self.config.symbol_samples();
-        let attack = ((self.config.attack_ms / 1000.0) * self.config.sample_rate_hz as f32).round()
-            as usize;
+        let attack =
+            ((self.config.attack_ms / 1000.0) * self.config.sample_rate_hz as f32).round() as usize;
         let release = ((self.config.release_ms / 1000.0) * self.config.sample_rate_hz as f32)
             .round() as usize;
         let amp = self.config.amplitude;

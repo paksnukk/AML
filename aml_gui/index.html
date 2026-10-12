@@ -93,6 +93,12 @@
                 color: #04140e;
                 font-weight: 600;
             }
+            button.danger {
+                background: #3a1818;
+                border-color: var(--danger);
+                color: #ffb4b4;
+                font-weight: 600;
+            }
             .mode-row { gap: 0.5rem; align-items: center; }
             .mode-row label { display: flex; align-items: center; gap: 0.35rem; color: var(--text); font-size: 0.9rem; }
             .display-box {
@@ -168,7 +174,7 @@
                     <div>State: <strong id="link-state">Search</strong></div>
                     <div>Link alive: <span id="link-alive">no</span></div>
                     <div>Confidence: <span id="link-confidence">—</span> dB</div>
-                    <div>Est. latency: <span id="link-latency">—</span> ms</div>
+                    <div>Est. decode latency: <span id="link-latency">—</span> ms</div>
                     <div>CRC pass/fail: <span id="link-crc">0 / 0</span></div>
                     <div>CRC pass rate: <span id="link-crc-rate">—</span>%</div>
                     <div>Sync lost: <span id="link-sync-lost">0</span></div>
@@ -227,6 +233,7 @@
                     <button id="save-settings-btn">Save Settings</button>
                     <button id="self-test-btn">Self-Test</button>
                 </div>
+                <p class="hint" id="self-test-results" style="margin-top: 0.5rem"></p>
             </div>
 
             <div class="row">
@@ -249,11 +256,17 @@
                     <div class="actions">
                         <button id="start-encode-btn" class="primary">Start Encoder</button>
                         <button id="stop-encode-btn" disabled>Stop</button>
+                        <button id="panic-btn" class="danger" disabled>Panic</button>
                     </div>
+                    <p class="hint" id="tx-queue-hint" style="margin-top: 0.5rem">
+                        Queue: <span id="tx-queued">—</span> msgs · queue latency:
+                        <span id="tx-queue-latency">—</span> ms
+                    </p>
                     <label style="margin-top: 0.5rem">
                         <input type="checkbox" id="simulate-check" />
-                        Simulate C-major scale (if no MIDI in)
+                        Also send simulated C-major scale
                     </label>
+                    <p class="hint">With MIDI In set to None the encoder always sends the simulated scale.</p>
                     <p class="hint">Heartbeat is sent every 500 ms while encoding.</p>
                 </div>
             </div>

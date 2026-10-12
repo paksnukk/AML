@@ -71,12 +71,10 @@ name = "aml_cli"
 version = "0.1.0"
 dependencies = [
  "aml_core",
+ "aml_engine",
  "anyhow",
  "clap",
- "cpal",
  "hound",
- "midir",
- "ringbuf",
 ]
 
 [[package]]
@@ -91,15 +89,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "aml_gui"
-version = "1.0.0"
+name = "aml_engine"
+version = "0.1.0"
 dependencies = [
  "aml_core",
  "anyhow",
  "cpal",
- "dirs 5.0.1",
  "midir",
  "ringbuf",
+]
+
+[[package]]
+name = "aml_gui"
+version = "1.0.0"
+dependencies = [
+ "aml_core",
+ "aml_engine",
+ "dirs 5.0.1",
  "serde",
  "serde_json",
  "tauri",

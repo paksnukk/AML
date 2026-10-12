@@ -1,67 +1,79 @@
-pub mod audio;
+//! Tauri shell over `aml_engine`: commands start/stop engine handles kept in
+//! app state, and one forwarder thread per handle turns `EngineEvent`s into
+//! the frontend's Tauri events (`log`, `input_level`, `decoded_frame`,
+//! `link_stats`, `alarm`, `alarm_cleared`, `worker_stopped`).
+//!
+//! Each start command returns a run id that is also carried by that run's
+//! `worker_stopped` event, so the frontend can tell "the worker I just
+//! started died" (missing device, open error, device error, panic) from a
+//! late `worker_stopped` of an earlier run. Ordering alone is not enough:
+//! a stop that times out (`STOP_TIMEOUT`) detaches the old worker and its
+//! forwarder, whose `worker_stopped` may then arrive at any later time, and
+//! Tauri does not promise that an event emitted during a command reaches the
+//! webview before that command's response.
+
 pub mod settings;
 
-use aml_core::modem::{decode_samples, encode_to_samples, AmlModemRx, AmlModemTx, ModemOutput};
-use aml_core::phy::{LinkState, PhyConfig};
-use aml_core::transport::{midi_to_message, TransportMessage};
-use cpal::traits::StreamTrait;
-use midir::{MidiInput, MidiOutput};
-use ringbuf::HeapRb;
+use aml_core::phy::PhyConfig;
+use aml_engine::{
+    audio, format_message, link_state_name, midi, AudioIn, AudioOut, DecoderConfig, DecoderHandle,
+    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut, TransportMessage,
+};
 use settings::{load_settings, save_settings, AppSettings};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
 use tauri::{AppHandle, Emitter, State};
 
-struct WorkerGate {
-    stop: AtomicBool,
-    running: AtomicBool,
+/// A running engine handle plus the thread forwarding its events.
+struct Running<H> {
+    handle: H,
+    forwarder: Option<JoinHandle<()>>,
 }
 
-impl WorkerGate {
-    fn new() -> Self {
-        Self {
-            stop: AtomicBool::new(true),
-            running: AtomicBool::new(false),
-        }
-    }
-
-    fn request_stop_and_wait(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while self.running.load(Ordering::SeqCst) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn mark_stopped(&self) {
-        self.running.store(false, Ordering::SeqCst);
-    }
-}
-
+#[derive(Default)]
 struct AppState {
-    decode_gate: Arc<WorkerGate>,
-    encode_gate: Arc<WorkerGate>,
-    /// Shared stop flags so commands can flip them
-    decode_stop: Mutex<Option<Arc<AtomicBool>>>,
-    encode_stop: Mutex<Option<Arc<AtomicBool>>>,
+    decoder: Mutex<Option<Running<DecoderHandle>>>,
+    encoder: Mutex<Option<Running<EncoderHandle>>>,
+    /// Last run id handed out (shared by both roles; ids start at 1).
+    last_run_id: AtomicU64,
 }
 
-#[derive(Clone, serde::Serialize)]
+impl AppState {
+    fn next_run_id(&self) -> u64 {
+        self.last_run_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// Which worker a forwarder belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Role {
+    Decoder,
+    Encoder,
+}
+
+/// The run a forwarder serves: its role and the id its start command returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    role: Role,
+    id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct DecodedFrameEvent {
     frame_type: String,
     payload: String,
     is_heartbeat: bool,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct LogEvent {
     message: String,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct LinkStatsEvent {
     state: String,
     crc_pass: u64,
@@ -75,14 +87,130 @@ struct LinkStatsEvent {
     buffer_drops: u64,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct AlarmEvent {
     kind: String,
     message: String,
 }
 
+/// Payload of `worker_stopped`: `{ "role": "decoder" | "encoder", "run_id": n }`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct WorkerStoppedEvent {
+    role: Role,
+    run_id: u64,
+}
+
+/// A Tauri event for the frontend: name plus typed payload.
+#[derive(Debug, Clone, PartialEq)]
+enum FrontendEvent {
+    Log(LogEvent),
+    InputLevel(f32),
+    DecodedFrame(DecodedFrameEvent),
+    LinkStats(LinkStatsEvent),
+    Alarm(AlarmEvent),
+    AlarmCleared(AlarmEvent),
+    WorkerStopped(WorkerStoppedEvent),
+    TxStatus(TxStatusEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct TxStatusEvent {
+    queued: usize,
+    latency_ms: f32,
+}
+
+impl FrontendEvent {
+    fn emit(self, app: &AppHandle) -> tauri::Result<()> {
+        match self {
+            FrontendEvent::Log(p) => app.emit("log", p),
+            FrontendEvent::InputLevel(p) => app.emit("input_level", p),
+            FrontendEvent::DecodedFrame(p) => app.emit("decoded_frame", p),
+            FrontendEvent::LinkStats(p) => app.emit("link_stats", p),
+            FrontendEvent::Alarm(p) => app.emit("alarm", p),
+            FrontendEvent::AlarmCleared(p) => app.emit("alarm_cleared", p),
+            FrontendEvent::WorkerStopped(p) => app.emit("worker_stopped", p),
+            FrontendEvent::TxStatus(p) => app.emit("tx_status", p),
+        }
+    }
+}
+
 fn parse_profile(profile: &str) -> PhyConfig {
     PhyConfig::from_name(profile)
+}
+
+/// Map one engine event of `run` to the frontend's Tauri event, if it has
+/// one (same names and payloads as before the engine existed, plus
+/// `worker_stopped`). Pure, so the mapping is testable without a Tauri app.
+fn to_frontend(event: EngineEvent, run: Run) -> Option<FrontendEvent> {
+    Some(match event {
+        EngineEvent::Log(message) => FrontendEvent::Log(LogEvent { message }),
+        EngineEvent::Level(rms) => FrontendEvent::InputLevel(rms),
+        EngineEvent::Decoded(msg) => {
+            let (frame_type, payload) = format_message(&msg);
+            FrontendEvent::DecodedFrame(DecodedFrameEvent {
+                frame_type,
+                payload,
+                is_heartbeat: matches!(msg, TransportMessage::Heartbeat),
+            })
+        }
+        EngineEvent::Stats(s) => FrontendEvent::LinkStats(LinkStatsEvent {
+            state: link_state_name(s.state).into(),
+            crc_pass: s.crc_pass,
+            crc_fail: s.crc_fail,
+            confidence_db: s.confidence_db,
+            last_seq: s.last_seq,
+            sync_lost: s.sync_lost,
+            crc_pass_rate: s.crc_pass_rate,
+            est_latency_ms: s.est_latency_ms,
+            link_alive: s.link_alive,
+            buffer_drops: s.buffer_drops,
+        }),
+        EngineEvent::Alarm { kind, message } => FrontendEvent::Alarm(AlarmEvent {
+            kind: kind.as_str().into(),
+            message,
+        }),
+        EngineEvent::AlarmCleared { kind, message } => FrontendEvent::AlarmCleared(AlarmEvent {
+            kind: kind.as_str().into(),
+            message,
+        }),
+        EngineEvent::Stopped => FrontendEvent::WorkerStopped(WorkerStoppedEvent {
+            role: run.role,
+            run_id: run.id,
+        }),
+        EngineEvent::TxStatus { queued, latency_ms } => {
+            FrontendEvent::TxStatus(TxStatusEvent { queued, latency_ms })
+        }
+    })
+}
+
+/// Forward events until the worker drops its sender.
+fn spawn_forwarder(
+    app: AppHandle,
+    events: Receiver<EngineEvent>,
+    run: Run,
+) -> Option<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("aml-gui-events".into())
+        .spawn(move || {
+            for event in events {
+                if let Some(ev) = to_frontend(event, run) {
+                    let _ = ev.emit(&app);
+                }
+            }
+        })
+        .ok()
+}
+
+/// Stop a running handle; once the worker has exited, wait for its forwarder
+/// so its last events reach the frontend before anything new starts.
+fn shutdown<H>(running: Option<Running<H>>, stop: impl FnOnce(&mut H) -> bool) {
+    if let Some(mut r) = running {
+        if stop(&mut r.handle) {
+            if let Some(f) = r.forwarder.take() {
+                let _ = f.join();
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -97,30 +225,12 @@ fn get_output_devices() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn get_midi_inputs() -> Result<Vec<String>, String> {
-    let midi_in = MidiInput::new("aml list in").map_err(|e| e.to_string())?;
-    let mut names = Vec::new();
-    for port in midi_in.ports() {
-        names.push(
-            midi_in
-                .port_name(&port)
-                .unwrap_or_else(|_| "Unknown".into()),
-        );
-    }
-    Ok(names)
+    midi::list_inputs().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn get_midi_outputs() -> Result<Vec<String>, String> {
-    let midi_out = MidiOutput::new("aml list out").map_err(|e| e.to_string())?;
-    let mut names = Vec::new();
-    for port in midi_out.ports() {
-        names.push(
-            midi_out
-                .port_name(&port)
-                .unwrap_or_else(|_| "Unknown".into()),
-        );
-    }
-    Ok(names)
+    midi::list_outputs().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -146,614 +256,133 @@ fn get_profile_info(profile: String) -> Result<serde_json::Value, String> {
     }))
 }
 
-#[tauri::command]
-fn run_self_test(profile: String) -> Result<String, String> {
-    let config = parse_profile(&profile);
-    let messages = vec![
-        TransportMessage::NoteOn {
-            note: 60,
-            velocity: 100,
-        },
-        TransportMessage::NoteOff { note: 60 },
-        TransportMessage::Heartbeat,
-    ];
-    let samples = encode_to_samples(config.clone(), &messages);
-    let decoded = decode_samples(config.clone(), &samples);
-    let ok = decoded.iter().any(|m| matches!(m, TransportMessage::NoteOn { .. }))
-        && decoded
-            .iter()
-            .any(|m| matches!(m, TransportMessage::NoteOff { .. }));
-    if ok {
-        Ok(format!(
-            "Self-test OK ({}). est latency {:.0} ms. Decoded {} msgs.",
-            profile,
-            config.estimated_first_copy_ms(),
-            decoded.len()
-        ))
-    } else {
-        Err(format!(
-            "Self-test FAILED. Got: {:?}",
-            decoded
-        ))
-    }
+const SELF_TEST_NOTES: usize = 8;
+
+fn format_latency_line(profile: &str, s: &aml_engine::LatencySummary) -> String {
+    format!(
+        "{}: n={} mean={:.1} ms p95={:.1} ms jitter={:.1} ms (measured)",
+        profile, s.n, s.mean_ms, s.p95_ms, s.jitter_ms
+    )
 }
 
+/// Runs on a blocking worker thread: the measurement plays notes in real time
+/// for several seconds and must not stall the UI.
+#[tauri::command]
+async fn run_self_test() -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut lines = Vec::new();
+        for profile in ["fast", "robust"] {
+            let s = aml_engine::measure_midi_loopback(profile, SELF_TEST_NOTES)
+                .map_err(|e| format!("{}: {}", profile, e))?;
+            lines.push(format_latency_line(profile, &s));
+        }
+        Ok(lines)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn encoder_panic(state: State<'_, AppState>) -> Result<(), String> {
+    let slot = state.encoder.lock().unwrap();
+    let Some(running) = slot.as_ref() else {
+        return Err("Encoder is not running".into());
+    };
+    running.handle.send(TransportMessage::Panic);
+    Ok(())
+}
+
+/// Start the decoder. `audio_in` / `midi_out` are device names as listed by
+/// `get_input_devices` / `get_midi_outputs` (`None` = default audio input /
+/// no MIDI out). A name that is not present fails in the engine (reported as
+/// a log line); no other device is picked. Returns the run id carried by
+/// this run's `worker_stopped` event.
 #[tauri::command]
 fn start_decoder(
     app: AppHandle,
     state: State<'_, AppState>,
-    audio_in: Option<usize>,
-    midi_out: Option<usize>,
+    audio_in: Option<String>,
+    midi_out: Option<String>,
     profile: String,
-) -> Result<(), String> {
-    state.decode_gate.request_stop_and_wait();
-    if let Some(prev) = state.decode_stop.lock().unwrap().take() {
-        prev.store(true, Ordering::SeqCst);
-    }
-    state.decode_gate.request_stop_and_wait();
+) -> Result<u64, String> {
+    let mut slot = state.decoder.lock().unwrap();
+    shutdown(slot.take(), DecoderHandle::stop);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    *state.decode_stop.lock().unwrap() = Some(stop.clone());
-    state.decode_gate.stop.store(false, Ordering::SeqCst);
-    state.decode_gate.running.store(true, Ordering::SeqCst);
-
-    let gate = state.decode_gate.clone();
-    let app_handle = app.clone();
-
-    thread::spawn(move || {
-        let _ = app_handle.emit(
-            "log",
-            LogEvent {
-                message: format!("Starting decoder (profile={})...", profile),
-            },
-        );
-
-        let mut config = parse_profile(&profile);
-        let est_latency = config.estimated_first_copy_ms();
-        let preferred_sample_rate = config.sample_rate_hz;
-
-        let midi_conn = match midi_out {
-            Some(idx) => match open_midi_out(idx) {
-                Ok(c) => Some(Arc::new(Mutex::new(c))),
-                Err(e) => {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!("MIDI out error: {}", e),
-                        },
-                    );
-                    None
-                }
-            },
-            None => {
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: "No MIDI out selected — decode to UI only.".into(),
-                    },
-                );
-                None
-            }
-        };
-
-        let drops = Arc::new(AtomicU64::new(0));
-        let drops_cb = drops.clone();
-        let ring = HeapRb::<f32>::new(preferred_sample_rate as usize * 2);
-        let (mut producer, mut consumer) = ring.split();
-
-        let stream_result = audio::setup_input_stream(
-            audio_in,
-            Some(preferred_sample_rate),
-            move |data: &[f32], channels: usize| {
-                for frame in data.chunks(channels.max(1)) {
-                    if let Some(&s) = frame.first() {
-                        if producer.push(s).is_err() {
-                            drops_cb.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            },
-        );
-
-        match stream_result {
-            Ok((stream, stream_sample_rate, channels)) => {
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: format!(
-                            "Audio in {} Hz, {} ch (ch0). est latency {:.0} ms.",
-                            stream_sample_rate, channels, est_latency
-                        ),
-                    },
-                );
-                if stream_sample_rate != preferred_sample_rate {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!(
-                                "Sample rate adapted {} → {} Hz",
-                                preferred_sample_rate, stream_sample_rate
-                            ),
-                        },
-                    );
-                    config = config.with_sample_rate(stream_sample_rate);
-                }
-
-                if let Err(e) = stream.play() {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!("Failed to play input: {}", e),
-                        },
-                    );
-                    gate.mark_stopped();
-                    return;
-                }
-
-                let mut rx = AmlModemRx::new(config);
-                let mut rms_accumulator = 0.0f32;
-                let mut sample_count_for_meter = 0usize;
-                let meter_report_interval = (stream_sample_rate as usize) / 20;
-                let mut last_stats_emit = Instant::now();
-                let mut sync_lost: u64 = 0;
-                let mut link_alive = false;
-
-                while !stop.load(Ordering::SeqCst) {
-                    let mut chunk = Vec::new();
-                    while let Some(sample) = consumer.pop() {
-                        chunk.push(sample);
-                        rms_accumulator += sample * sample;
-                        sample_count_for_meter += 1;
-                        if sample_count_for_meter >= meter_report_interval {
-                            let rms = (rms_accumulator / sample_count_for_meter as f32).sqrt();
-                            let _ = app_handle.emit("input_level", rms);
-                            rms_accumulator = 0.0;
-                            sample_count_for_meter = 0;
-                        }
-                        if chunk.len() >= 512 {
-                            break;
-                        }
-                    }
-
-                    if chunk.is_empty() {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-
-                    for out in rx.push_samples(&chunk) {
-                        match out {
-                            ModemOutput::Message(msg) => {
-                                let is_hb = matches!(msg, TransportMessage::Heartbeat);
-                                if is_hb {
-                                    link_alive = true;
-                                }
-                                let (frame_type, payload) = format_message(&msg);
-                                let _ = app_handle.emit(
-                                    "decoded_frame",
-                                    DecodedFrameEvent {
-                                        frame_type,
-                                        payload,
-                                        is_heartbeat: is_hb,
-                                    },
-                                );
-                            }
-                            ModemOutput::Midi(bytes) => {
-                                if let Some(conn) = &midi_conn {
-                                    if let Ok(mut c) = conn.lock() {
-                                        let _ = c.send(&bytes);
-                                    }
-                                }
-                            }
-                            ModemOutput::LinkDead => {
-                                link_alive = false;
-                                let _ = app_handle.emit(
-                                    "alarm",
-                                    AlarmEvent {
-                                        kind: "link_dead".into(),
-                                        message: "Link dead — All Notes Off sent".into(),
-                                    },
-                                );
-                                let _ = app_handle.emit(
-                                    "log",
-                                    LogEvent {
-                                        message: "Link dead — All Notes Off".into(),
-                                    },
-                                );
-                            }
-                            ModemOutput::SyncLost => {
-                                sync_lost = sync_lost.saturating_add(1);
-                            }
-                            ModemOutput::Stats(stats) => {
-                                if last_stats_emit.elapsed() >= Duration::from_millis(200) {
-                                    let total = stats.crc_pass + stats.crc_fail;
-                                    let rate = if total == 0 {
-                                        100.0
-                                    } else {
-                                        100.0 * stats.crc_pass as f32 / total as f32
-                                    };
-                                    if matches!(stats.link_state, LinkState::Locked) {
-                                        link_alive = true;
-                                    }
-                                    if matches!(stats.link_state, LinkState::Dead) {
-                                        link_alive = false;
-                                    }
-                                    let _ = app_handle.emit(
-                                        "link_stats",
-                                        LinkStatsEvent {
-                                            state: link_state_str(stats.link_state).into(),
-                                            crc_pass: stats.crc_pass,
-                                            crc_fail: stats.crc_fail,
-                                            confidence_db: stats.last_confidence_db,
-                                            last_seq: stats.last_seq,
-                                            sync_lost,
-                                            crc_pass_rate: rate,
-                                            est_latency_ms: est_latency,
-                                            link_alive,
-                                            buffer_drops: drops.load(Ordering::Relaxed),
-                                        },
-                                    );
-                                    last_stats_emit = Instant::now();
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: "Decoder stopped.".into(),
-                    },
-                );
-            }
-            Err(e) => {
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: format!("Audio input error: {}", e),
-                    },
-                );
-            }
-        }
-        gate.mark_stopped();
-    });
-
-    Ok(())
+    let mut handle = DecoderHandle::start(DecoderConfig {
+        audio_in: AudioIn::Device(DeviceSelector::from_name(audio_in)),
+        midi_out: match DeviceSelector::from_name(midi_out) {
+            DeviceSelector::Default => MidiOut::None,
+            sel => MidiOut::Device(sel),
+        },
+        profile,
+        link_dead_ms: None,
+    })
+    .map_err(|e| e.to_string())?;
+    let run = Run {
+        role: Role::Decoder,
+        id: state.next_run_id(),
+    };
+    let forwarder = spawn_forwarder(app, handle.take_events(), run);
+    *slot = Some(Running { handle, forwarder });
+    Ok(run.id)
 }
 
 #[tauri::command]
 fn stop_decoder(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(stop) = state.decode_stop.lock().unwrap().as_ref() {
-        stop.store(true, Ordering::SeqCst);
-    }
-    state.decode_gate.request_stop_and_wait();
+    let mut slot = state.decoder.lock().unwrap();
+    shutdown(slot.take(), DecoderHandle::stop);
     Ok(())
 }
 
+/// Start the encoder. `audio_out` / `midi_in` are device names as listed by
+/// `get_output_devices` / `get_midi_inputs` (`None` = default audio output /
+/// no MIDI in). A name that is not present fails in the engine; no other
+/// device is picked. Returns the run id carried by this run's
+/// `worker_stopped` event. With no MIDI in, the engine sends the simulated
+/// test scale regardless of `simulate`.
 #[tauri::command]
 fn start_encoder(
     app: AppHandle,
     state: State<'_, AppState>,
-    audio_out: Option<usize>,
-    midi_in: Option<usize>,
+    audio_out: Option<String>,
+    midi_in: Option<String>,
     profile: String,
     simulate: bool,
-) -> Result<(), String> {
-    state.encode_gate.request_stop_and_wait();
-    if let Some(prev) = state.encode_stop.lock().unwrap().take() {
-        prev.store(true, Ordering::SeqCst);
-    }
-    state.encode_gate.request_stop_and_wait();
+) -> Result<u64, String> {
+    let mut slot = state.encoder.lock().unwrap();
+    shutdown(slot.take(), EncoderHandle::stop);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    *state.encode_stop.lock().unwrap() = Some(stop.clone());
-    state.encode_gate.stop.store(false, Ordering::SeqCst);
-    state.encode_gate.running.store(true, Ordering::SeqCst);
-
-    let gate = state.encode_gate.clone();
-    let app_handle = app.clone();
-
-    thread::spawn(move || {
-        let _ = app_handle.emit(
-            "log",
-            LogEvent {
-                message: format!("Starting encoder (profile={}, simulate={})...", profile, simulate),
-            },
-        );
-
-        let mut config = parse_profile(&profile);
-        let est_latency = config.estimated_first_copy_ms();
-        let preferred_sample_rate = config.sample_rate_hz;
-        let heartbeat_ms = config.heartbeat_interval_ms as u64;
-
-        let pending: Arc<Mutex<VecDeque<TransportMessage>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-
-        // Keep MIDI connection alive for the thread lifetime
-        let _midi_conn = if let Some(idx) = midi_in {
-            match open_midi_in(idx, pending.clone()) {
-                Ok(c) => {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!("MIDI in index {} connected.", idx),
-                        },
-                    );
-                    Some(c)
-                }
-                Err(e) => {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!("MIDI in error: {}", e),
-                        },
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let drops = Arc::new(AtomicU64::new(0));
-        let ring = HeapRb::<f32>::new(preferred_sample_rate as usize * 4);
-        let (mut producer, mut consumer) = ring.split();
-
-        let stream_result = audio::setup_output_stream(
-            audio_out,
-            Some(preferred_sample_rate),
-            move |data: &mut [f32], channels: usize| {
-                for frame in data.chunks_mut(channels.max(1)) {
-                    let sample = consumer.pop().unwrap_or(0.0);
-                    for s in frame.iter_mut() {
-                        *s = sample;
-                    }
-                }
-            },
-        );
-
-        match stream_result {
-            Ok((stream, stream_sample_rate, channels)) => {
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: format!(
-                            "Audio out {} Hz, {} ch. est latency {:.0} ms.",
-                            stream_sample_rate, channels, est_latency
-                        ),
-                    },
-                );
-                if stream_sample_rate != preferred_sample_rate {
-                    config = config.with_sample_rate(stream_sample_rate);
-                }
-                if let Err(e) = stream.play() {
-                    let _ = app_handle.emit(
-                        "log",
-                        LogEvent {
-                            message: format!("Failed to play output: {}", e),
-                        },
-                    );
-                    gate.mark_stopped();
-                    return;
-                }
-
-                let mut tx = AmlModemTx::new(config.clone());
-                let mut last_heartbeat = Instant::now();
-                let mut note_idx = 0usize;
-                let scale = [0u8, 2, 4, 5, 7, 9, 11, 12];
-                let mut last_sim = Instant::now() - Duration::from_secs(1);
-                let use_sim = simulate || midi_in.is_none();
-
-                while !stop.load(Ordering::SeqCst) {
-                    let msgs: Vec<TransportMessage> = {
-                        let mut q = pending.lock().unwrap();
-                        q.drain(..).collect()
-                    };
-                    for msg in msgs {
-                        let _ = app_handle.emit(
-                            "log",
-                            LogEvent {
-                                message: format!("TX {:?}", msg),
-                            },
-                        );
-                        push_audio(&mut producer, &tx.encode_message(&msg), &stop, &drops);
-                    }
-
-                    if use_sim && last_sim.elapsed() >= Duration::from_millis(1000) {
-                        let note = 60 + scale[note_idx % scale.len()];
-                        let on = TransportMessage::NoteOn {
-                            note,
-                            velocity: 100,
-                        };
-                        push_audio(&mut producer, &tx.encode_message(&on), &stop, &drops);
-                        let off = TransportMessage::NoteOff { note };
-                        push_audio(&mut producer, &tx.encode_message(&off), &stop, &drops);
-                        let _ = app_handle.emit(
-                            "log",
-                            LogEvent {
-                                message: format!("TX sim Note {}", note),
-                            },
-                        );
-                        note_idx += 1;
-                        last_sim = Instant::now();
-                    }
-
-                    if last_heartbeat.elapsed() >= Duration::from_millis(heartbeat_ms) {
-                        push_audio(&mut producer, &tx.encode_heartbeat(), &stop, &drops);
-                        last_heartbeat = Instant::now();
-                    }
-
-                    let d = drops.load(Ordering::Relaxed);
-                    if d > 0 && d % 1000 == 0 {
-                        let _ = app_handle.emit(
-                            "log",
-                            LogEvent {
-                                message: format!("Audio buffer drops: {}", d),
-                            },
-                        );
-                    }
-
-                    thread::sleep(Duration::from_millis(5));
-                }
-
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: "Encoder stopped.".into(),
-                    },
-                );
-            }
-            Err(e) => {
-                let _ = app_handle.emit(
-                    "log",
-                    LogEvent {
-                        message: format!("Audio output error: {}", e),
-                    },
-                );
-            }
-        }
-        gate.mark_stopped();
-    });
-
-    Ok(())
+    let mut handle = EncoderHandle::start(EncoderConfig {
+        audio_out: AudioOut::Device(DeviceSelector::from_name(audio_out)),
+        midi_in: match DeviceSelector::from_name(midi_in) {
+            DeviceSelector::Default => MidiIn::None,
+            sel => MidiIn::Device(sel),
+        },
+        profile,
+        simulate,
+    })
+    .map_err(|e| e.to_string())?;
+    let run = Run {
+        role: Role::Encoder,
+        id: state.next_run_id(),
+    };
+    let forwarder = spawn_forwarder(app, handle.take_events(), run);
+    *slot = Some(Running { handle, forwarder });
+    Ok(run.id)
 }
 
 #[tauri::command]
 fn stop_encoder(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(stop) = state.encode_stop.lock().unwrap().as_ref() {
-        stop.store(true, Ordering::SeqCst);
-    }
-    state.encode_gate.request_stop_and_wait();
+    let mut slot = state.encoder.lock().unwrap();
+    shutdown(slot.take(), EncoderHandle::stop);
     Ok(())
-}
-
-// Back-compat aliases used by older frontend bindings during transition
-#[tauri::command]
-fn start_listening(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    device_index: Option<usize>,
-) -> Result<(), String> {
-    start_decoder(app, state, device_index, None, "robust".into())
-}
-
-#[tauri::command]
-fn stop_listening(state: State<'_, AppState>) -> Result<(), String> {
-    stop_decoder(state)
-}
-
-#[tauri::command]
-fn start_test_sequence(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    device_index: Option<usize>,
-) -> Result<(), String> {
-    start_encoder(app, state, device_index, None, "robust".into(), true)
-}
-
-#[tauri::command]
-fn stop_playing(state: State<'_, AppState>) -> Result<(), String> {
-    stop_encoder(state)
-}
-
-fn open_midi_out(index: usize) -> Result<midir::MidiOutputConnection, String> {
-    let midi_out = MidiOutput::new("aml decode out").map_err(|e| e.to_string())?;
-    let ports = midi_out.ports();
-    let port = ports
-        .get(index)
-        .ok_or_else(|| format!("MIDI out index {} not found", index))?;
-    midi_out
-        .connect(port, "aml out")
-        .map_err(|e| format!("MIDI connect: {}", e))
-}
-
-fn open_midi_in(
-    index: usize,
-    pending: Arc<Mutex<VecDeque<TransportMessage>>>,
-) -> Result<midir::MidiInputConnection<()>, String> {
-    let midi_in = MidiInput::new("aml encode in").map_err(|e| e.to_string())?;
-    let ports = midi_in.ports();
-    let port = ports
-        .get(index)
-        .ok_or_else(|| format!("MIDI in index {} not found", index))?;
-    midi_in
-        .connect(
-            port,
-            "aml in",
-            move |_stamp, message, _| {
-                if let Some(msg) = midi_to_message(message) {
-                    if let Ok(mut q) = pending.lock() {
-                        q.push_back(msg);
-                    }
-                }
-            },
-            (),
-        )
-        .map_err(|e| format!("MIDI connect: {}", e))
-}
-
-fn push_audio(
-    producer: &mut ringbuf::HeapProducer<f32>,
-    samples: &[f32],
-    stop: &AtomicBool,
-    drops: &AtomicU64,
-) {
-    for &sample in samples {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut attempts = 0;
-        while producer.is_full() {
-            if stop.load(Ordering::Relaxed) || attempts > 2000 {
-                drops.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-            attempts += 1;
-        }
-        if producer.push(sample).is_err() {
-            drops.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-fn link_state_str(state: LinkState) -> &'static str {
-    match state {
-        LinkState::Search => "Search",
-        LinkState::Locked => "Locked",
-        LinkState::Dead => "Dead",
-    }
-}
-
-fn format_message(msg: &TransportMessage) -> (String, String) {
-    match msg {
-        TransportMessage::NoteOn { note, velocity } => (
-            "NoteOn".into(),
-            format!("note={} vel={}", note, velocity),
-        ),
-        TransportMessage::NoteOff { note } => ("NoteOff".into(), format!("note={}", note)),
-        TransportMessage::ProgramChange { program } => {
-            ("ProgramChange".into(), format!("program={}", program))
-        }
-        TransportMessage::MscLite { cmd, cuelist, cue } => (
-            "MscLite".into(),
-            format!("{:?} cuelist={} cue={}", cmd, cuelist, cue),
-        ),
-        TransportMessage::Heartbeat => ("Heartbeat".into(), String::new()),
-        TransportMessage::Panic => ("Panic".into(), String::new()),
-    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            decode_gate: Arc::new(WorkerGate::new()),
-            encode_gate: Arc::new(WorkerGate::new()),
-            decode_stop: Mutex::new(None),
-            encode_stop: Mutex::new(None),
-        })
+        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_input_devices,
             get_output_devices,
@@ -763,15 +392,97 @@ pub fn run() {
             set_settings,
             get_profile_info,
             run_self_test,
+            encoder_panic,
             start_decoder,
             stop_decoder,
             start_encoder,
-            stop_encoder,
-            start_listening,
-            stop_listening,
-            start_test_sequence,
-            stop_playing
+            stop_encoder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aml_engine::AlarmKind;
+
+    const RUN: Run = Run {
+        role: Role::Encoder,
+        id: 7,
+    };
+
+    #[test]
+    fn stopped_maps_to_worker_stopped_with_role_and_run_id() {
+        assert_eq!(
+            to_frontend(EngineEvent::Stopped, RUN),
+            Some(FrontendEvent::WorkerStopped(WorkerStoppedEvent {
+                role: Role::Encoder,
+                run_id: 7,
+            }))
+        );
+        let dec = Run {
+            role: Role::Decoder,
+            id: 1,
+        };
+        let Some(FrontendEvent::WorkerStopped(p)) = to_frontend(EngineEvent::Stopped, dec) else {
+            panic!("Stopped must map to worker_stopped");
+        };
+        assert_eq!(
+            serde_json::to_value(p).unwrap(),
+            serde_json::json!({ "role": "decoder", "run_id": 1 })
+        );
+    }
+
+    #[test]
+    fn other_events_keep_their_mapping() {
+        assert_eq!(
+            to_frontend(EngineEvent::Log("hi".into()), RUN),
+            Some(FrontendEvent::Log(LogEvent {
+                message: "hi".into()
+            }))
+        );
+        assert_eq!(
+            to_frontend(EngineEvent::Decoded(TransportMessage::Heartbeat), RUN),
+            Some(FrontendEvent::DecodedFrame(DecodedFrameEvent {
+                frame_type: "Heartbeat".into(),
+                payload: String::new(),
+                is_heartbeat: true,
+            }))
+        );
+        assert_eq!(
+            to_frontend(
+                EngineEvent::Alarm {
+                    kind: AlarmKind::AudioDeviceError,
+                    message: "x".into()
+                },
+                RUN
+            ),
+            Some(FrontendEvent::Alarm(AlarmEvent {
+                kind: "audio_device_error".into(),
+                message: "x".into()
+            }))
+        );
+        assert_eq!(
+            to_frontend(
+                EngineEvent::TxStatus {
+                    queued: 3,
+                    latency_ms: 12.5
+                },
+                RUN
+            ),
+            Some(FrontendEvent::TxStatus(TxStatusEvent {
+                queued: 3,
+                latency_ms: 12.5
+            }))
+        );
+    }
+
+    #[test]
+    fn run_ids_are_unique_and_increasing() {
+        let state = AppState::default();
+        let a = state.next_run_id();
+        let b = state.next_run_id();
+        assert!(a >= 1 && b > a);
+    }
 }

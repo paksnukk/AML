@@ -1,18 +1,17 @@
-use aml_core::modem::{AmlModemRx, AmlModemTx, ModemOutput};
 use aml_core::phy::PhyConfig;
-use aml_core::transport::{midi_to_message, TransportMessage};
+use aml_core::transport::TransportMessage;
 use aml_core::wav::{read_wav_f32, write_wav_f32};
+use aml_engine::measure_midi_loopback;
+use aml_engine::{
+    audio, midi, AlarmKind, AudioIn, AudioOut, DecoderConfig, DecoderHandle, DeviceSelector,
+    EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
+};
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use cpal::traits::StreamTrait;
-use midir::{MidiInput, MidiOutput};
-use ringbuf::HeapRb;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::Receiver;
 
-mod audio;
+/// Profile the real-time CLI modes run (no flag yet).
+const PROFILE: &str = "robust";
 
 #[derive(Parser)]
 #[command(author, version, about = "AML V2 audio modem CLI", long_about = None)]
@@ -24,28 +23,50 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the real-time encoder (MIDI -> Audio)
+    ///
+    /// Devices are chosen by index or by exact name (see `list-devices`);
+    /// a name that is not present is an error, never another device.
     Encode {
         /// Input MIDI device index
         #[arg(short, long)]
         midi_in: Option<usize>,
 
-        /// Output Audio device index
+        /// Input MIDI port by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "midi_in")]
+        midi_in_name: Option<String>,
+
+        /// Output Audio device index (default device if neither is given)
         #[arg(short, long)]
         audio_out: Option<usize>,
+
+        /// Output Audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_out")]
+        audio_out_name: Option<String>,
 
         /// Simulate a C-major scale if no MIDI device is used
         #[arg(long, default_value_t = false)]
         simulate: bool,
     },
     /// Start the real-time decoder (Audio -> MIDI)
+    ///
+    /// Devices are chosen by index or by exact name (see `list-devices`);
+    /// a name that is not present is an error, never another device.
     Decode {
-        /// Input Audio device index
+        /// Input Audio device index (default device if neither is given)
         #[arg(short, long)]
         audio_in: Option<usize>,
+
+        /// Input Audio device by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "audio_in")]
+        audio_in_name: Option<String>,
 
         /// Output MIDI device index
         #[arg(short, long)]
         midi_out: Option<usize>,
+
+        /// Output MIDI port by exact name
+        #[arg(long, value_name = "NAME", conflicts_with = "midi_out")]
+        midi_out_name: Option<String>,
     },
     /// List available Audio and MIDI devices
     ListDevices,
@@ -68,13 +89,27 @@ fn main() -> Result<()> {
     match &cli.command {
         Commands::Encode {
             midi_in,
+            midi_in_name,
             audio_out,
+            audio_out_name,
             simulate,
         } => {
-            run_encoder(*midi_in, *audio_out, *simulate)?;
+            run_encoder(
+                selector(*midi_in, midi_in_name),
+                selector(*audio_out, audio_out_name),
+                *simulate,
+            )?;
         }
-        Commands::Decode { audio_in, midi_out } => {
-            run_decoder(*audio_in, *midi_out)?;
+        Commands::Decode {
+            audio_in,
+            audio_in_name,
+            midi_out,
+            midi_out_name,
+        } => {
+            run_decoder(
+                selector(*audio_in, audio_in_name),
+                selector(*midi_out, midi_out_name),
+            )?;
         }
         Commands::ListDevices => {
             list_all_devices()?;
@@ -90,27 +125,32 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Device from an index flag or a name flag (clap rejects both at once);
+/// `Default` when neither is given.
+fn selector(index: Option<usize>, name: &Option<String>) -> DeviceSelector {
+    match (index, name) {
+        (_, Some(n)) => DeviceSelector::Name(n.clone()),
+        (i, None) => DeviceSelector::from_index(i),
+    }
+}
+
 fn list_all_devices() -> Result<()> {
-    audio::list_devices()?;
+    println!("Host: {}", audio::host_name());
+    println!("--- Input Devices ---");
+    for (index, name) in audio::list_input_devices()?.iter().enumerate() {
+        println!("{}: {}", index, name);
+    }
+    println!("--- Output Devices ---");
+    for (index, name) in audio::list_output_devices()?.iter().enumerate() {
+        println!("{}: {}", index, name);
+    }
     println!("--- MIDI Input Devices ---");
-    let midi_in = MidiInput::new("aml_cli list")?;
-    for (i, port) in midi_in.ports().iter().enumerate() {
-        println!(
-            "{}: {}",
-            i,
-            midi_in.port_name(port).unwrap_or_else(|_| "Unknown".into())
-        );
+    for (i, name) in midi::list_inputs()?.iter().enumerate() {
+        println!("{}: {}", i, name);
     }
     println!("--- MIDI Output Devices ---");
-    let midi_out = MidiOutput::new("aml_cli list")?;
-    for (i, port) in midi_out.ports().iter().enumerate() {
-        println!(
-            "{}: {}",
-            i,
-            midi_out
-                .port_name(port)
-                .unwrap_or_else(|_| "Unknown".into())
-        );
+    for (i, name) in midi::list_outputs()?.iter().enumerate() {
+        println!("{}: {}", i, name);
     }
     Ok(())
 }
@@ -130,7 +170,12 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
 
     let samples = if let Some(path) = wav_in {
         let (rate, samples) = read_wav_f32(path).map_err(|e| anyhow!(e))?;
-        println!("Loaded {} samples @ {} Hz from {}", samples.len(), rate, path);
+        println!(
+            "Loaded {} samples @ {} Hz from {}",
+            samples.len(),
+            rate,
+            path
+        );
         samples
     } else {
         let samples = aml_core::encode_to_samples(config.clone(), &messages);
@@ -149,269 +194,96 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
 
     if wav_in.is_none() {
         // Filter heartbeats optionally — expect at least note on/off/program
-        assert!(decoded.iter().any(|m| matches!(m, TransportMessage::NoteOn { .. })));
-        assert!(decoded.iter().any(|m| matches!(m, TransportMessage::NoteOff { .. })));
+        assert!(decoded
+            .iter()
+            .any(|m| matches!(m, TransportMessage::NoteOn { .. })));
+        assert!(decoded
+            .iter()
+            .any(|m| matches!(m, TransportMessage::NoteOff { .. })));
         println!("Test Passed!");
     }
     Ok(())
 }
 
+const LOOPBACK_NOTES: usize = 20;
+
 fn run_loopback_metrics() -> Result<()> {
-    println!("AML V2 in-process loopback latency measurement...");
-    let config = PhyConfig::robust();
-    let mut tx = AmlModemTx::new(config.clone());
-    let mut rx = AmlModemRx::new(config.clone());
-
-    let mut latencies_ms = Vec::new();
-    for note in [60u8, 62, 64, 65, 67] {
-        let msg = TransportMessage::NoteOn {
-            note,
-            velocity: 90,
-        };
-        let t0 = Instant::now();
-        let audio = tx.encode_message(&msg);
-        let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        let t1 = Instant::now();
-        let mut got = None;
-        for chunk in audio.chunks(256) {
-            for out in rx.push_samples(chunk) {
-                if let ModemOutput::Message(m) = out {
-                    if got.is_none() {
-                        got = Some(m);
-                    }
-                }
-            }
+    println!("AML engine loopback latency (paced MIDI in → MIDI out)...");
+    for profile in ["fast", "robust"] {
+        let s = measure_midi_loopback(profile, LOOPBACK_NOTES)?;
+        if s.n < LOOPBACK_NOTES {
+            return Err(anyhow!(
+                "{}: only {} of {} NoteOns delivered",
+                profile,
+                s.n,
+                LOOPBACK_NOTES
+            ));
         }
-        let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
-        let audio_ms = audio.len() as f64 * 1000.0 / config.sample_rate_hz as f64;
-        // One repetition duration approximates delivery latency (K=2 sends two copies)
-        let one_rep_ms = audio_ms / config.repetition_k.max(1) as f64;
-
         println!(
-            "note {}: encode={:.2}ms decode_cpu={:.2}ms audio_total={:.1}ms ~e2e_first_copy={:.1}ms got={:?}",
-            note, encode_ms, decode_ms, audio_ms, one_rep_ms, got
+            "{}: n={} mean={:.1} ms p95={:.1} ms jitter={:.1} ms",
+            profile, s.n, s.mean_ms, s.p95_ms, s.jitter_ms
         );
-        assert_eq!(got, Some(msg));
-        latencies_ms.push(one_rep_ms);
     }
-
-    let avg = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
-    let min = latencies_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = latencies_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    println!(
-        "Latency (first repetition audio duration): avg={:.1}ms min={:.1}ms max={:.1}ms jitter={:.1}ms",
-        avg,
-        min,
-        max,
-        max - min
-    );
     Ok(())
 }
 
-fn run_decoder(audio_in_index: Option<usize>, midi_out_index: Option<usize>) -> Result<()> {
-    println!("Initializing AML V2 Decoder...");
-    let mut config = PhyConfig::robust();
-
-    let midi_conn = if let Some(idx) = midi_out_index {
-        let midi_out = MidiOutput::new("aml_cli decode")?;
-        let ports = midi_out.ports();
-        let port = ports
-            .get(idx)
-            .ok_or_else(|| anyhow!("MIDI out index {} not found", idx))?;
-        println!("MIDI Out: {}", midi_out.port_name(port)?);
-        Some(Arc::new(Mutex::new(
-            midi_out
-                .connect(port, "aml_cli out")
-                .map_err(|e| anyhow!("MIDI connect: {}", e))?,
-        )))
-    } else {
-        println!("No MIDI out selected; decoded messages will be logged only.");
-        None
-    };
-
-    let ring = HeapRb::<f32>::new(config.sample_rate_hz as usize * 2);
-    let (mut producer, mut consumer) = ring.split();
-
-    let (stream, stream_sample_rate, channels) =
-        audio::setup_input_stream(audio_in_index, move |data, chans| {
-            // Channel 0 only
-            for frame in data.chunks(chans) {
-                if let Some(&s) = frame.first() {
-                    let _ = producer.push(s);
-                }
-            }
-        })?;
-
-    if stream_sample_rate != config.sample_rate_hz {
-        eprintln!(
-            "Adapting sample rate {} -> {}",
-            config.sample_rate_hz, stream_sample_rate
-        );
-        config = config.with_sample_rate(stream_sample_rate);
-    }
-    println!("Input channels reported: {} (using ch0)", channels);
-
-    stream.play()?;
-    let mut rx = AmlModemRx::new(config);
-    println!("Listening (V2)...");
-
-    loop {
-        let mut chunk = Vec::new();
-        while let Some(s) = consumer.pop() {
-            chunk.push(s);
-            if chunk.len() >= 512 {
-                break;
-            }
-        }
-        if chunk.is_empty() {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-
-        for out in rx.push_samples(&chunk) {
-            match out {
-                ModemOutput::Message(msg) => {
-                    println!("[MSG] {:?}", msg);
-                }
-                ModemOutput::Midi(bytes) => {
-                    if let Some(conn) = &midi_conn {
-                        if let Ok(mut c) = conn.lock() {
-                            let _ = c.send(&bytes);
-                        }
-                    }
-                }
-                ModemOutput::LinkDead => {
-                    println!("[LINK DEAD] All Notes Off");
-                }
-                ModemOutput::SyncLost => {}
-                ModemOutput::Stats(stats) => {
-                    // Periodic light log could go here; keep quiet unless useful
-                    let _ = stats;
-                }
-            }
+/// Print engine events until the worker stops (it only stops on its own
+/// after a device error, so that is reported as a failure).
+fn print_events(events: &Receiver<EngineEvent>, what: &str) -> Result<()> {
+    for event in events {
+        match event {
+            EngineEvent::Log(line) => println!("{}", line),
+            EngineEvent::Decoded(msg) => println!("[MSG] {:?}", msg),
+            EngineEvent::Alarm {
+                kind: AlarmKind::LinkDead,
+                ..
+            } => println!("[LINK DEAD] All Notes Off"),
+            EngineEvent::Alarm { message, .. } => println!("[ALARM] {}", message),
+            EngineEvent::AlarmCleared { message, .. } => println!("[ALARM CLEARED] {}", message),
+            EngineEvent::Stopped => break,
+            EngineEvent::Level(_) | EngineEvent::Stats(_) | EngineEvent::TxStatus { .. } => {}
         }
     }
+    Err(anyhow!("{} stopped", what))
 }
 
-fn run_encoder(
-    midi_in_index: Option<usize>,
-    audio_out_index: Option<usize>,
-    simulate: bool,
-) -> Result<()> {
-    println!("Initializing AML V2 Encoder...");
-    let mut config = PhyConfig::robust();
-
-    let pending: Arc<Mutex<VecDeque<TransportMessage>>> = Arc::new(Mutex::new(VecDeque::new()));
-
-    // Optional MIDI input
-    let _midi_conn = if let Some(idx) = midi_in_index {
-        let midi_in = MidiInput::new("aml_cli encode")?;
-        let ports = midi_in.ports();
-        let port = ports
-            .get(idx)
-            .ok_or_else(|| anyhow!("MIDI in index {} not found", idx))?;
-        println!("MIDI In: {}", midi_in.port_name(port)?);
-        let pending_cb = pending.clone();
-        let conn = midi_in
-            .connect(
-                port,
-                "aml_cli in",
-                move |_stamp, message, _| {
-                    if let Some(msg) = midi_to_message(message) {
-                        if let Ok(mut q) = pending_cb.lock() {
-                            q.push_back(msg);
-                        }
-                    }
-                },
-                (),
-            )
-            .map_err(|e| anyhow!("MIDI connect: {}", e))?;
-        Some(conn)
-    } else {
-        None
+fn run_decoder(audio_in: DeviceSelector, midi_out: DeviceSelector) -> Result<()> {
+    println!("Initializing AML V2 Decoder...");
+    let midi_out = match midi_out {
+        DeviceSelector::Default => MidiOut::None,
+        sel => {
+            // Fail fast on a bad port, as before the engine.
+            println!("MIDI Out: {}", midi::output_port_name(&sel)?);
+            MidiOut::Device(sel)
+        }
     };
+    let dec = DecoderHandle::start(DecoderConfig {
+        audio_in: AudioIn::Device(audio_in),
+        midi_out,
+        profile: PROFILE.into(),
+        link_dead_ms: None,
+    })?;
+    print_events(dec.events(), "Decoder")
+}
 
-    let ring = HeapRb::<f32>::new(config.sample_rate_hz as usize * 4);
-    let (mut producer, mut consumer) = ring.split();
-
-    let (stream, stream_sample_rate, channels) =
-        audio::setup_output_stream(audio_out_index, move |data, chans| {
-            // Fill channel 0 from ring; duplicate mono to other channels
-            for frame in data.chunks_mut(chans) {
-                let sample = consumer.pop().unwrap_or(0.0);
-                for (i, s) in frame.iter_mut().enumerate() {
-                    *s = if i == 0 { sample } else { sample };
-                }
-            }
-        })?;
-
-    if stream_sample_rate != config.sample_rate_hz {
-        eprintln!(
-            "Adapting sample rate {} -> {}",
-            config.sample_rate_hz, stream_sample_rate
-        );
-        config = config.with_sample_rate(stream_sample_rate);
-    }
-    println!("Output channels reported: {} (mono on all)", channels);
-
-    stream.play()?;
-    let mut tx = AmlModemTx::new(config.clone());
-    println!("Encoder running (V2).");
-
-    let use_simulate = simulate || midi_in_index.is_none();
-    if use_simulate {
+fn run_encoder(midi_in: DeviceSelector, audio_out: DeviceSelector, simulate: bool) -> Result<()> {
+    println!("Initializing AML V2 Encoder...");
+    let midi_in = match midi_in {
+        DeviceSelector::Default => MidiIn::None,
+        sel => {
+            // Fail fast on a bad port, as before the engine.
+            println!("MIDI In: {}", midi::input_port_name(&sel)?);
+            MidiIn::Device(sel)
+        }
+    };
+    if simulate || matches!(midi_in, MidiIn::None) {
         println!("Simulation mode: C-major scale + heartbeats");
     }
-
-    let mut note_idx = 0usize;
-    let scale = [0u8, 2, 4, 5, 7, 9, 11, 12];
-    let mut last_heartbeat = Instant::now();
-    let mut last_sim_note = Instant::now();
-
-    loop {
-        // Drain pending MIDI messages
-        let msgs: Vec<TransportMessage> = {
-            let mut q = pending.lock().unwrap();
-            q.drain(..).collect()
-        };
-
-        for msg in msgs {
-            println!("TX {:?}", msg);
-            push_audio(&mut producer, &tx.encode_message(&msg));
-        }
-
-        if use_simulate && last_sim_note.elapsed() >= Duration::from_millis(1000) {
-            let note = 60 + scale[note_idx % scale.len()];
-            let msg = TransportMessage::NoteOn {
-                note,
-                velocity: 100,
-            };
-            println!("TX sim {:?}", msg);
-            push_audio(&mut producer, &tx.encode_message(&msg));
-            // Matching note off shortly after via queue timing — send immediately after
-            let off = TransportMessage::NoteOff { note };
-            push_audio(&mut producer, &tx.encode_message(&off));
-            note_idx += 1;
-            last_sim_note = Instant::now();
-        }
-
-        if last_heartbeat.elapsed()
-            >= Duration::from_millis(config.heartbeat_interval_ms as u64)
-        {
-            push_audio(&mut producer, &tx.encode_heartbeat());
-            last_heartbeat = Instant::now();
-        }
-
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn push_audio(producer: &mut ringbuf::HeapProducer<f32>, samples: &[f32]) {
-    for &sample in samples {
-        while producer.is_full() {
-            thread::sleep(Duration::from_millis(1));
-        }
-        let _ = producer.push(sample);
-    }
+    let enc = EncoderHandle::start(EncoderConfig {
+        audio_out: AudioOut::Device(audio_out),
+        midi_in,
+        profile: PROFILE.into(),
+        simulate,
+    })?;
+    print_events(enc.events(), "Encoder")
 }

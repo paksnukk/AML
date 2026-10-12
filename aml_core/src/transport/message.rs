@@ -56,9 +56,16 @@ impl MscCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportMessage {
-    NoteOn { note: u8, velocity: u8 },
-    NoteOff { note: u8 },
-    ProgramChange { program: u8 },
+    NoteOn {
+        note: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        note: u8,
+    },
+    ProgramChange {
+        program: u8,
+    },
     MscLite {
         cmd: MscCommand,
         cuelist: u8,

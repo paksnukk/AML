@@ -5,9 +5,7 @@ edition = "2021"
 
 [dependencies]
 aml_core = { path = "../aml_core" }
-cpal = "0.15"
-midir = "0.9"
-ringbuf = "0.3"
+aml_engine = { path = "../aml_engine" }
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 hound = "3.5"

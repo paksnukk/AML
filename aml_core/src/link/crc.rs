@@ -29,6 +29,10 @@ mod tests {
         assert_eq!(crc16_ccitt(&[]), 0xFFFF);
         let c = crc16_ccitt(&[0x01, 0x02, 0x03]);
         assert_ne!(c, 0);
-        assert!(verify_crc16(&[0x01, 0x02, 0x03], (c >> 8) as u8, (c & 0xFF) as u8));
+        assert!(verify_crc16(
+            &[0x01, 0x02, 0x03],
+            (c >> 8) as u8,
+            (c & 0xFF) as u8
+        ));
     }
 }

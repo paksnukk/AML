@@ -21,11 +21,11 @@ pub enum MscCommand {
 pub enum SymbolValue {
     Preamble,
     Type(FrameType),
-    Note(u8),       // 0-11
-    Octave(u8),     // 0-10
-    Value(u8),      // 0-15 (Generic 4-bit value)
+    Note(u8),   // 0-11
+    Octave(u8), // 0-10
+    Value(u8),  // 0-15 (Generic 4-bit value)
     MscCmd(MscCommand),
-    CueList(u8),    // 0-15
+    CueList(u8), // 0-15
 }
 
 impl FrameType {

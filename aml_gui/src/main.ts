@@ -30,6 +30,14 @@ const saveSettingsBtn = document.getElementById(
 const selfTestBtn = document.getElementById(
   "self-test-btn",
 ) as HTMLButtonElement;
+const selfTestResults = document.getElementById(
+  "self-test-results",
+) as HTMLElement;
+const panicBtn = document.getElementById("panic-btn") as HTMLButtonElement;
+const txQueuedEl = document.getElementById("tx-queued") as HTMLElement;
+const txQueueLatencyEl = document.getElementById(
+  "tx-queue-latency",
+) as HTMLElement;
 
 const startListenBtn = document.getElementById(
   "start-listening-btn",
@@ -73,13 +81,14 @@ const confidenceMeter = document.getElementById(
   "confidence-meter",
 ) as HTMLDivElement;
 
+/** Devices are stored by name (they survive restarts and re-plugging). */
 interface AppSettings {
   profile: string;
   mode: string;
-  audio_in: number | null;
-  audio_out: number | null;
-  midi_in: number | null;
-  midi_out: number | null;
+  audio_in: string | null;
+  audio_out: string | null;
+  midi_in: string | null;
+  midi_out: string | null;
 }
 
 function log(msg: string) {
@@ -89,33 +98,73 @@ function log(msg: string) {
   logContainer.scrollTop = logContainer.scrollHeight;
 }
 
-function selectedIndex(select: HTMLSelectElement): number | null {
-  const v = parseInt(select.value, 10);
-  return Number.isNaN(v) ? null : v;
+/** Kind of the alarm the banner currently shows (null when hidden). */
+let alarmKind: string | null = null;
+
+function showAlarm(kind: string, message: string) {
+  alarmKind = kind;
+  alarmBox.textContent = message;
+  alarmBox.classList.add("visible");
 }
 
+function clearAlarm() {
+  alarmKind = null;
+  alarmBox.classList.remove("visible");
+}
+
+/** Selected device name (option values are device names), or null. */
+function selectedName(select: HTMLSelectElement): string | null {
+  return select.value === "" ? null : select.value;
+}
+
+/** Label of the "no MIDI" entry of each MIDI select (value ""). */
+const MIDI_IN_NONE = "None (encoder sends simulated test scale)";
+const MIDI_OUT_NONE = "None (no MIDI output)";
+
+/**
+ * Fill `select` with device names and select `preferred` by name. If the
+ * preferred device is not connected, it stays selected as a marked
+ * placeholder (starting with it fails in the engine) instead of silently
+ * selecting another device; returns a description of it for the warning.
+ */
 function populateSelect(
   select: HTMLSelectElement,
   devices: string[],
-  preferred?: number | null,
-) {
+  preferred: string | null,
+  label: string,
+  noneLabel?: string,
+): string | null {
   select.innerHTML = "";
-  if (devices.length === 0) {
+  // Optional first entry meaning "no device"; selected when nothing is preferred.
+  if (noneLabel !== undefined) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.text = noneLabel;
+    select.add(opt);
+  }
+  devices.forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.text = name;
+    select.add(opt);
+  });
+  if (preferred && !devices.includes(preferred)) {
+    const opt = document.createElement("option");
+    opt.value = preferred;
+    opt.text = `${preferred} (not connected)`;
+    select.add(opt, noneLabel !== undefined ? 1 : 0);
+    select.value = preferred;
+    return `${label} "${preferred}"`;
+  }
+  if (select.options.length === 0) {
     const opt = document.createElement("option");
     opt.text = "No devices found";
     opt.value = "";
     select.add(opt);
-    return;
+    return null;
   }
-  devices.forEach((name, index) => {
-    const opt = document.createElement("option");
-    opt.value = String(index);
-    opt.text = name;
-    select.add(opt);
-  });
-  if (preferred != null && preferred >= 0 && preferred < devices.length) {
-    select.selectedIndex = preferred;
-  }
+  if (preferred) select.value = preferred;
+  return null;
 }
 
 function currentMode(): string {
@@ -136,14 +185,18 @@ async function refreshProfileHint() {
     const info = await invoke<{ est_latency_ms: number }>("get_profile_info", {
       profile: profileSelect.value,
     });
-    linkLatencyEl.textContent = info.est_latency_ms.toFixed(0);
     profileHint.textContent =
       profileSelect.value === "fast"
-        ? `Fast ≈ ${info.est_latency_ms.toFixed(0)} ms — clean dedicated chain only.`
-        : `Robust ≈ ${info.est_latency_ms.toFixed(0)} ms — preferred default.`;
+        ? `Fast — notes on a clean dedicated line (no EQ, compression, or limiter). ≈ ${info.est_latency_ms.toFixed(0)} ms first-copy airtime.`
+        : `Robust — cue and program-change triggers on an uncertain chain, about 3–4 messages per second. ≈ ${info.est_latency_ms.toFixed(0)} ms first-copy airtime.`;
   } catch (e) {
     log(`Profile info error: ${e}`);
   }
+}
+
+function clearTxQueueDisplay() {
+  txQueuedEl.textContent = "—";
+  txQueueLatencyEl.textContent = "—";
 }
 
 async function loadDevices() {
@@ -157,10 +210,50 @@ async function loadDevices() {
       invoke<AppSettings>("get_settings"),
     ]);
 
-    populateSelect(inputDeviceSelect, audioIn, settings.audio_in);
-    populateSelect(outputDeviceSelect, audioOut, settings.audio_out);
-    populateSelect(midiInSelect, midiIn, settings.midi_in);
-    populateSelect(midiOutSelect, midiOut, settings.midi_out);
+    // Keep the current selection on refresh; otherwise restore the saved one.
+    const pick = (select: HTMLSelectElement, saved: string | null) =>
+      selectedName(select) ?? saved;
+    // MIDI selects: "None" (null) is a real choice once the select is filled;
+    // a saved null (or no saved choice) restores to "None".
+    const pickMidi = (select: HTMLSelectElement, saved: string | null) =>
+      select.options.length > 0 ? selectedName(select) : saved;
+    const missing = [
+      populateSelect(
+        inputDeviceSelect,
+        audioIn,
+        pick(inputDeviceSelect, settings.audio_in),
+        "Audio in",
+      ),
+      populateSelect(
+        outputDeviceSelect,
+        audioOut,
+        pick(outputDeviceSelect, settings.audio_out),
+        "Audio out",
+      ),
+      populateSelect(
+        midiInSelect,
+        midiIn,
+        pickMidi(midiInSelect, settings.midi_in),
+        "MIDI in",
+        MIDI_IN_NONE,
+      ),
+      populateSelect(
+        midiOutSelect,
+        midiOut,
+        pickMidi(midiOutSelect, settings.midi_out),
+        "MIDI out",
+        MIDI_OUT_NONE,
+      ),
+    ].filter((m): m is string => m !== null);
+    if (missing.length > 0) {
+      const msg =
+        `Saved device not connected: ${missing.join(", ")}. ` +
+        "Reconnect it and press Refresh Devices, or choose another device.";
+      log(`WARNING: ${msg}`);
+      showAlarm("device_missing", msg);
+    } else if (alarmKind === "device_missing") {
+      clearAlarm();
+    }
 
     profileSelect.value = settings.profile || "robust";
     const modeRadio = document.querySelector(
@@ -182,10 +275,10 @@ async function persistSettings() {
   const settings: AppSettings = {
     profile: profileSelect.value,
     mode: currentMode(),
-    audio_in: selectedIndex(inputDeviceSelect),
-    audio_out: selectedIndex(outputDeviceSelect),
-    midi_in: selectedIndex(midiInSelect),
-    midi_out: selectedIndex(midiOutSelect),
+    audio_in: selectedName(inputDeviceSelect),
+    audio_out: selectedName(outputDeviceSelect),
+    midi_in: selectedName(midiInSelect),
+    midi_out: selectedName(midiOutSelect),
   };
   await invoke("set_settings", { settings });
   log("Settings saved.");
@@ -203,29 +296,103 @@ document.querySelectorAll('input[name="mode"]').forEach((el) => {
 });
 
 selfTestBtn.addEventListener("click", async () => {
+  selfTestBtn.disabled = true;
+  selfTestResults.textContent = "Measuring loopback latency (paced)…";
   try {
-    const result = await invoke<string>("run_self_test", {
-      profile: profileSelect.value,
-    });
-    log(result);
+    const lines = await invoke<string[]>("run_self_test");
+    for (const line of lines) log(line);
+    selfTestResults.textContent = lines.join(" · ");
   } catch (e) {
+    selfTestResults.textContent = "";
     log(`Self-test failed: ${e}`);
+  } finally {
+    selfTestBtn.disabled = false;
   }
 });
 
+type Role = "decoder" | "encoder";
+
+/** Payload of the `worker_stopped` event. */
+interface WorkerStopped {
+  role: Role;
+  run_id: number;
+}
+
+/**
+ * Run id returned by the start command of the worker the UI currently shows
+ * as running (null = shown as stopped), and the highest run id reported by
+ * `worker_stopped` per role. Run ids increase, so a `worker_stopped` that
+ * arrives before its start command's reply is still matched afterwards, and
+ * a late one from an earlier run is ignored.
+ */
+const currentRun: Record<Role, number | null> = {
+  decoder: null,
+  encoder: null,
+};
+const lastStoppedRun: Record<Role, number> = { decoder: 0, encoder: 0 };
+
+/** Lock or unlock a role's controls (buttons and the selects it uses). */
+function setRunningUi(role: Role, running: boolean) {
+  if (role === "decoder") {
+    startListenBtn.disabled = running;
+    stopListenBtn.disabled = !running;
+    inputDeviceSelect.disabled = running;
+    midiOutSelect.disabled = running;
+  } else {
+    startEncodeBtn.disabled = running;
+    stopEncodeBtn.disabled = !running;
+    panicBtn.disabled = !running;
+    outputDeviceSelect.disabled = running;
+    midiInSelect.disabled = running;
+    simulateCheck.disabled = running;
+    if (!running) clearTxQueueDisplay();
+  }
+}
+
+/** Show `role` as stopped; `reason` is shown in the decoder display. */
+function markStopped(role: Role, reason: string) {
+  currentRun[role] = null;
+  setRunningUi(role, false);
+  if (role === "decoder") {
+    decodedDisplay.innerHTML = "";
+    const span = document.createElement("span");
+    span.style.color = "#555";
+    span.textContent = reason;
+    decodedDisplay.appendChild(span);
+  }
+}
+
+/** The worker of `role` ended without the user pressing Stop. */
+function workerDied(role: Role) {
+  const name = role === "decoder" ? "Decoder" : "Encoder";
+  markStopped(role, "Stopped (worker ended — see log)");
+  log(`${name} stopped unexpectedly (see the log above for the reason).`);
+}
+
+/** Record a started run; returns false if it has already stopped. */
+function trackRun(role: Role, runId: number): boolean {
+  if (lastStoppedRun[role] >= runId) {
+    workerDied(role);
+    return false;
+  }
+  currentRun[role] = runId;
+  setRunningUi(role, true);
+  return true;
+}
+
 startListenBtn.addEventListener("click", async () => {
+  // Cleared before starting so an alarm raised by the new worker stays up.
+  clearAlarm();
   try {
-    await invoke("start_decoder", {
-      audioIn: selectedIndex(inputDeviceSelect),
-      midiOut: selectedIndex(midiOutSelect),
+    const runId = await invoke<number>("start_decoder", {
+      audioIn: selectedName(inputDeviceSelect),
+      midiOut: selectedName(midiOutSelect),
       profile: profileSelect.value,
     });
-    startListenBtn.disabled = true;
-    stopListenBtn.disabled = false;
-    inputDeviceSelect.disabled = true;
-    midiOutSelect.disabled = true;
-    decodedDisplay.innerHTML = '<span style="color: #3d9a7a">Listening…</span>';
-    alarmBox.classList.remove("visible");
+    if (trackRun("decoder", runId)) {
+      decodedDisplay.innerHTML =
+        '<span style="color: #3d9a7a">Listening…</span>';
+    }
     await persistSettings();
   } catch (error) {
     log(`Error starting decoder: ${error}`);
@@ -233,13 +400,10 @@ startListenBtn.addEventListener("click", async () => {
 });
 
 stopListenBtn.addEventListener("click", async () => {
+  // Forget the run first so its own worker_stopped is not taken as a crash.
+  markStopped("decoder", "Stopped");
   try {
     await invoke("stop_decoder");
-    startListenBtn.disabled = false;
-    stopListenBtn.disabled = true;
-    inputDeviceSelect.disabled = false;
-    midiOutSelect.disabled = false;
-    decodedDisplay.innerHTML = '<span style="color: #555">Stopped</span>';
     log("Decoder stopped.");
   } catch (error) {
     log(`Error stopping decoder: ${error}`);
@@ -248,17 +412,15 @@ stopListenBtn.addEventListener("click", async () => {
 
 startEncodeBtn.addEventListener("click", async () => {
   try {
-    const midiIn = selectedIndex(midiInSelect);
-    await invoke("start_encoder", {
-      audioOut: selectedIndex(outputDeviceSelect),
+    const midiIn = selectedName(midiInSelect);
+    const runId = await invoke<number>("start_encoder", {
+      audioOut: selectedName(outputDeviceSelect),
       midiIn,
       profile: profileSelect.value,
+      // With MIDI In = None the encoder always sends the test scale.
       simulate: simulateCheck.checked || midiIn === null,
     });
-    startEncodeBtn.disabled = true;
-    stopEncodeBtn.disabled = false;
-    outputDeviceSelect.disabled = true;
-    midiInSelect.disabled = true;
+    trackRun("encoder", runId);
     await persistSettings();
   } catch (error) {
     log(`Error starting encoder: ${error}`);
@@ -266,19 +428,33 @@ startEncodeBtn.addEventListener("click", async () => {
 });
 
 stopEncodeBtn.addEventListener("click", async () => {
+  markStopped("encoder", "Stopped");
   try {
     await invoke("stop_encoder");
-    startEncodeBtn.disabled = false;
-    stopEncodeBtn.disabled = true;
-    outputDeviceSelect.disabled = false;
-    midiInSelect.disabled = false;
     log("Encoder stopped.");
   } catch (error) {
     log(`Error stopping encoder: ${error}`);
   }
 });
 
+panicBtn.addEventListener("click", async () => {
+  try {
+    await invoke("encoder_panic");
+    log("Encoder panic sent (All Notes Off).");
+  } catch (error) {
+    log(`Panic failed: ${error}`);
+  }
+});
+
 async function bindEvents() {
+  // A worker ended (missing/failed device, panic, or a deliberate stop).
+  // Only the run the UI shows as running is reset; see `currentRun`.
+  await listen<WorkerStopped>("worker_stopped", (event) => {
+    const { role, run_id } = event.payload;
+    lastStoppedRun[role] = Math.max(lastStoppedRun[role], run_id);
+    if (currentRun[role] === run_id) workerDied(role);
+  });
+
   await listen<{ message: string }>("log", (event) => {
     log(event.payload.message);
   });
@@ -337,9 +513,21 @@ async function bindEvents() {
   });
 
   await listen<{ kind: string; message: string }>("alarm", (event) => {
-    alarmBox.textContent = event.payload.message;
-    alarmBox.classList.add("visible");
+    showAlarm(event.payload.kind, event.payload.message);
     log(`ALARM: ${event.payload.message}`);
+  });
+
+  // The engine reports when an alarm's condition has ended (e.g. audio input
+  // resumed after a stall): drop the banner if it still shows that alarm.
+  await listen<{ kind: string; message: string }>("alarm_cleared", (event) => {
+    if (alarmKind === event.payload.kind) clearAlarm();
+    log(event.payload.message);
+  });
+
+  await listen<{ queued: number; latency_ms: number }>("tx_status", (event) => {
+    const { queued, latency_ms } = event.payload;
+    txQueuedEl.textContent = String(queued);
+    txQueueLatencyEl.textContent = latency_ms.toFixed(0);
   });
 }
 
