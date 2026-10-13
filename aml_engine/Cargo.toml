@@ -2,6 +2,7 @@
 name = "aml_engine"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "AML real-time engine: audio/MIDI I/O and encoder/decoder workers shared by the GUI and CLI"
 
 [features]
