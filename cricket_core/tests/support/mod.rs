@@ -55,7 +55,7 @@ impl XorShift64 {
 /// Deterministic channel impairments applied to mono samples.
 ///
 /// Processing order: symbol corruption (on the clean, grid-aligned TX
-/// signal) → clock drift → low-pass → gain → leading silence → AWGN.
+/// signal) → dropout → clock drift → low-pass → gain → leading silence → AWGN.
 #[derive(Debug, Clone)]
 pub struct ChannelSim {
     pub config: PhyConfig,
@@ -72,6 +72,9 @@ pub struct ChannelSim {
     pub lowpass_hz: Option<f32>,
     /// Probability per symbol period of replacing a tone with a different one.
     pub symbol_error_prob: f64,
+    /// One muted stretch (e.g. a network audio packet loss) of this many
+    /// samples at a uniformly random position inside the signal.
+    pub dropout_samples: usize,
 }
 
 impl ChannelSim {
@@ -86,6 +89,7 @@ impl ChannelSim {
             drift_ppm: 0.0,
             lowpass_hz: None,
             symbol_error_prob: 0.0,
+            dropout_samples: 0,
         }
     }
 
@@ -119,6 +123,11 @@ impl ChannelSim {
         self
     }
 
+    pub fn dropout_samples(mut self, samples: usize) -> Self {
+        self.dropout_samples = samples;
+        self
+    }
+
     /// Apply all configured impairments. Deterministic for a given seed.
     pub fn apply(&self, input: &[f32]) -> Vec<f32> {
         let mut rng = XorShift64::new(self.seed);
@@ -126,6 +135,10 @@ impl ChannelSim {
 
         if self.symbol_error_prob > 0.0 {
             corrupt_symbols(&self.config, &mut samples, self.symbol_error_prob, &mut rng);
+        }
+        if self.dropout_samples > 0 && samples.len() > self.dropout_samples {
+            let start = rng.below(samples.len() - self.dropout_samples);
+            samples[start..start + self.dropout_samples].fill(0.0);
         }
         if self.drift_ppm != 0.0 {
             samples = resample_drift(&samples, self.drift_ppm);

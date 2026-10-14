@@ -1,5 +1,6 @@
 //! Robust-profile physical-layer parameters (see docs/aml-v1-spec.md).
 
+use crate::link::FecMode;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -34,6 +35,9 @@ pub struct PhyConfig {
     pub interleave_depth: usize,
     pub link_dead_ms: u32,
     pub heartbeat_interval_ms: u32,
+    /// Body forward error correction (experimental; `None` = AML v1 as
+    /// specified). See docs/proposals/fec.md.
+    pub fec: FecMode,
 }
 
 impl Default for PhyConfig {
@@ -62,6 +66,7 @@ impl PhyConfig {
             interleave_depth: 4,
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
+            fec: FecMode::None,
         }
     }
 
@@ -86,12 +91,25 @@ impl PhyConfig {
             interleave_depth: 4,
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
+            fec: FecMode::None,
+        }
+    }
+
+    /// Experimental: Robust phy with an RS(11,7)x2 GF(16) coded body
+    /// (`FecMode::Rs16 { parity: 4 }`) and a single copy (K = 1) instead of
+    /// K = 2 repetition. Not part of AML v1; see docs/proposals/fec.md.
+    pub fn robust_fec() -> Self {
+        Self {
+            repetition_k: 1,
+            fec: FecMode::Rs16 { parity: 4 },
+            ..Self::robust()
         }
     }
 
     pub fn from_name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
             "fast" => Self::fast(),
+            "robust_fec" | "robust-fec" => Self::robust_fec(),
             _ => Self::robust(),
         }
     }
@@ -101,9 +119,10 @@ impl PhyConfig {
         self
     }
 
-    /// Estimated first-copy on-wire duration for a max-size body (16 nibbles) + preamble.
+    /// Estimated first-copy on-wire duration for a max-size body (16 nibbles,
+    /// or the FEC-coded body length) + preamble.
     pub fn estimated_first_copy_ms(&self) -> f32 {
-        let body_nibbles = 16usize; // MAX_BODY_NIBBLES
+        let body_nibbles = self.fec.body_nibbles();
         let symbols = self.preamble.len() + body_nibbles;
         let period_ms = self.symbol_duration_ms + self.guard_gap_ms;
         symbols as f32 * period_ms
