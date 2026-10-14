@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ALSA for cpal/midir; GTK/WebKitGTK/libsoup for Tauri 2 (aml_gui).
+      # ALSA for cpal/midir; GTK/WebKitGTK/libsoup for Tauri 2 (cricket_gui).
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -45,7 +45,7 @@ jobs:
         run: cargo test --workspace
 
   no_std:
-    name: aml_core (no_std)
+    name: cricket_core (no_std)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,14 +57,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build for a bare-metal target
-        run: cargo build -p aml_core --no-default-features --target thumbv8m.main-none-eabihf
+        run: cargo build -p cricket_core --no-default-features --target thumbv8m.main-none-eabihf
 
   frontend:
     name: Frontend (typecheck)
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: aml_gui
+        working-directory: cricket_gui
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +72,7 @@ jobs:
         with:
           node-version: lts/*
           cache: npm
-          cache-dependency-path: aml_gui/package-lock.json
+          cache-dependency-path: cricket_gui/package-lock.json
 
       - name: Install
         run: npm ci

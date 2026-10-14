@@ -1,0 +1,16 @@
+[package]
+name = "cricket_cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "cricket"
+path = "src/main.rs"
+
+[dependencies]
+cricket_core = { path = "../cricket_core" }
+cricket_engine = { path = "../cricket_engine" }
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0"
+hound = "3.5"

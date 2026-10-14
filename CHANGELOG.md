@@ -2,6 +2,7 @@
 
 ## 1.1.0 (unreleased)
 
+- **Breaking:** the project is renamed from AML (AudioMIDI Link) to Cricket (Cricket MIDI). Crates are now `cricket_core`, `cricket_engine`, `cricket_cli`, and `cricket_gui`; the CLI binary is `cricket`; the app identifier is `se.dpmstudios.cricket`. The protocol keeps the name AML (AudioMIDI Link), with Cricket as its reference implementation; its first official version is AML v1 (spec: `docs/aml-v1-spec.md`), with wire version nibble `1` in the packet header, so it does not interoperate with earlier AML builds. The legacy prototype phy module is now `phy_legacy`. GUI settings live in a new `cricket` config directory; settings from AML builds are not migrated.
 - MIDI/AML decoding tolerates a wide input level range (−30 dB to 0 dB relative to transmit level) via level-independent tone detection and a silence floor.
 - Link loss and panic use one fail-safe path: Sustain off and All Notes Off are sent once, without duplicate bursts.
 - Repeated on-air copies of the same packet are suppressed within a short time window; dedup state resets when the link is declared dead.

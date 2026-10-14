@@ -67,53 +67,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aml_cli"
-version = "0.1.0"
-dependencies = [
- "aml_core",
- "aml_engine",
- "anyhow",
- "clap",
- "hound",
-]
-
-[[package]]
-name = "aml_core"
-version = "0.1.0"
-dependencies = [
- "hound",
- "libm",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "aml_engine"
-version = "0.1.0"
-dependencies = [
- "aml_core",
- "anyhow",
- "cpal",
- "midir",
- "ringbuf",
-]
-
-[[package]]
-name = "aml_gui"
-version = "1.0.0"
-dependencies = [
- "aml_core",
- "aml_engine",
- "dirs 5.0.1",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -822,6 +775,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "cricket_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cricket_core",
+ "cricket_engine",
+ "hound",
+]
+
+[[package]]
+name = "cricket_core"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "libm",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "cricket_engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "cricket_core",
+ "midir",
+ "ringbuf",
+]
+
+[[package]]
+name = "cricket_gui"
+version = "1.0.0"
+dependencies = [
+ "cricket_core",
+ "cricket_engine",
+ "dirs 5.0.1",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
 ]
 
 [[package]]

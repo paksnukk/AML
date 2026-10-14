@@ -121,7 +121,7 @@
   "encoding": {
     "velocity": {
       "mode": "quantized_4bit",
-      "description": "Velocity (0-127) is mapped to 0-15 for V1 robustness and faster decoding.",
+      "description": "Velocity (0-127) is mapped to 0-15 for legacy-prototype robustness and faster decoding.",
       "map": {
         "formula": "v4 = clamp(round(velocity / 8), 0, 15)",
         "symbol": "value_0_15"
@@ -129,7 +129,7 @@
     },
     "program_change": {
       "mode": "quantized_4bit",
-      "description": "Program (0-127) mapped to 0-15 in V1. Can be extended to 8-bit using two VALUE symbols later.",
+      "description": "Program (0-127) mapped to 0-15 in the legacy prototype. Can be extended to 8-bit using two VALUE symbols later.",
       "map": {
         "formula": "p4 = clamp(program >> 3, 0, 15)",
         "symbol": "value_0_15"
@@ -137,7 +137,7 @@
     },
     "cue_index": {
       "mode": "quantized_4bit",
-      "description": "Cue index encoded as 0-15 in V1. Extend later if needed.",
+      "description": "Cue index encoded as 0-15 in the legacy prototype. Extend later if needed.",
       "symbol": "value_0_15"
     }
   },

@@ -1,7 +1,10 @@
-# Project Plan: AML (AudioMIDI Link) Implementation in Rust
+# Project Plan: Cricket (Cricket MIDI) Implementation in Rust
+
+> Historical planning document. "V1" here is the sequential-tone prototype (now the legacy
+> prototype phy); "V2" became the shipped protocol, **AML v1** (see `docs/aml-v1-spec.md`).
 
 ## Overview
-Build a real-time application to convert MIDI to Audio (Encoder) and Audio to MIDI (Decoder) using the AML Protocol V1.
+Build a real-time application to convert MIDI to Audio (Encoder) and Audio to MIDI (Decoder) using the V1 prototype protocol.
 The system is designed for low-latency, deterministic control over standard audio channels.
 
 ## Goals
@@ -10,10 +13,10 @@ The system is designed for low-latency, deterministic control over standard audi
 - **Architecture:** Separation of concerns (Core Library vs. Application Layer).
 
 ## Phase 1: Architecture & Setup
-- [ ] Initialize Rust Workspace (`aml_workspace`)
+- [ ] Initialize Rust Workspace (`cricket_workspace`)
 - [ ] Create crates:
-    - `aml_core`: Logic, State Machine, DSP (Goertzel), Protocol definitions.
-    - `aml_cli`: Command-line interface for real-time I/O.
+    - `cricket_core`: Logic, State Machine, DSP (Goertzel), Protocol definitions.
+    - `cricket_cli`: Command-line interface for real-time I/O.
 - [ ] Dependency selection:
     - `cpal` (Audio I/O)
     - `midir` (MIDI I/O)
@@ -21,7 +24,7 @@ The system is designed for low-latency, deterministic control over standard audi
     - `clap` (CLI arguments)
     - `serde`/`serde_json` (Profile parsing)
 
-## Phase 2: AML Core Implementation
+## Phase 2: Cricket Core Implementation
 ### 2.1 Data Structures
 - [ ] Implement `Profile` struct and JSON parsing.
 - [ ] Implement `Symbol` definitions and frequency table generation.

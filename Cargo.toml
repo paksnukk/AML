@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "aml_core",
-    "aml_engine",
-    "aml_cli",
-    "aml_gui/src-tauri"
+    "cricket_core",
+    "cricket_engine",
+    "cricket_cli",
+    "cricket_gui/src-tauri"
 ]
 resolver = "2"

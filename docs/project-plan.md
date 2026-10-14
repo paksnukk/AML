@@ -1,4 +1,7 @@
-# Project Plan: AudioMIDI Link (AML)
+# Project Plan: Cricket (Cricket MIDI)
+
+> Historical planning document. "V1" here is the sequential-tone prototype (now the legacy
+> prototype phy); "V2" became the shipped protocol, **AML v1** (see `docs/aml-v1-spec.md`).
 
 ## 1. Vision
 Build a robust bridge that transports MIDI/MSC control data over audio infrastructure (analog XLR, Dante, MADI) by encoding events into short audio tone "symbols".
@@ -46,7 +49,7 @@ Primary goals (live environment):
 
 ---
 
-## 4. Protocol: AML V1 (Sequential Tone Symbols)
+## 4. Protocol: V1 prototype (Sequential Tone Symbols)
 ### 4.1 What “symbols in sequence” means
 A **symbol** is a short tone burst at a predefined frequency for a predefined duration.
 A **frame** is a sequence of symbols (preamble + type + payload).
@@ -108,17 +111,17 @@ We start conservative to ensure correctness, then optimize.
 
 ## 6. Architecture
 ### 6.1 Crate layout (Cargo workspace)
-- `aml-core`
+- `cricket-core`
   - protocol (frame definitions, encoder/decoder state machine)
   - dsp (tone generator, Goertzel detector, gate/threshold, meters)
   - timing (symbol clock, buffering helpers)
-- `aml-io`
+- `cricket-io`
   - audio (cpal wrapper)
   - midi (midir wrapper)
   - config (serde + toml)
-- `aml-cli`
+- `cricket-cli`
   - CLI app (TX/RX modes, logging, config)
-- `aml-gui` (optional, later)
+- `cricket-gui` (optional, later)
   - Tauri UI + core integration
 
 ### 6.2 Decoder as a state machine
@@ -133,15 +136,15 @@ Decoder states:
 
 ## 7. Milestones
 ### Phase 0 — Specification & Test Harness (must-have)
-- [ ] Write `spec.md` for AML V1 (frequencies, symbol duration, frame formats)
+- [ ] Write `spec.md` for the V1 prototype (frequencies, symbol duration, frame formats)
 - [ ] Implement offline generator → writes WAV test files
 - [ ] Implement offline decoder → reads WAV and outputs parsed events
 - [ ] Create golden tests: known frames must decode correctly
 
 ### Phase 1 — Encoder Proof of Concept (TX)
-- [ ] Create Rust workspace + crates (`aml-core`, `aml-io`, `aml-cli`)
+- [ ] Create Rust workspace + crates (`cricket-core`, `cricket-io`, `cricket-cli`)
 - [ ] MIDI input: listen for NOTE_ON/NOTE_OFF
-- [ ] Encode events into AML frames (symbol sequence)
+- [ ] Encode events into Cricket frames (symbol sequence)
 - [ ] Tone generator with ramp (attack/release)
 - [ ] Output audio via cpal
 - [ ] CLI flags: select MIDI in/out, audio device, mode (safe/fast placeholder)

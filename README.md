@@ -1,16 +1,21 @@
-# AML — AudioMIDI Link
+# Cricket
 
-> **MIDI over a cable that was only ever meant to carry sound.**
+> **Cricket MIDI: MIDI over a cable that was only ever meant to carry sound.**
 
 You have a Dante network, a MADI snake, or a long analog XLR run between front of house and the stage.
 You need MIDI or show-control cues over there. The audio path reaches it; the MIDI cable does not.
 
-AML turns MIDI into a short burst of tones, sends it down any spare audio channel, and turns the tones back
+Cricket turns MIDI into a short burst of tones, sends it down any spare audio channel, and turns the tones back
 into MIDI on the far end. It sounds a bit like a dial-up modem having a very polite conversation.
+Like its namesake, it keeps chirping steadily even when there's nothing to say; if the far end suddenly hears
+nothing but, well, crickets, it sends All Notes Off so no note is left droning.
+
+Cricket speaks **AML v1** (AudioMIDI Link), an open protocol for MIDI over audio, specified in
+[`docs/aml-v1-spec.md`](docs/aml-v1-spec.md). Anything else that speaks AML v1 can talk to it.
 
 ```
  ┌───────────┐  MIDI   ┌─────────┐  ♪ audio ♪  ┌──────────────────┐  ♪ audio ♪  ┌─────────┐  MIDI   ┌──────────┐
- │ keyboard, │ ──────▶ │ AML     │ ──────────▶ │ Dante / MADI /   │ ──────────▶ │ AML     │ ──────▶ │ synth,   │
+ │ keyboard, │ ──────▶ │ Cricket │ ──────────▶ │ Dante / MADI /   │ ──────────▶ │ Cricket │ ──────▶ │ synth,   │
  │ show ctrl │         │ encoder │             │ analog XLR / ... │             │ decoder │         │ lights … │
  └───────────┘         └─────────┘             └──────────────────┘             └─────────┘         └──────────┘
 ```
@@ -48,7 +53,7 @@ Supported messages: NoteOn, NoteOff, Program Change, MSC (Go / Stop / Resume / L
 | Comfortable rate | ~3–4 messages/s | ~10 messages/s |
 | Measured NoteOn latency\* | mean ~345 ms, p95 ~480 ms | mean ~80 ms, p95 ~115 ms |
 
-\* MIDI in → MIDI out through the engine, in-process (`aml_cli loopback`), while notes are being played *and
+\* MIDI in → MIDI out through the engine, in-process (`cricket loopback`), while notes are being played *and
 released*. Real audio interfaces add their own buffering on top. Run the measurement yourself rather than
 trusting this table.
 
@@ -59,20 +64,22 @@ Node.js and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites
 
 ```sh
 # What audio and MIDI devices are there?
-cargo run -p aml_cli -- list-devices
+cargo run -p cricket_cli -- list-devices
 
 # Sending side: MIDI in → tones out (by index or by exact name)
-cargo run -p aml_cli -- encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2"
+cargo run -p cricket_cli -- encode --midi-in-name "My Keyboard" --audio-out-name "Dante TX 1-2"
 
 # Receiving side: tones in → MIDI out
-cargo run -p aml_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
+cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
 
 # No hardware at hand? Encoder plays a C-major scale on its own
-cargo run -p aml_cli -- encode --simulate
+cargo run -p cricket_cli -- encode --simulate
 
 # How fast is it, really? (both profiles, no hardware needed)
-cargo run --release -p aml_cli -- loopback
+cargo run --release -p cricket_cli -- loopback
 ```
+
+The binary is called `cricket` (`cargo install --path cricket_cli`, or `target/release/cricket`).
 
 Devices are remembered **by name**, so unplugging and replugging an interface doesn't silently pick another
 one. A name that isn't present is an error.
@@ -80,7 +87,7 @@ one. A name that isn't present is an error.
 ### The GUI
 
 ```sh
-cd aml_gui
+cd cricket_gui
 npm install
 npm run tauri dev
 ```
@@ -93,10 +100,10 @@ rate, sync losses), the TX queue and its latency, alarms for missing or stalled 
 
 | Crate | What lives there |
 |---|---|
-| [`aml_core`](aml_core) | The modem: tone synthesis and detection, packets, CRC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy V1 phy. |
-| [`aml_engine`](aml_engine) | The real-time part: audio/MIDI devices, encoder and decoder workers, events, loopback latency measurement. |
-| [`aml_cli`](aml_cli) | Command-line front end. |
-| [`aml_gui`](aml_gui) | Tauri 2 desktop app (TypeScript + Rust). |
+| [`cricket_core`](cricket_core) | The modem: tone synthesis and detection, packets, CRC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy prototype phy. |
+| [`cricket_engine`](cricket_engine) | The real-time part: audio/MIDI devices, encoder and decoder workers, events, loopback latency measurement. |
+| [`cricket_cli`](cricket_cli) | Command-line front end. |
+| [`cricket_gui`](cricket_gui) | Tauri 2 desktop app (TypeScript + Rust). |
 
 ## Testing
 
@@ -106,15 +113,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-The tests don't need hardware. A channel simulator in [`aml_core/tests/support`](aml_core/tests/support)
+The tests don't need hardware. A channel simulator in [`cricket_core/tests/support`](cricket_core/tests/support)
 puts packets through offsets, odd chunk sizes, gain changes, noise, clock drift, low-pass filtering and
-random symbol corruption. In [`stuck_notes.rs`](aml_core/tests/stuck_notes.rs), a thousand NoteOn/NoteOff
+random symbol corruption. In [`stuck_notes.rs`](cricket_core/tests/stuck_notes.rs), a thousand NoteOn/NoteOff
 pairs go through a corrupted channel, and every note must be released. CI runs all of the above on
 every push.
 
 ## Docs
 
-- [`docs/aml-v2-spec.md`](docs/aml-v2-spec.md): the protocol and physical layer as implemented.
+- [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md): the AML v1 protocol and physical layer as implemented.
 - [`docs/v1.1-plan.md`](docs/v1.1-plan.md): what v1.1 set out to fix, and how.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed.
 

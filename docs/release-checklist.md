@@ -1,12 +1,12 @@
-# AML v1.0 Release / Field Checklist (pro-clean)
+# Cricket v1.0 Release / Field Checklist (pro-clean)
 
-Operational model: **dedicated channel like LTC** — no EQ/comp/limiter on the AML bus.
+Operational model: **dedicated channel like LTC** — no EQ/comp/limiter on the Cricket bus.
 
 ## Pre-release (automated)
 
-- [ ] `cargo test -p aml_core` green (includes Fast latency budget ≤ 60 ms)
-- [ ] `cargo run -p aml_cli -- test` passes
-- [ ] `cargo run -p aml_cli -- loopback` reports stable latency
+- [ ] `cargo test -p cricket_core` green (includes Fast latency budget ≤ 60 ms)
+- [ ] `cargo run -p cricket_cli -- test` passes
+- [ ] `cargo run -p cricket_cli -- loopback` reports stable latency
 - [ ] GUI **Self-Test** passes for Robust and Fast
 - [ ] `npm run tauri build` produces macOS app/bundle
 
@@ -32,5 +32,5 @@ Operational model: **dedicated channel like LTC** — no EQ/comp/limiter on the 
 
 ## Version
 
-- App version **1.0.0** (`aml_gui` package + `tauri.conf.json`)
+- App version **1.0.0** (`cricket_gui` package + `tauri.conf.json`)
 - Git tag: `v1.0.0` when field gate is signed off
