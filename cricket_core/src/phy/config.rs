@@ -144,14 +144,31 @@ impl PhyConfig {
         }
     }
 
+    /// **Experimental**: [`ltc`](Self::ltc) with an RS(11,7)x2 GF(16) coded
+    /// body (`FecMode::Rs16 { parity: 4 }`, 22 instead of 16 nibbles).
+    pub fn ltc_fec() -> Self {
+        Self::ltc_fec_with_bit_rate(4800)
+    }
+
+    /// Experimental BMC profile at `bit_rate` bit/s with the RS16 parity-4 body.
+    pub fn ltc_fec_with_bit_rate(bit_rate: u32) -> Self {
+        Self {
+            fec: FecMode::Rs16 { parity: 4 },
+            ..Self::ltc_with_bit_rate(bit_rate)
+        }
+    }
+
     pub fn from_name(name: &str) -> Self {
-        match name.to_ascii_lowercase().as_str() {
+        match name.to_ascii_lowercase().replace('-', "_").as_str() {
             "fast" => Self::fast(),
-            "robust_fec" | "robust-fec" => Self::robust_fec(),
+            "robust_fec" => Self::robust_fec(),
             "ltc" => Self::ltc(),
             "ltc2400" => Self::ltc_with_bit_rate(2400),
             "ltc4800" => Self::ltc_with_bit_rate(4800),
             "ltc9600" => Self::ltc_with_bit_rate(9600),
+            "ltc_fec" | "ltc4800_fec" => Self::ltc_fec(),
+            "ltc2400_fec" => Self::ltc_fec_with_bit_rate(2400),
+            "ltc9600_fec" => Self::ltc_fec_with_bit_rate(9600),
             _ => Self::robust(),
         }
     }

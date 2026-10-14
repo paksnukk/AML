@@ -15,7 +15,8 @@ use std::sync::mpsc::Receiver;
 struct Cli {
     /// PHY profile: robust (default), fast, or the experimental robust_fec
     /// (Reed–Solomon body FEC) and BMC (LTC-style) profiles ltc (4800 bit/s),
-    /// ltc2400, ltc4800, ltc9600
+    /// ltc2400, ltc4800, ltc9600, and ltc_fec, ltc2400_fec, ltc9600_fec (with
+    /// Reed–Solomon body FEC)
     #[arg(long, global = true, default_value = "robust")]
     profile: String,
 

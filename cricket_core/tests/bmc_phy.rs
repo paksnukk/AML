@@ -218,8 +218,18 @@ fn link_dead_fires_after_silence() {
 #[test]
 fn mfsk_and_bmc_do_not_cross_decode() {
     let messages: Vec<_> = (0..6).map(note_on_for).collect();
-    let mfsk = [PhyConfig::robust(), PhyConfig::fast()];
-    for (name, bmc) in ltc_profiles() {
+    let mfsk = [
+        PhyConfig::robust(),
+        PhyConfig::fast(),
+        PhyConfig::robust_fec(),
+    ];
+    let mut bmc_profiles = ltc_profiles();
+    bmc_profiles.extend([
+        ("ltc2400_fec", PhyConfig::ltc_fec_with_bit_rate(2400)),
+        ("ltc_fec", PhyConfig::ltc_fec()),
+        ("ltc9600_fec", PhyConfig::ltc_fec_with_bit_rate(9600)),
+    ]);
+    for (name, bmc) in bmc_profiles {
         for m in &mfsk {
             let mfsk_audio = encode_to_samples(m.clone(), &messages);
             assert!(
@@ -232,15 +242,13 @@ fn mfsk_and_bmc_do_not_cross_decode() {
     }
 
     // One stream carrying both: each receiver gets exactly its own messages.
-    let fast = PhyConfig::fast();
-    let ltc = PhyConfig::ltc();
-    let a = [note_on_for(1)];
-    let b = [note_on_for(2)];
-    let mut stream = encode_to_samples(fast.clone(), &a);
-    stream.extend(encode_to_samples(ltc.clone(), &b));
-    stream.extend(encode_to_samples(fast.clone(), &a));
-    // The second Fast copy is identical (same SEQ) and inside the dedup
-    // window, so Fast reports it once.
-    assert_eq!(decode_samples(fast, &stream), a);
-    assert_eq!(decode_samples(ltc, &stream), b);
+    for ltc in [PhyConfig::ltc(), PhyConfig::ltc_fec()] {
+        let fast = PhyConfig::fast();
+        let (a, b, c) = ([note_on_for(1)], [note_on_for(2)], [note_on_for(3)]);
+        let mut stream = encode_to_samples(fast.clone(), &a);
+        stream.extend(encode_to_samples(ltc.clone(), &b));
+        stream.extend(encode_to_samples(fast.clone(), &c));
+        assert_eq!(decode_samples(fast, &stream), [a[0].clone(), c[0].clone()]);
+        assert_eq!(decode_samples(ltc, &stream), b);
+    }
 }
