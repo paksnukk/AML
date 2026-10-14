@@ -1,5 +1,6 @@
 //! Robust-profile physical-layer parameters (see docs/aml-v1-spec.md).
 
+use super::bmc::{BmcParams, Modulation};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -14,6 +15,8 @@ const PURITY_FAST: f32 = 0.3;
 #[derive(Debug, Clone)]
 pub struct PhyConfig {
     pub sample_rate_hz: u32,
+    /// Line code. `Mfsk` for AML v1 (robust, fast); `Bmc` is experimental.
+    pub modulation: Modulation,
     pub symbol_duration_ms: f32,
     pub guard_gap_ms: f32,
     pub attack_ms: f32,
@@ -46,6 +49,7 @@ impl PhyConfig {
     pub fn robust() -> Self {
         Self {
             sample_rate_hz: 48_000,
+            modulation: Modulation::Mfsk,
             symbol_duration_ms: 6.0,
             guard_gap_ms: 0.5,
             attack_ms: 0.3,
@@ -70,6 +74,7 @@ impl PhyConfig {
     pub fn fast() -> Self {
         Self {
             sample_rate_hz: 48_000,
+            modulation: Modulation::Mfsk,
             symbol_duration_ms: 3.0,
             guard_gap_ms: 0.0,
             attack_ms: 0.15,
@@ -89,9 +94,45 @@ impl PhyConfig {
         }
     }
 
+    /// **Experimental** LTC-style profile: biphase-mark code at 4800 bit/s
+    /// (see `docs/proposals/ltc-bmc.md`). Not part of the AML v1 spec.
+    pub fn ltc() -> Self {
+        Self::ltc_with_bit_rate(4800)
+    }
+
+    /// Experimental BMC profile at `bit_rate` bit/s. The symbol fields describe
+    /// one nibble (4 bits) so generic helpers stay meaningful; the MFSK-only
+    /// fields (tones, preamble, purity) are unused.
+    pub fn ltc_with_bit_rate(bit_rate: u32) -> Self {
+        Self {
+            sample_rate_hz: 48_000,
+            modulation: Modulation::Bmc(BmcParams::new(bit_rate)),
+            symbol_duration_ms: 4000.0 / bit_rate as f32,
+            guard_gap_ms: 0.0,
+            attack_ms: 0.0,
+            release_ms: 0.0,
+            amplitude: 0.8,
+            tone_base_hz: 0.0,
+            tone_step_hz: 0.0,
+            n_tones: 0,
+            preamble: Vec::new(),
+            min_confidence_db: 0.0,
+            min_tone_purity: 0.0,
+            min_rms_dbfs: -60.0,
+            repetition_k: 1,
+            interleave_depth: 4,
+            link_dead_ms: 2000,
+            heartbeat_interval_ms: 500,
+        }
+    }
+
     pub fn from_name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
             "fast" => Self::fast(),
+            "ltc" => Self::ltc(),
+            "ltc2400" => Self::ltc_with_bit_rate(2400),
+            "ltc4800" => Self::ltc_with_bit_rate(4800),
+            "ltc9600" => Self::ltc_with_bit_rate(9600),
             _ => Self::robust(),
         }
     }
@@ -104,6 +145,9 @@ impl PhyConfig {
     /// Estimated first-copy on-wire duration for a max-size body (16 nibbles) + preamble.
     pub fn estimated_first_copy_ms(&self) -> f32 {
         let body_nibbles = 16usize; // MAX_BODY_NIBBLES
+        if let Modulation::Bmc(p) = &self.modulation {
+            return p.frame_ms(body_nibbles);
+        }
         let symbols = self.preamble.len() + body_nibbles;
         let period_ms = self.symbol_duration_ms + self.guard_gap_ms;
         symbols as f32 * period_ms

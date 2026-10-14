@@ -2,7 +2,7 @@ use crate::link::{
     body_nibble_count, bytes_to_nibbles, decode_packet_bytes, deinterleave, encode_packet_bytes,
     interleave, nibbles_to_bytes, Packet,
 };
-use crate::phy::{LinkState, ModemRx, ModemTx, PhyConfig, RxEvent};
+use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
 use crate::transport::{
     fail_safe_burst, message_to_midi, FailSafeMonitor, MessageType, TransportMessage,
 };
@@ -31,16 +31,17 @@ pub enum ModemOutput {
     Stats(ModemStats),
 }
 
-/// High-level TX: transport message → repeated interleaved MFSK audio.
+/// High-level TX: transport message → repeated interleaved audio (MFSK, or
+/// the experimental BMC phy, per `config.modulation`).
 pub struct CricketModemTx {
-    phy: ModemTx,
+    phy: PhyTx,
     config: PhyConfig,
     seq: u8,
 }
 
 impl CricketModemTx {
     pub fn new(config: PhyConfig) -> Self {
-        let phy = ModemTx::new(config.clone());
+        let phy = PhyTx::new(config.clone());
         Self {
             phy,
             config,
@@ -81,7 +82,7 @@ impl CricketModemTx {
         for _ in 0..self.config.repetition_k {
             audio.extend(self.phy.synthesize_framed(&interleaved));
             // Small gap between repetitions
-            let gap = self.config.samples_per_symbol_period();
+            let gap = repetition_gap_samples(&self.config);
             audio.extend(core::iter::repeat_n(0.0, gap));
         }
         audio
@@ -95,7 +96,19 @@ impl CricketModemTx {
 /// Samples one on-wire repetition occupies: preamble + body symbol periods
 /// plus the one-period gap `CricketModemTx` inserts after each repetition.
 pub fn repetition_samples(config: &PhyConfig) -> u64 {
+    if let Modulation::Bmc(p) = &config.modulation {
+        return p.repetition_samples(config.sample_rate_hz, MAX_BODY_NIBBLES) as u64;
+    }
     ((config.preamble.len() + MAX_BODY_NIBBLES + 1) * config.samples_per_symbol_period()) as u64
+}
+
+/// Silence `CricketModemTx` appends after each repetition: one symbol
+/// period (MFSK) or `gap_bits` cells (BMC).
+pub fn repetition_gap_samples(config: &PhyConfig) -> usize {
+    match &config.modulation {
+        Modulation::Mfsk => config.samples_per_symbol_period(),
+        Modulation::Bmc(p) => p.gap_samples(config.sample_rate_hz),
+    }
 }
 
 /// Duplicate-suppression window in samples (docs/aml-v1-spec.md §4.4): one
@@ -119,7 +132,7 @@ pub fn dedup_window_samples(config: &PhyConfig) -> u64 {
 /// that sample (resolution: one chunk); the exact sample is available from
 /// [`CricketModemRx::last_link_dead_sample`].
 pub struct CricketModemRx {
-    phy: ModemRx,
+    phy: PhyRx,
     config: PhyConfig,
     body_nibbles: Vec<u8>,
     collecting: bool,
@@ -136,7 +149,7 @@ pub struct CricketModemRx {
 
 impl CricketModemRx {
     pub fn new(config: PhyConfig) -> Self {
-        let mut phy = ModemRx::new(config.clone());
+        let mut phy = PhyRx::new(config.clone());
         phy.set_expected_body_nibbles(MAX_BODY_NIBBLES);
         let fail_safe = FailSafeMonitor::new(config.link_dead_ms, config.sample_rate_hz);
         let dedup_window = dedup_window_samples(&config);
