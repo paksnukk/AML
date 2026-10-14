@@ -15,3 +15,4 @@
 - `aml_cli loopback` and the GUI self-test report measured MIDI-in to MIDI-out note-on latency (mean, 95th percentile, and jitter) while playing and releasing notes, instead of a theoretical airtime. The self-test no longer blocks the UI.
 - While encoding, the UI shows how many messages are queued and how late the oldest one already is (its wait plus the audio buffered ahead of it). A panic button sends All Notes Off. Profile hints say when to use Fast and when to use Robust.
 - Continuous integration runs `cargo test`, `clippy`, and `fmt` on GitHub Actions.
+- `aml_core` builds as `no_std` + `alloc` (with `--no-default-features`) so the modem can run on microcontrollers such as ESP32-S3, RP2350, and STM32. WAV file I/O and the legacy V1 phy stay behind the default `std` feature. CI checks the build for `thumbv8m.main-none-eabihf`.

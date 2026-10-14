@@ -1,6 +1,7 @@
 use aml_core::modem::{decode_samples, encode_to_samples, AmlModemRx, AmlModemTx, ModemOutput};
 use aml_core::phy::PhyConfig;
 use aml_core::transport::{MscCommand, TransportMessage};
+#[cfg(feature = "std")]
 use aml_core::wav::{read_wav_f32, write_wav_f32};
 
 #[test]
@@ -35,6 +36,7 @@ fn loopback_program_and_msc() {
     assert_eq!(decoded, messages);
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn loopback_via_wav_file() {
     let config = PhyConfig::robust();

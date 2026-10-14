@@ -6,7 +6,9 @@ use crate::phy::{LinkState, ModemRx, ModemTx, PhyConfig, RxEvent};
 use crate::transport::{
     fail_safe_burst, message_to_midi, FailSafeMonitor, MessageType, TransportMessage,
 };
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Fixed interleaved body size so RX can lock without knowing the type early.
 pub const MAX_BODY_NIBBLES: usize = 16;
@@ -80,7 +82,7 @@ impl AmlModemTx {
             audio.extend(self.phy.synthesize_framed(&interleaved));
             // Small gap between repetitions
             let gap = self.config.samples_per_symbol_period();
-            audio.extend(std::iter::repeat_n(0.0, gap));
+            audio.extend(core::iter::repeat_n(0.0, gap));
         }
         audio
     }
@@ -331,7 +333,7 @@ pub fn encode_to_samples(config: PhyConfig, messages: &[TransportMessage]) -> Ve
     for msg in messages {
         all.extend(tx.encode_message(msg));
         // Inter-message silence
-        all.extend(std::iter::repeat_n(
+        all.extend(core::iter::repeat_n(
             0.0,
             tx.config().samples_per_symbol_period() * 2,
         ));

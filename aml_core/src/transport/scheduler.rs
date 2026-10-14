@@ -7,7 +7,7 @@
 //! where that transmission begins.
 
 use super::TransportMessage;
-use std::collections::{HashSet, VecDeque};
+use alloc::collections::VecDeque;
 
 const REFRESH_CAPACITY: usize = 32;
 const REFRESH_LIFETIME_MS: u64 = 10_000;
@@ -19,6 +19,28 @@ const NOTEON_BUDGET_MS: u64 = 250;
 /// Queued NoteOns that are never dropped for the airtime budget, so a chord
 /// survives even when one message is longer than the budget (Robust).
 const MIN_KEPT_NOTE_ONS: usize = 4;
+
+/// Allocation-free set of note numbers (one bit per `u8` value).
+#[derive(Clone, Copy, Default)]
+struct NoteSet([u128; 2]);
+
+impl NoteSet {
+    fn insert(&mut self, note: u8) {
+        self.0[usize::from(note >> 7)] |= 1 << (note & 0x7F);
+    }
+
+    fn remove(&mut self, note: u8) {
+        self.0[usize::from(note >> 7)] &= !(1 << (note & 0x7F));
+    }
+
+    fn contains(&self, note: u8) -> bool {
+        self.0[usize::from(note >> 7)] & (1 << (note & 0x7F)) != 0
+    }
+
+    fn clear(&mut self) {
+        self.0 = [0; 2];
+    }
+}
 
 #[derive(Clone, Copy)]
 struct RefreshEntry {
@@ -70,7 +92,7 @@ pub struct TxScheduler {
     normal_q: VecDeque<Queued>,
 
     /// Notes whose NoteOn has been emitted (sounding on the far side).
-    sounding: HashSet<u8>,
+    sounding: NoteSet,
     refresh: VecDeque<RefreshEntry>,
 
     last_emit_sample: Option<u64>,
@@ -90,7 +112,7 @@ impl TxScheduler {
             panic_q: VecDeque::new(),
             note_off_q: VecDeque::new(),
             normal_q: VecDeque::new(),
-            sounding: HashSet::new(),
+            sounding: NoteSet::default(),
             refresh: VecDeque::new(),
             last_emit_sample: None,
             note_on_dropped: false,
@@ -171,7 +193,7 @@ impl TxScheduler {
         }
         if let Some(q) = self.note_off_q.pop_front() {
             if let TransportMessage::NoteOff { note } = q.msg {
-                self.sounding.remove(&note);
+                self.sounding.remove(note);
                 self.push_refresh(note, now_samples);
             }
             return Some(self.emit(q.msg, now_samples, true));
@@ -279,7 +301,7 @@ impl TxScheduler {
         // sounding from an earlier strike: then the release must still go out.
         if let (TransportMessage::NoteOn { note, .. }, Some(push_sample)) = (q.msg, q.release_after)
         {
-            if self.sounding.contains(&note) {
+            if self.sounding.contains(note) {
                 self.note_off_q
                     .push_back(Queued::new(TransportMessage::NoteOff { note }, push_sample));
             }

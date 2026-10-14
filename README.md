@@ -93,7 +93,7 @@ rate, sync losses), the TX queue and its latency, alarms for missing or stalled 
 
 | Crate | What lives there |
 |---|---|
-| [`aml_core`](aml_core) | The modem: tone synthesis and detection, packets, CRC, interleaving, TX scheduler, fail-safe. Pure Rust, no I/O. |
+| [`aml_core`](aml_core) | The modem: tone synthesis and detection, packets, CRC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy V1 phy. |
 | [`aml_engine`](aml_engine) | The real-time part: audio/MIDI devices, encoder and decoder workers, events, loopback latency measurement. |
 | [`aml_cli`](aml_cli) | Command-line front end. |
 | [`aml_gui`](aml_gui) | Tauri 2 desktop app (TypeScript + Rust). |

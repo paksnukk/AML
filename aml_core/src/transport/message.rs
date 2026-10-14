@@ -1,3 +1,6 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {

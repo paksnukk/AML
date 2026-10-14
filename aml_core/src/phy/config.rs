@@ -1,5 +1,8 @@
 //! Robust-profile physical-layer parameters (see docs/aml-v2-spec.md).
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 // Tone-purity thresholds (see `goertzel::tone_purity`). Measured on
 // synthesized symbols: ~0.97 aligned, ~0.91 aligned at SNR 12 dB, >= 0.43 at a
 // full search hop of misalignment (>= 0.39 at SNR 12 dB). White-noise windows
@@ -107,11 +110,11 @@ impl PhyConfig {
     }
 
     pub fn symbol_samples(&self) -> usize {
-        ((self.symbol_duration_ms / 1000.0) * self.sample_rate_hz as f32).round() as usize
+        libm::roundf((self.symbol_duration_ms / 1000.0) * self.sample_rate_hz as f32) as usize
     }
 
     pub fn gap_samples(&self) -> usize {
-        ((self.guard_gap_ms / 1000.0) * self.sample_rate_hz as f32).round() as usize
+        libm::roundf((self.guard_gap_ms / 1000.0) * self.sample_rate_hz as f32) as usize
     }
 
     pub fn samples_per_symbol_period(&self) -> usize {

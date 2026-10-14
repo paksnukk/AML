@@ -1,6 +1,7 @@
 use super::config::PhyConfig;
 use super::goertzel::{best_tone, goertzel_power, rms_dbfs, ToneDetection};
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {

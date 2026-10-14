@@ -46,7 +46,7 @@ impl FailSafeMonitor {
     /// Disarm without firing (link-dead was declared by someone else, e.g. a
     /// wall-clock watchdog). Returns true if the monitor was armed.
     pub fn disarm(&mut self) -> bool {
-        std::mem::replace(&mut self.armed, false)
+        core::mem::replace(&mut self.armed, false)
     }
 
     /// Stream sample at which link-dead fires if no valid packet arrives first.

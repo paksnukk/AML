@@ -1,5 +1,6 @@
 use super::crc::crc16_ccitt;
 use crate::transport::MessageType;
+use alloc::vec::Vec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {

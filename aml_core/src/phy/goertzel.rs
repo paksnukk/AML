@@ -1,4 +1,4 @@
-use std::f32::consts::PI;
+use core::f32::consts::PI;
 
 /// Non-coherent Goertzel power for a single target frequency.
 pub fn goertzel_power(samples: &[f32], target_freq: f32, sample_rate: u32) -> f32 {
@@ -8,7 +8,7 @@ pub fn goertzel_power(samples: &[f32], target_freq: f32, sample_rate: u32) -> f3
     }
     let k = (n * target_freq) / sample_rate as f32;
     let w = 2.0 * PI * k / n;
-    let coeff = 2.0 * w.cos();
+    let coeff = 2.0 * libm::cosf(w);
 
     let mut q1 = 0.0f32;
     let mut q2 = 0.0f32;
@@ -47,7 +47,7 @@ pub fn rms_dbfs(energy: f32, len: usize) -> f32 {
         return -200.0;
     }
     let mean_sq = energy / len as f32;
-    10.0 * mean_sq.max(1e-20).log10()
+    10.0 * libm::log10f(mean_sq.max(1e-20))
 }
 
 /// Level-independent tone purity: `power / (energy * N / 2)`.
@@ -88,7 +88,7 @@ pub fn best_tone(samples: &[f32], tones: &[f32], sample_rate: u32) -> Option<Ton
     }
 
     let confidence_db = if runner_up > 0.0 {
-        10.0 * (best_power / runner_up).log10()
+        10.0 * libm::log10f(best_power / runner_up)
     } else {
         100.0
     };

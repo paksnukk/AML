@@ -44,6 +44,21 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  no_std:
+    name: aml_core (no_std)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build for a bare-metal target
+        run: cargo build -p aml_core --no-default-features --target thumbv8m.main-none-eabihf
+
   frontend:
     name: Frontend (typecheck)
     runs-on: ubuntu-latest

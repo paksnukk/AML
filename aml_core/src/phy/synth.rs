@@ -1,5 +1,6 @@
 use super::config::PhyConfig;
-use std::f32::consts::PI;
+use alloc::vec::Vec;
+use core::f32::consts::PI;
 
 /// Encodes MFSK-16 nibble streams into mono audio samples.
 pub struct ModemTx {
@@ -23,7 +24,7 @@ impl ModemTx {
             out.extend(self.synthesize_symbol(self.config.tone_hz(idx)));
             let gap = self.config.gap_samples();
             if gap > 0 {
-                out.extend(std::iter::repeat_n(0.0, gap));
+                out.extend(core::iter::repeat_n(0.0, gap));
             }
         }
         out
@@ -40,9 +41,11 @@ impl ModemTx {
     fn synthesize_symbol(&self, freq: f32) -> Vec<f32> {
         let total = self.config.symbol_samples();
         let attack =
-            ((self.config.attack_ms / 1000.0) * self.config.sample_rate_hz as f32).round() as usize;
-        let release = ((self.config.release_ms / 1000.0) * self.config.sample_rate_hz as f32)
-            .round() as usize;
+            libm::roundf((self.config.attack_ms / 1000.0) * self.config.sample_rate_hz as f32)
+                as usize;
+        let release =
+            libm::roundf((self.config.release_ms / 1000.0) * self.config.sample_rate_hz as f32)
+                as usize;
         let amp = self.config.amplitude;
 
         let mut buffer = Vec::with_capacity(total);
@@ -57,7 +60,7 @@ impl ModemTx {
             } else {
                 1.0
             };
-            buffer.push(phase.sin() * envelope * amp);
+            buffer.push(libm::sinf(phase) * envelope * amp);
             phase += phase_inc;
             if phase > 2.0 * PI {
                 phase -= 2.0 * PI;

@@ -1,3 +1,6 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// Block interleave: write column-major into `depth` rows, read row-major.
 /// Pads with 0 nibbles to a multiple of `depth`.
 pub fn interleave(nibbles: &[u8], depth: usize) -> Vec<u8> {

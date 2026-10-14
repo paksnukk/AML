@@ -1,4 +1,6 @@
 use super::message::{MessageType, TransportMessage};
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Convert a transport message to MIDI 1.0 messages (channel 1).
 ///
