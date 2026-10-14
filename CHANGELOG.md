@@ -17,3 +17,7 @@
 - While encoding, the UI shows how many messages are queued and how late the oldest one already is (its wait plus the audio buffered ahead of it). A panic button sends All Notes Off. Profile hints say when to use Fast and when to use Robust.
 - Continuous integration runs `cargo test`, `clippy`, and `fmt` on GitHub Actions.
 - `aml_core` builds as `no_std` + `alloc` (with `--no-default-features`) so the modem can run on microcontrollers such as ESP32-S3, RP2350, and STM32. WAV file I/O and the legacy V1 phy stay behind the default `std` feature. CI checks the build for `thumbv8m.main-none-eabihf`.
+- A false preamble lock whose body fails to decode no longer swallows a real packet that starts inside it: the receiver rewinds and re-scans the buffered audio (MFSK profiles).
+- The CLI takes a global `--profile` option for every command; `cricket loopback --profiles a,b,… --notes N` measures several profiles in one run.
+- **Experimental** (not part of AML v1, may change): `ltc`, `ltc2400`, `ltc4800`, and `ltc9600` profiles using an LTC-style biphase-mark code (~22 ms mean NoteOn latency at 4800 bit/s on a clean, dedicated line); see `docs/proposals/ltc-bmc.md`.
+- **Experimental** (not part of AML v1, may change): `robust_fec` profile, Robust tones with a Reed–Solomon coded body sent once instead of twice (~25 % lower mean NoteOn latency than Robust in loopback: ~265 ms vs ~345 ms); see `docs/proposals/fec.md`.

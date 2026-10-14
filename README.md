@@ -57,6 +57,19 @@ Supported messages: NoteOn, NoteOff, Program Change, MSC (Go / Stop / Resume / L
 released*. Real audio interfaces add their own buffering on top. Run the measurement yourself rather than
 trusting this table.
 
+### Experimental profiles
+
+Two more profiles are in the code for evaluation. They are **not part of AML v1**, so both ends must pick the
+same one, and they may change or go away. Select one with `--profile` (e.g. `cricket --profile ltc decode …`).
+
+| Profile | What it is | Measured NoteOn latency\* | Needs |
+|---|---|---|---|
+| `ltc` | LTC-style biphase-mark code at 4800 bit/s (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | A dedicated clean line: ≥ 10 dB SNR, no EQ, compression or limiter |
+| `robust_fec` | Robust tones with a Reed–Solomon coded body sent once instead of twice | mean ~265 ms (Robust: ~345 ms) | Same chains as Robust |
+
+The details and measurements are in [docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md) and
+[docs/proposals/fec.md](docs/proposals/fec.md).
+
 ## Quick start
 
 You need a Rust toolchain. On Linux you also need ALSA headers (`libasound2-dev`). The GUI additionally needs
@@ -75,8 +88,9 @@ cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-nam
 # No hardware at hand? Encoder plays a C-major scale on its own
 cargo run -p cricket_cli -- encode --simulate
 
-# How fast is it, really? (both profiles, no hardware needed)
+# How fast is it, really? (no hardware needed; default: fast,robust)
 cargo run --release -p cricket_cli -- loopback
+cargo run --release -p cricket_cli -- loopback --profiles robust,robust_fec,fast,ltc --notes 40
 ```
 
 The binary is called `cricket` (`cargo install --path cricket_cli`, or `target/release/cricket`).
