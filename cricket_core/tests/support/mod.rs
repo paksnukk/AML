@@ -55,7 +55,8 @@ impl XorShift64 {
 /// Deterministic channel impairments applied to mono samples.
 ///
 /// Processing order: symbol corruption (on the clean, grid-aligned TX
-/// signal) → clock drift → low-pass → gain → leading silence → AWGN.
+/// signal) → clock drift → low-pass(es) → high-pass → peaking EQ → soft clip
+/// → polarity → gain → hum → leading silence → AWGN.
 #[derive(Debug, Clone)]
 pub struct ChannelSim {
     pub config: PhyConfig,
@@ -72,6 +73,18 @@ pub struct ChannelSim {
     pub lowpass_hz: Option<f32>,
     /// Probability per symbol period of replacing a tone with a different one.
     pub symbol_error_prob: f64,
+    /// Second-order Butterworth low-pass cutoff in Hz (steeper band limit).
+    pub lowpass2_hz: Option<f32>,
+    /// One-pole high-pass cutoff in Hz (AC coupling / transformer).
+    pub highpass_hz: Option<f32>,
+    /// Peaking EQ: (centre Hz, gain dB, Q).
+    pub peaking_eq: Option<(f32, f32, f32)>,
+    /// Soft clipper `tanh(drive * x) / drive` (drive > 0; ~limiter).
+    pub soft_clip_drive: Option<f32>,
+    /// Invert polarity (pin 2/3 swap).
+    pub invert: bool,
+    /// Mains hum: (frequency Hz, level in dB relative to the tone RMS).
+    pub hum: Option<(f32, f32)>,
 }
 
 impl ChannelSim {
@@ -86,7 +99,43 @@ impl ChannelSim {
             drift_ppm: 0.0,
             lowpass_hz: None,
             symbol_error_prob: 0.0,
+            lowpass2_hz: None,
+            highpass_hz: None,
+            peaking_eq: None,
+            soft_clip_drive: None,
+            invert: false,
+            hum: None,
         }
+    }
+
+    pub fn lowpass2_hz(mut self, cutoff_hz: f32) -> Self {
+        self.lowpass2_hz = Some(cutoff_hz);
+        self
+    }
+
+    pub fn highpass_hz(mut self, cutoff_hz: f32) -> Self {
+        self.highpass_hz = Some(cutoff_hz);
+        self
+    }
+
+    pub fn peaking_eq(mut self, centre_hz: f32, gain_db: f32, q: f32) -> Self {
+        self.peaking_eq = Some((centre_hz, gain_db, q));
+        self
+    }
+
+    pub fn soft_clip(mut self, drive: f32) -> Self {
+        self.soft_clip_drive = Some(drive);
+        self
+    }
+
+    pub fn invert(mut self) -> Self {
+        self.invert = true;
+        self
+    }
+
+    pub fn hum(mut self, freq_hz: f32, rel_db: f32) -> Self {
+        self.hum = Some((freq_hz, rel_db));
+        self
     }
 
     pub fn offset(mut self, samples: usize) -> Self {
@@ -130,12 +179,36 @@ impl ChannelSim {
         if self.drift_ppm != 0.0 {
             samples = resample_drift(&samples, self.drift_ppm);
         }
+        let rate = self.config.sample_rate_hz;
         if let Some(cutoff) = self.lowpass_hz {
-            one_pole_lowpass(&mut samples, cutoff, self.config.sample_rate_hz);
+            one_pole_lowpass(&mut samples, cutoff, rate);
         }
-        if self.gain != 1.0 {
+        if let Some(cutoff) = self.lowpass2_hz {
+            Biquad::lowpass(cutoff, rate).run(&mut samples);
+        }
+        if let Some(cutoff) = self.highpass_hz {
+            one_pole_highpass(&mut samples, cutoff, rate);
+        }
+        if let Some((f, db, q)) = self.peaking_eq {
+            Biquad::peaking(f, db, q, rate).run(&mut samples);
+        }
+        if let Some(drive) = self.soft_clip_drive {
             for s in samples.iter_mut() {
-                *s *= self.gain;
+                *s = (drive * *s).tanh() / drive;
+            }
+        }
+        let gain = if self.invert { -self.gain } else { self.gain };
+        if gain != 1.0 {
+            for s in samples.iter_mut() {
+                *s *= gain;
+            }
+        }
+        if let Some((f, rel_db)) = self.hum {
+            let tone_rms = self.config.amplitude * self.gain / 2f32.sqrt();
+            let amp = tone_rms * 2f32.sqrt() * 10f32.powf(rel_db / 20.0);
+            let w = 2.0 * PI * f / rate as f32;
+            for (i, s) in samples.iter_mut().enumerate() {
+                *s += amp * (w * i as f32).sin();
             }
         }
         if self.offset_samples > 0 {
@@ -215,6 +288,70 @@ pub fn one_pole_lowpass(samples: &mut [f32], cutoff_hz: f32, sample_rate_hz: u32
     for s in samples.iter_mut() {
         y += alpha * (*s - y);
         *s = y;
+    }
+}
+
+/// In-place one-pole high-pass (DC blocker) with cutoff `cutoff_hz`.
+pub fn one_pole_highpass(samples: &mut [f32], cutoff_hz: f32, sample_rate_hz: u32) {
+    let r = (-2.0 * PI * cutoff_hz / sample_rate_hz as f32).exp();
+    let (mut x1, mut y1) = (0.0f32, 0.0f32);
+    for s in samples.iter_mut() {
+        let y = *s - x1 + r * y1;
+        x1 = *s;
+        y1 = y;
+        *s = y;
+    }
+}
+
+/// RBJ-cookbook biquad (direct form I).
+#[derive(Debug, Clone, Copy)]
+pub struct Biquad {
+    b: [f32; 3],
+    a: [f32; 2],
+}
+
+impl Biquad {
+    /// Butterworth low-pass.
+    pub fn lowpass(cutoff_hz: f32, sample_rate_hz: u32) -> Self {
+        let w0 = 2.0 * PI * cutoff_hz / sample_rate_hz as f32;
+        let alpha = w0.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let c = w0.cos();
+        let a0 = 1.0 + alpha;
+        Self {
+            b: [(1.0 - c) / 2.0 / a0, (1.0 - c) / a0, (1.0 - c) / 2.0 / a0],
+            a: [-2.0 * c / a0, (1.0 - alpha) / a0],
+        }
+    }
+
+    /// Peaking EQ of `gain_db` at `centre_hz` with quality `q`.
+    pub fn peaking(centre_hz: f32, gain_db: f32, q: f32, sample_rate_hz: u32) -> Self {
+        let a = 10f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * centre_hz / sample_rate_hz as f32;
+        let alpha = w0.sin() / (2.0 * q);
+        let c = w0.cos();
+        let a0 = 1.0 + alpha / a;
+        Self {
+            b: [
+                (1.0 + alpha * a) / a0,
+                -2.0 * c / a0,
+                (1.0 - alpha * a) / a0,
+            ],
+            a: [-2.0 * c / a0, (1.0 - alpha / a) / a0],
+        }
+    }
+
+    pub fn run(&self, samples: &mut [f32]) {
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for s in samples.iter_mut() {
+            let x = *s;
+            let y =
+                self.b[0] * x + self.b[1] * x1 + self.b[2] * x2 - self.a[0] * y1 - self.a[1] * y2;
+            x2 = x1;
+            x1 = x;
+            y2 = y1;
+            y1 = y;
+            *s = y;
+        }
     }
 }
 

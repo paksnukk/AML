@@ -10,12 +10,14 @@ use cricket_engine::{
 };
 use std::sync::mpsc::Receiver;
 
-/// Profile the real-time CLI modes run (no flag yet).
-const PROFILE: &str = "robust";
-
 #[derive(Parser)]
 #[command(author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = None)]
 struct Cli {
+    /// PHY profile: robust (default), fast, or the experimental BMC
+    /// (LTC-style) profiles ltc (4800 bit/s), ltc2400, ltc9600
+    #[arg(long, global = true, default_value = "robust")]
+    profile: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -80,11 +82,16 @@ enum Commands {
         wav_in: Option<String>,
     },
     /// Encode→decode loopback with latency measurement (in-process)
-    Loopback,
+    Loopback {
+        /// Comma-separated profiles to measure
+        #[arg(long, value_delimiter = ',', default_value = "fast,robust")]
+        profiles: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let profile = cli.profile.as_str();
 
     match &cli.command {
         Commands::Encode {
@@ -98,6 +105,7 @@ fn main() -> Result<()> {
                 selector(*midi_in, midi_in_name),
                 selector(*audio_out, audio_out_name),
                 *simulate,
+                profile,
             )?;
         }
         Commands::Decode {
@@ -109,16 +117,17 @@ fn main() -> Result<()> {
             run_decoder(
                 selector(*audio_in, audio_in_name),
                 selector(*midi_out, midi_out_name),
+                profile,
             )?;
         }
         Commands::ListDevices => {
             list_all_devices()?;
         }
         Commands::Test { wav_out, wav_in } => {
-            run_test_mode(wav_out.as_deref(), wav_in.as_deref())?;
+            run_test_mode(wav_out.as_deref(), wav_in.as_deref(), profile)?;
         }
-        Commands::Loopback => {
-            run_loopback_metrics()?;
+        Commands::Loopback { profiles } => {
+            run_loopback_metrics(profiles)?;
         }
     }
 
@@ -155,9 +164,9 @@ fn list_all_devices() -> Result<()> {
     Ok(())
 }
 
-fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
-    println!("Running Cricket loopback test...");
-    let config = PhyConfig::robust();
+fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>, profile: &str) -> Result<()> {
+    println!("Running Cricket loopback test (profile={})...", profile);
+    let config = PhyConfig::from_name(profile);
     let messages = vec![
         TransportMessage::NoteOn {
             note: 60,
@@ -207,9 +216,9 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
 
 const LOOPBACK_NOTES: usize = 20;
 
-fn run_loopback_metrics() -> Result<()> {
+fn run_loopback_metrics(profiles: &[String]) -> Result<()> {
     println!("Cricket engine loopback latency (paced MIDI in → MIDI out)...");
-    for profile in ["fast", "robust"] {
+    for profile in profiles {
         let s = measure_midi_loopback(profile, LOOPBACK_NOTES)?;
         if s.n < LOOPBACK_NOTES {
             return Err(anyhow!(
@@ -247,7 +256,7 @@ fn print_events(events: &Receiver<EngineEvent>, what: &str) -> Result<()> {
     Err(anyhow!("{} stopped", what))
 }
 
-fn run_decoder(audio_in: DeviceSelector, midi_out: DeviceSelector) -> Result<()> {
+fn run_decoder(audio_in: DeviceSelector, midi_out: DeviceSelector, profile: &str) -> Result<()> {
     println!("Initializing Cricket decoder...");
     let midi_out = match midi_out {
         DeviceSelector::Default => MidiOut::None,
@@ -260,13 +269,18 @@ fn run_decoder(audio_in: DeviceSelector, midi_out: DeviceSelector) -> Result<()>
     let dec = DecoderHandle::start(DecoderConfig {
         audio_in: AudioIn::Device(audio_in),
         midi_out,
-        profile: PROFILE.into(),
+        profile: profile.into(),
         link_dead_ms: None,
     })?;
     print_events(dec.events(), "Decoder")
 }
 
-fn run_encoder(midi_in: DeviceSelector, audio_out: DeviceSelector, simulate: bool) -> Result<()> {
+fn run_encoder(
+    midi_in: DeviceSelector,
+    audio_out: DeviceSelector,
+    simulate: bool,
+    profile: &str,
+) -> Result<()> {
     println!("Initializing Cricket encoder...");
     let midi_in = match midi_in {
         DeviceSelector::Default => MidiIn::None,
@@ -282,7 +296,7 @@ fn run_encoder(midi_in: DeviceSelector, audio_out: DeviceSelector, simulate: boo
     let enc = EncoderHandle::start(EncoderConfig {
         audio_out: AudioOut::Device(audio_out),
         midi_in,
-        profile: PROFILE.into(),
+        profile: profile.into(),
         simulate,
     })?;
     print_events(enc.events(), "Encoder")
