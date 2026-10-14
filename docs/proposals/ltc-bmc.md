@@ -2,7 +2,8 @@
 
 Status: **phase 1: prototype, measurements, design proposal.** Not part of the AML v1 spec. The
 prototype is in `cricket_core/src/phy/bmc/` and is selected with `PhyConfig::ltc()` / `--profile ltc`.
-The robust and fast profiles behave exactly as before.
+The robust and fast profiles behave exactly as before. Since the first prototype the receiver makes
+soft decisions and produces erasures, and `ltc_fec` adds Reed–Solomon body FEC (§9).
 
 ## 1. Motivation
 
@@ -16,7 +17,8 @@ gives:
 * **~3.4× less airtime than Fast and ~17× less than Robust** at 4800 bit/s (16.9 ms per message, see §5).
 * **Measured MIDI-in → MIDI-out latency of 22 ms mean** through the engine, against 78 ms for Fast and
   343 ms for Robust.
-* A receiver that costs **about 1/10 of the CPU** of the Goertzel receivers and needs **no sample buffer**.
+* A receiver that costs **about 1/3 of the CPU** of the Goertzel receivers and keeps only a few bit
+  cells of samples (§5).
 
 ## 2. Design
 
@@ -35,7 +37,7 @@ transitions happen, never by the level. The receiver therefore sees just two tra
 
 | Part | Content | Purpose |
 |---|---|---|
-| Preamble | 8 `1` bits = 16 H intervals, a square wave at the bit rate | Clock acquisition (half-cell estimate), envelope settling. The RX needs ≥ 8 consecutive H intervals within ±30 % of each other, with a mean within ±5 % of nominal. |
+| Preamble | 8 `1` bits = 16 H intervals, a square wave at the bit rate | Sync detection and envelope settling. The RX correlates all 16 half cells, together with the sync, against the expected pattern (§2.5). |
 | Sync | Two **code violations** V, each 1.5 cells (3 half cells), at opposite levels | Valid BMC data contains only H and F intervals, so `V V` can never appear inside a body, whatever the payload. Unlike the LTC sync word, it needs no reserved data pattern and no bit stuffing (AES3 preambles use violations for the same reason). It is DC-balanced and has no polarity. The edge that ends the second V marks the start of the first body bit. |
 | Body | The link-layer nibbles, MSB first: exactly the 16 interleaved nibbles that MFSK sends as tones | Reuses the link layer unchanged (§3). |
 | Postamble | One `1` bit | Gives the last body bit a terminating transition, so its length can be measured. |
@@ -52,7 +54,7 @@ All parameters scale with the bit rate. The three candidates at 48 kHz:
 |---|---|---|---|---|
 | 2400 | 10 samples | 31.9 ms | 1.2–2.4 kHz | LTC-like rate (30 fps LTC = 2400 bit/s); most noise margin |
 | **4800** | **5 samples** | **15.9 ms** | **2.4–4.8 kHz** | **recommended default**; survives a 3.4 kHz 2-pole low-pass |
-| 9600 | 2.5 samples | 8.0 ms | 4.8–9.6 kHz | digital lines only; fails with < ~6 kHz bandwidth or SNR < 12 dB |
+| 9600 | 2.5 samples | 8.0 ms | 4.8–9.6 kHz | digital lines only; fails with < ~6 kHz bandwidth, ≥ 97 % down to 5 dB SNR |
 
 The half cell does not have to be a whole number of samples. TX and RX work in fractional samples, and
 the tests pass at 44.1 kHz (4.59 samples per half cell at 4800) and at 96 kHz.
@@ -69,31 +71,46 @@ below therefore compare like with like. The peak is 3 dB lower than MFSK's, whic
 ### 2.5 Receiver and clock recovery
 
 ```
-x → DC blocker (1-pole HP, 0.05 × bit rate) → 2-pole Butterworth LP (1.5 × bit rate)
-  → peak envelope (release 8 cells) → Schmitt trigger (±0.2 × envelope)
-  → transition time = interpolated zero crossing that preceded the Schmitt flip
-  → interval / half-cell estimate → H | F | V | invalid → bits → nibbles → RxEvent
+x → DC blocker (1-pole HP, 0.05 × bit rate) → 2-pole Butterworth LP (1.5 × bit rate) = y
+y → half-cell box sums → sync correlator (16 preamble + 6 sync half cells) → body start
+y → peak envelope → Schmitt trigger (±0.3 × envelope) → interpolated zero-crossing times
+  → timing loop (half-cell grid)
+y → per bit: integrals over 4 half cells on the grid → bit + margin → nibble (+ reliability, erased)
 ```
 
-* **Edge-interval classification** with thresholds at 1.5 / 2.5 / 3.5 half cells. Each interval is
-  measured on its own between two transitions, so a sample-rate offset never builds up over the frame.
-  Only the ratio to the estimate matters. The half-cell estimate is acquired on the preamble and tracked
-  through the body (first-order loop, gain 1/16). The measured tolerance is **±1 % rate error with 100 %
-  success**. The ±5 % acquisition window could be widened. A PLL is not needed for burst mode.
-* **Sub-sample timing without chatter.** The Schmitt trigger decides *that* a transition happened, with
-  hysteresis against noise. The linearly interpolated zero crossing before the flip decides *when*.
-* **Level independence.** The hysteresis is proportional to the tracked envelope, and the decision
-  uses only times. The prototype decodes from 0 dB down to −50 dB with 100 % success. A silence floor
-  (`min_rms_dbfs`, −60 dBFS, as in MFSK) gates the receiver: below it, transitions are ignored and any
-  body in progress is abandoned.
-* **Polarity** is irrelevant by construction (100 % success inverted, also with noise).
-* **DC / high-pass.** BMC is DC-free, so AC coupling and transformers are fine (HP 300 Hz and HP 1 kHz
-  pass at 4800). The RX DC blocker also removes hum: 50 Hz hum at the same level as the signal passes
-  at all three rates.
+The first prototype classified the intervals between transitions (H / F / V) and aborted on the first
+invalid one. It is replaced by a soft-decision receiver (details and the before/after numbers in §9):
+
+* **Sync correlator.** Every sample, the box sums of the last 22 half cells are correlated with the
+  expected `… + − + − − − − + + +` pattern (sign-free, normalized by the energy, so level-independent).
+  The best peak above 0.75 is the sync; the transition that ends the second violation, when one is
+  close, times it exactly. Body data can score at most 0.82 on a clean line, so a lock is replaced
+  only by a clearly stronger sync, or by one ≥ 0.95. The search never stops during a body: a false lock
+  cannot hide a real packet, which is what the MFSK receiver needs its "rewind on failed decode" for.
+* **Bits.** On a half-cell grid anchored at the sync, each bit compares the integrals of its two
+  halves (`1` when their signs differ). Every cell starts with a transition, so the half cell before
+  and the half cell after are inverted second looks at the first and second half; averaging them in
+  halves the noise of both estimates. The normalized difference is the bit margin (1 ideal, 0 coin
+  toss). A nibble reports its weakest bit as `confidence_db` and is flagged **erased** when a bit has
+  almost no signal (dropout). With FEC the body is dropped once more nibbles are erased than the code
+  can fill (8 for parity 4); without FEC the CRC decides.
+* **Timing loop.** The Schmitt trigger decides *that* a transition happened and the interpolated zero
+  crossing *when*. Each transition within 0.45 half cells of a grid point pulls the grid (phase gain
+  0.3, rate gain 0.02, less weight towards the edge of the window). A body starts at the nominal rate;
+  the loop pulls in more than the ±1 % requirement (at SNR 12 dB: 100 % at ±3 %, ≥ 98 % at +5 % for
+  2400 and 4800 bit/s). A spurious or
+  missing transition only costs the bits it touches.
+* **False-lock gates.** A completed body whose mean nibble margin is below 0.3, or in which fewer than
+  60 % of the transitions fall near the grid, is dropped before the CRC / FEC sees it (white noise
+  scores 0.1–0.25, a real packet at 0 dB SNR ~0.5).
+* **Level independence and polarity**: the correlator and the bit margins are ratios, and the Schmitt
+  threshold follows the envelope; 0 dB down to −50 dB and inverted polarity decode at 100 %. A silence
+  floor (`min_rms_dbfs`, −60 dBFS) disables the Schmitt trigger and the correlator.
+* **DC / high-pass.** BMC is DC-free, so AC coupling and transformers are fine. The RX DC blocker also
+  removes hum: 50 Hz hum at the same level as the signal passes at all three rates.
 * The receiver emits the **same `RxEvent`s as the MFSK receiver** (`PreambleLocked`, one `BodyNibble`
-  per 4 bits with its end sample, `SyncLost`, `Metrics`). `confidence_db` is a timing-quality figure:
-  `−10·log10(mean squared interval error in half cells)`, capped at 40 dB. An ideal line gives 30–40 dB
-  and the decision boundary is at 6 dB.
+  per 4 bits, `SyncLost`, `Metrics`). `last_confidence_db` is the mean nibble margin of the last packet
+  as `20·log10((1 + m) / (1 − m))`, capped at 40 dB (0 dB = coin toss).
 
 ### 2.6 Idle behaviour: burst (prototyped) vs continuous (option)
 
@@ -109,16 +126,16 @@ x → DC blocker (1-pole HP, 0.05 × bit rate) → 2-pole Butterworth LP (1.5 ×
 
 **Recommendation:** keep burst mode as the default because it matches the existing heartbeat and
 fail-safe model. Offer continuous mode later as an opt-in for show-critical lines where sub-10 ms
-link-dead detection matters. Its receiver is the same one: the idle fill simply keeps the preamble run
-counter satisfied.
+link-dead detection matters. Its receiver is the same one: the idle fill is one long preamble.
 
 ## 3. Fit in the code and in AML
 
 ### 3.1 Code (additive)
 
 * `PhyConfig` gained one field, `modulation: Modulation`, which is `Mfsk` or `Bmc(BmcParams)`. `robust()`
-  and `fast()` set `Mfsk`, so their behaviour is unchanged. New constructors are `ltc()` (4800) and
-  `ltc_with_bit_rate(n)`. `from_name` accepts `ltc`, `ltc2400`, `ltc4800` and `ltc9600`.
+  and `fast()` set `Mfsk`, so their behaviour is unchanged. New constructors are `ltc()` (4800),
+  `ltc_with_bit_rate(n)`, `ltc_fec()` and `ltc_fec_with_bit_rate(n)` (§9). `from_name` accepts `ltc`,
+  `ltc2400`, `ltc4800`, `ltc9600`, `ltc_fec` (= `ltc4800_fec`), `ltc2400_fec` and `ltc9600_fec`.
 * `phy::PhyTx` / `phy::PhyRx` are small enums that dispatch to `ModemTx`/`ModemRx` (MFSK) or
   `BmcTx`/`BmcRx`. In `modem.rs`, `CricketModemTx`/`CricketModemRx` hold these instead of the MFSK
   types. `repetition_samples` and the new `repetition_gap_samples` know the BMC burst length. This keeps
@@ -135,22 +152,23 @@ counter satisfied.
 * **No header change is needed.** The packet bytes, including version nibble `0x1`, are the same on both
   phys. The phy is a property of the *line*, the way the MFSK profile already is.
 * **Telling MFSK from BMC: auto-detect is feasible and cheap.** The two signals cannot be confused. A BMC
-  sync needs ≥ 8 regular H intervals followed by two 3-half-cell violations and 64 valid bits; MFSK
-  needs Goertzel-pure tones on its preamble frequencies; and both are CRC-checked. A test feeds Robust
+  sync needs a strong correlation with the 22-half-cell preamble + violation pattern and a body that
+  sits on the bit grid with clear margins; MFSK needs Goertzel-pure tones on its preamble frequencies;
+  and both are CRC-checked. MFSK audio does trigger some BMC bodies (~70–100 per minute of back-to-back
+  MFSK traffic, all rejected; §9.6). A test feeds Robust
   and Fast audio to all three BMC receivers and BMC audio to both MFSK receivers, and gets **zero
   cross-decodes** (`mfsk_and_bmc_do_not_cross_decode`). The same test shows that two receivers running
   in parallel on one stream that mixes Fast and LTC bursts each get exactly their own packets. Because
-  the BMC receiver adds only ~10 % to the CPU cost of an MFSK receiver, a v1.x receiver can **always run
-  BMC alongside its MFSK profile** and report which phy the link is on. The operator then picks the
+  the BMC receiver adds only ~25–40 % to the CPU cost of an MFSK receiver, a v1.x receiver can **always
+  run BMC alongside its MFSK profile** and report which phy the link is on. The operator then picks the
   profile only on the TX side. Auto-detecting the BMC *bit rate* also works: run one BMC receiver per
-  rate (each about 20 ns per sample on the host), or widen the acquisition window and use the measured
-  half cell.
+  rate (each about 60 ns per sample on the host).
 * A profile identifier in the header would cost header bits for information the receiver already has.
   If the TX should advertise its profile (for example for GUI display), a later heartbeat payload is
   the right place.
-* For the spec: a new §6.x "LTC (BMC) profile". Frame (§2.2), shaping, and RX requirements: interval
-  thresholds, ±1 % rate tolerance, the silence floor, and the rule that the RX must accept either
-  polarity.
+* For the spec: a new §6.x "LTC (BMC) profile". Frame (§2.2), shaping, and RX requirements: ±1 % rate
+  tolerance, the silence floor, the rule that the RX must accept either polarity, and minimum
+  performance figures rather than a receiver algorithm.
 
 ### 3.3 Combining with link-layer FEC (`claude/fec`)
 
@@ -160,11 +178,11 @@ layer therefore goes on the wire unchanged, at 4 bits per nibble (each extra par
 at 4800 bit/s). Points to note:
 
 * BMC errors are of two kinds. A missed or spurious mid-cell transition gives a **single-bit substitution**
-  (H+H read as F, or the reverse), and RS corrects these. A shifted transition usually gives an
-  **invalid interval sequence**, and the prototype then aborts the packet. With FEC it would be better
-  to mark the affected nibble as an **erasure** and resynchronise on the next unambiguous F, so that RS
-  can fill it in. RS corrects twice as many erasures as unknown errors. This is the main phy change FEC
-  would want.
+  (H+H read as F, or the reverse), and RS corrects these. A shifted transition gave an **invalid
+  interval sequence**, and the first prototype then aborted the packet, so FEC could not help (with that
+  receiver FEC made things *worse*, §9.3). The soft-decision receiver (§2.5) never aborts on a bad
+  interval: it keeps the bit grid, reports a reliability per nibble and erasures for dropouts, which is
+  what RS needs. **Done: see §9.**
 * The nibble interleaver is still useful against impulse noise, which corrupts a short run of
   consecutive bits.
 * With FEC, the default K stays 1 on BMC. FEC helps more than a second copy, which would double the
@@ -177,65 +195,76 @@ peaking EQ, soft clip, polarity inversion and mains hum. The existing ones are A
 (resampling) and 1-pole low-pass. SNR is relative to the RMS of the signal (equal for MFSK and BMC, see
 §2.4), with white noise over the full 0–24 kHz band. Each cell is the success rate of 200 single NoteOns
 with random start offsets and random input chunk sizes (64–4096); success means the exact message and
-nothing else.
+nothing else. The tables are for the current (soft-decision) receiver; §9 compares it with the first
+prototype at 1000 trials per cell and adds clicks, dropouts and the FEC profiles.
 
 Reproduce with:
 
 ```sh
 cargo test --release -p cricket_core --test phy_ab_measurements -- --ignored --nocapture
-cargo run --release -p cricket_cli -- loopback --profiles ltc,ltc2400,ltc9600,fast,robust
+cargo test --release -p cricket_core --test ltc_fec_ab -- --ignored --nocapture
+cargo run --release -p cricket_cli -- loopback --profiles ltc,ltc_fec,ltc2400,ltc9600,fast,robust
 ```
 
 ### 4.1 Packet success (%)
 
-| condition | robust | fast | ltc2400 | ltc4800 | ltc9600 |
-|---|---|---|---|---|---|
-| clean | 100 | 100 | 100 | 100 | 100 |
-| SNR 20 dB | 100 | 100 | 100 | 100 | 100 |
-| SNR 15 dB | 100 | 100 | 100 | 100 | 100 |
-| SNR 12 dB | 100 | 100 | 100 | 100 | 100 |
-| SNR 10 dB | 100 | 100 | 100 | 100 | 94.0 |
-| SNR 8 dB | 100 | 100 | 100 | 99.5 | 70.0 |
-| SNR 6 dB | 100 | 100 | 99.5 | 86.5 | 22.5 |
-| SNR 4 dB | 100 | 100 | 96.0 | 43.5 | 0 |
-| SNR 2 dB | 100 | 99.5 | 72.5 | 5.0 | 0 |
-| SNR 0 dB | 100 | 94.0 | 23.0 | 0 | 0 |
-| level −10 / −30 / −50 dB | 100 | 100 | 100 | 100 | 100 |
-| level −30 dB + SNR 20 | 100 | 100 | 100 | 100 | 100 |
-| polarity inverted | 100 | 100 | 100 | 100 | 100 |
-| inverted + SNR 12 | 100 | 100 | 100 | 100 | 100 |
-| drift ±1000 ppm (±0.1 %) | 100 | 100 | 100 | 100 | 100 |
-| drift +1000 ppm + SNR 12 | 100 | 100 | 100 | 100 | 99.0 |
-| drift +1 % | 0 | 65.5 | 100 | 100 | 100 |
-| drift −1 % | 0 | 73.5 | 100 | 100 | 100 |
-| 1-pole LP 15 / 8 / 4 kHz | 100 | 100 | 100 | 100 | 100 |
-| 2-pole LP 12 kHz | 100 | 100 | 100 | 100 | 100 |
-| 2-pole LP 6 kHz | 100 | 100 | 100 | 100 | 100 |
-| 2-pole LP 3.4 kHz (telephone) | 100 | 100 | 100 | 100 | **0** |
-| HP 20 Hz / 300 Hz (transformer) | 100 | 100 | 100 | 100 | 100 |
-| HP 1 kHz | 100 | 100 | **0** | 100 | 100 |
-| HP 300 Hz + LP 8 kHz + SNR 15 | 100 | 100 | 100 | 100 | 100 |
-| EQ +12 dB @ 3 kHz, Q 1 | 100 | 100 | 100 | **0** | **1.5** |
-| EQ −12 dB @ 3 kHz, Q 1 | 100 | 100 | 100 | 100 | 100 |
-| EQ −12 dB @ 6 kHz, Q 1 | 100 | 100 | 100 | 100 | 100 |
-| soft clip (tanh, drive 4) | 100 | 100 | 100 | 100 | 100 |
-| hum 50 Hz @ −6 dB | 100 | 100 | 100 | 100 | 100 |
-| hum 50 Hz @ 0 dB | 100 | 65.0 | 100 | 100 | 100 |
-| false messages from 60 s of white noise | 0 | 0 | 0 | 0 | 0 |
+| condition | robust | fast | ltc2400 | ltc4800 | ltc9600 | ltc_fec |
+|---|---|---|---|---|---|---|
+| clean | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 30 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 20 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 15 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 12 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 10 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 8 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 6 dB | 100 | 100 | 100 | 100 | 99.5 | 100 |
+| SNR 4 dB | 100 | 100 | 100 | 100 | 92.5 | 100 |
+| SNR 2 dB | 100 | 99.5 | 100 | 97.5 | 53.5 | 100 |
+| SNR 0 dB | 100 | 94.0 | 99.0 | 76.5 | 9.0 | 96.5 |
+| level -10 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| level -30 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| level -50 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| level -30 dB + SNR 20 | 100 | 100 | 100 | 100 | 100 | 100 |
+| polarity inverted | 100 | 100 | 100 | 100 | 100 | 100 |
+| inverted + SNR 12 | 100 | 100 | 100 | 100 | 100 | 100 |
+| drift +1000 ppm | 100 | 100 | 100 | 100 | 100 | 100 |
+| drift -1000 ppm | 100 | 100 | 100 | 100 | 100 | 100 |
+| drift +1000 ppm + SNR 12 | 100 | 100 | 100 | 100 | 100 | 100 |
+| drift +1 % (SRC misconfig) | 0 | 65.5 | 100 | 100 | 100 | 100 |
+| drift -1 % | 0 | 73.5 | 100 | 100 | 100 | 100 |
+| 1-pole LP 15 kHz | 100 | 100 | 100 | 100 | 100 | 100 |
+| 1-pole LP 8 kHz | 100 | 100 | 100 | 100 | 100 | 100 |
+| 1-pole LP 4 kHz | 100 | 100 | 100 | 100 | 100 | 100 |
+| 2-pole LP 12 kHz | 100 | 100 | 100 | 100 | 100 | 100 |
+| 2-pole LP 6 kHz | 100 | 100 | 100 | 100 | 100 | 100 |
+| 2-pole LP 3.4 kHz (telephone) | 100 | 100 | 100 | 100 | 0 | 100 |
+| HP 20 Hz | 100 | 100 | 100 | 100 | 100 | 100 |
+| HP 300 Hz (transformer) | 100 | 100 | 100 | 100 | 100 | 100 |
+| HP 1 kHz | 100 | 100 | 0 | 100 | 100 | 100 |
+| HP 300 Hz + LP 8 kHz + SNR 15 | 100 | 100 | 100 | 100 | 100 | 100 |
+| EQ +12 dB @ 3 kHz Q1 | 100 | 100 | 100 | 0 | 0 | 0 |
+| EQ -12 dB @ 3 kHz Q1 | 100 | 100 | 100 | 100 | 100 | 99.5 |
+| EQ -12 dB @ 6 kHz Q1 | 100 | 100 | 100 | 100 | 100 | 100 |
+| soft clip (drive 4) | 100 | 100 | 100 | 100 | 100 | 100 |
+| hum 50 Hz @ -6 dB | 100 | 100 | 100 | 100 | 100 | 100 |
+| hum 50 Hz @ 0 dB | 100 | 65.0 | 100 | 100 | 100 | 100 |
+| false messages from 60 s of white noise | 0 | 0 | 0 | 0 | 0 | 0 |
 
 ### 4.2 Airtime, latency, throughput (NoteOn, 48 kHz)
 
 | profile | burst (one copy) | K | airtime / msg | decode delay¹ | max msgs/s | engine loopback² mean / p95 / jitter |
 |---|---|---|---|---|---|---|
-| robust | 130.0 ms | 2 | 273.0 ms | 130.0 ms | 4 | 343 / 478 / 98 ms |
-| fast | 54.0 ms | 1 | 57.0 ms | 54.0 ms | 18 | 78 / 113 / 18 ms |
-| ltc2400 | 31.9 ms | 1 | 33.7 ms | 31.7 ms | 30 | 44 / 71 / 11 ms |
+| robust | 130.0 ms | 2 | 273.0 ms | 130.0 ms | 4 | 360 / 499 / 93 ms |
+| fast | 54.0 ms | 1 | 57.0 ms | 54.0 ms | 18 | 81 / 116 / 19 ms |
+| ltc2400 | 31.9 ms | 1 | 33.7 ms | 32.0 ms | 30 | 43 / 65 / 9 ms |
 | **ltc4800** | **15.9 ms** | **1** | **16.9 ms** | **16.0 ms** | **59** | **22 / 26 / 3 ms** |
-| ltc9600 | 8.0 ms | 1 | 8.4 ms | 8.0 ms | 119 | 11 / 15 / 3 ms |
+| ltc9600 | 8.0 ms | 1 | 8.4 ms | 8.0 ms | 119 | 12 / 15 / 3 ms |
+| **ltc_fec** (4800 + RS p4) | **20.9 ms** | **1** | **21.9 ms** | **21.0 ms** | **46** | **26 / 30 / 3 ms** |
 
 ¹ From the first sample of the message's audio to `ModemOutput::Message`, on a clean channel (16-sample
-chunks). For BMC, the packet is out as soon as the postamble's first transition arrives.
-² `cricket loopback`: paced MIDI in → engine encoder → in-memory audio → engine decoder → MIDI out, 20
+chunks). For BMC, the packet is out 1.5 half cells after the end of its last bit (the decision waits
+for the first half of the next cell).
+² `cricket loopback`: paced MIDI in → engine encoder → in-memory audio → engine decoder → MIDI out, 60
 notes, while notes are also released (so NoteOffs compete for airtime). This includes the engine's
 buffering and polling ticks, about 4–6 ms. Real interfaces add their own buffers.
 
@@ -244,68 +273,75 @@ takes 68 ms on air at 4800 bit/s, against 228 ms on Fast.
 
 ### 4.3 Robustness weak spots
 
-1. **Noise.** Zero-crossing timing is not an optimal detector. At 4800 bit/s, BMC needs about **10 dB
-   full-band SNR** (≈ 5 dB more inside the RX band) for ≥ 99 % success. Fast works down to ~2 dB and
-   Robust below 0 dB. On the lines this profile targets (digital: > 90 dB, analog tie lines: > 60 dB)
-   this does not matter, but BMC is **not** a replacement for Robust on unknown chains. An integrate-
-   and-dump or correlating detector clocked from the recovered half cell should gain 3–4 dB at roughly
-   the same cost (open question).
-2. **In-band EQ and group delay.** A +12 dB peaking EQ at 3 kHz (between the 2.4 kHz and 4.8 kHz
-   fundamentals) skews interval lengths. The long sync intervals read 2.1 instead of 3, and runs of
-   `0`s followed by `1`s produce 1.5-half-cell intervals, so 4800 fails outright. A cut instead of a
-   boost, and EQ outside the band, are harmless. LTC has the same weakness, and the same rule applies:
-   **no EQ on the line**.
-3. **Bandwidth.** 9600 bit/s needs more than ~6 kHz of bandwidth (it fails a 3.4 kHz 2-pole low-pass)
-   and ≥ 12 dB SNR, so it is for digital lines only. 2400 bit/s fails a steep 1 kHz high-pass because
-   its sync violations have their fundamental at 800 Hz.
-4. **Hard decisions only.** The receiver aborts on the first invalid interval. With FEC it should
-   produce erasures instead (§3.3).
-5. **Gates / fast compressors** ahead of the receiver can eat the start of the burst. The 8-bit
-   preamble (1.7 ms) needs only 8 of its 16 intervals, which absorbs ~0.8 ms of gate attack. More needs
-   a longer preamble (0.2 ms per bit at 4800).
+1. **Noise.** With the soft-decision receiver, 4800 bit/s delivers ≥ 99.8 % down to 4 dB full-band SNR
+   and 97 % at 2 dB (the first prototype needed ~10 dB). Fast works down to ~2 dB and Robust below 0 dB,
+   so BMC is now close to Fast on white noise, but it is still not a replacement for Robust on unknown
+   chains: see 2–4.
+2. **In-band EQ boost.** A +12 dB peaking EQ at 3 kHz (between the 2.4 kHz and 4.8 kHz fundamentals)
+   distorts the waveform so much that 4800 fails outright (FEC does not help: ~3 %). 2400 passes. A cut
+   instead of a boost, and EQ outside the band, are harmless. LTC has the same weakness, and the same
+   rule applies: **no EQ on the line**.
+3. **Bandwidth.** 9600 bit/s needs more than ~6 kHz of bandwidth (87 % at a 6 kHz 2-pole low-pass, 0 %
+   at 4 kHz), so it is for digital lines only. 2400 bit/s partly fails a 1 kHz high-pass (0–80 %
+   depending on noise) because its sync violations have their fundamental at 800 Hz.
+4. **Impulses and dropouts** are what the uncoded profiles cannot handle: a 1 ms dropout loses 78 % of
+   the packets at 4800, 200 clicks/s at +6 dB lose 24 %. Body FEC fixes most of it (§9).
+5. **Gates / fast compressors** ahead of the receiver can eat the start of the burst. The sync
+   correlator uses the whole 8-bit preamble, so a gate that mutes part of it lowers the correlation;
+   this has not been simulated yet.
 6. **Spectrum and annoyance.** BMC is broadband (square-wave harmonics, softened by the shaping), so it
    sounds like timecode and produces more crosstalk into neighbouring channels than MFSK tones of the
-   same RMS. Bursts are short (17 ms), which helps.
+   same RMS. Bursts are short (17–22 ms), which helps.
 
 ## 5. MCU cost
 
-Per input sample, the BMC receiver does a DC blocker (1 multiply, 2 adds), a biquad (5 multiply-adds),
-an envelope (1 multiply, 1 compare), a zero-crossing test, and the Schmitt compares (1 multiply, 2
-compares). That is **≈ 8 multiply-adds + ~6 compares, about 20–30 cycles on a Cortex-M33 with FPU**. One
-division per transition (≈ every 5 samples at 4800) and the per-interval decoder logic add a few more.
-At 48 kHz this is **≈ 1–1.5 MHz, about 1 % of a 150 MHz M33**. The RX keeps **no sample buffer**: its
-state is about 100 bytes.
+Per input sample, the receiver does a DC blocker (1 multiply, 2 adds), a biquad (5 multiply-adds), an
+envelope (1 multiply, 1 compare), a zero-crossing test and the Schmitt compares (1 multiply, 2
+compares), as in the first prototype. The soft-decision receiver adds:
+
+* one half-cell box sum (half-cell length adds: 5 at 4800 bit/s / 48 kHz) and
+* the sync correlator: 22 multiply-adds for the correlation and 22 for its energy, plus a compare,
+* per bit (every 10 samples at 4800): four half-cell integrals, ~20 multiply-adds, i.e. ~2 per sample,
+* per transition: one timing-loop update (a few multiplies).
+
+That is **≈ 60 multiply-adds per sample instead of ≈ 8**, about **3 MHz of a Cortex-M33 with FPU at
+48 kHz (~2 % of 150 MHz)**. RAM: a history of the filtered signal (64 floats at 4800 / 48 kHz, 256 at
+2400 / 96 kHz) and a ring of box sums (128–512 floats), so **≤ 3 KB**, against ~25 KB for Robust's
+packet buffer. If the correlator matters on a small MCU it can run every second sample: the peak is
+refined by interpolation and snapped to a transition anyway.
 
 The MFSK receivers run a 16-tone Goertzel bank over a 144–288-sample window every ¼ symbol, which is
 ≈ 64 Goertzel iterations (≈ 200 FLOPs) per sample. They also run fine alignment and purity/energy
-computations, and buffer up to a whole packet: Robust holds ~6 k samples, about 25 KB of f32. That is
-**≈ 250–400 cycles per sample, ≈ 12–20 MHz**.
+computations, and buffer up to a whole packet. That is **≈ 250–400 cycles per sample, ≈ 12–20 MHz**.
 
 Measured on the host (release build, 10 s of traffic at 30 dB SNR, in ns per input sample):
 
-| robust | fast | ltc2400 | ltc4800 | ltc9600 |
-|---|---|---|---|---|
-| 161 | 250 | 15.5 | 17.8 | 21.5 |
+| robust | fast | ltc2400 | ltc4800 | ltc9600 | ltc_fec |
+|---|---|---|---|---|---|
+| 155 | 225–270 | 58–74 | 57–65 | 74–82 | 57–63 |
 
-That is **9–14× cheaper** than MFSK, in line with the estimate, and nearly all the RAM is gone. The TX is
-also cheap: per sample it is a table lookup or a `sin` only inside the 0.5-half-cell transition windows.
-On an MCU the raised-cosine edge would be a 16-entry LUT.
+(first prototype: 15.5 / 17.8 / 21.5 ns for ltc2400 / 4800 / 9600). The receiver is still **3–4×
+cheaper** than MFSK. The FEC decoder runs once per completed body (at most 36 candidate pairs of two
+GF(16) RS decodes), not per sample. The TX is unchanged and cheap: per sample it is a table lookup or a
+`sin` only inside the 0.5-half-cell transition windows.
 
 ## 6. Recommendation
 
-* **Default bit rate: 4800 bit/s.** It is the best trade-off. It is 3.4× faster than Fast on air (22 ms
-  measured end-to-end), it survives everything in the matrix except an in-band EQ boost, including
-  3.4 kHz band limiting, a 1 kHz high-pass, ±1 % rate error, −50 dB level, inversion, clipping and hum,
-  and it keeps 6 dB more noise margin than 9600.
-* Offer **9600** as "LTC-digital" for Dante/MADI/AES lines (11 ms end-to-end), and possibly **2400** for
-  long analog runs with a lot of noise. Rate auto-detection makes the extra rates nearly free on the RX.
+* **Default bit rate: 4800 bit/s, and with FEC (`ltc_fec`) unless the line is known to be glitch-free.**
+  `ltc_fec` costs 5 ms more airtime than `ltc` (26 ms instead of 22 ms end-to-end) and turns the
+  failures that the uncoded profile cannot handle, 1–3 ms dropouts and bursts of clicks, into ≥ 92 %
+  delivery (§9). On white noise both are ≥ 99 % down to 3 dB SNR.
+* `ltc` (uncoded) stays for clean digital lines where every millisecond counts. Offer **9600** (with
+  FEC) as "LTC-digital" for Dante/MADI/AES lines (12–16 ms end-to-end) and **2400** where an in-band EQ
+  boost cannot be ruled out. Dropping to 2400 is **not** a substitute for FEC: it is ~2–3 dB better on
+  white noise but still loses most packets to dropouts, and it costs 11 ms more than `ltc_fec` (§9.4).
 * Keep **burst mode with the existing heartbeat**, and consider a shorter heartbeat and link-dead for
   this profile. Make continuous carrier an opt-in later.
 * Do **not** change the packet header. Do add **parallel MFSK + BMC reception** (auto-detect) to the
   receiver.
-* Before going into the spec: the erasure-producing RX for FEC, a 3–4 dB better detector if it stays
-  cheap, a gate/compressor simulation, and **hardware tests** over a real analog transformer path and
-  Dante with SRC.
+* Before going into the spec: a gate/compressor simulation, a proper bound on FEC miscorrection under
+  MFSK cross-traffic (§9.6), and **hardware tests** over a real analog transformer path and Dante with
+  SRC.
 
 ## 7. Open questions
 
@@ -319,8 +355,11 @@ On an MCU the raised-cosine edge would be a 16-entry LUT.
    worth diverging from the fixed-length MFSK body, and how does it interact with FEC codeword sizes?
 5. Output level: 0.57 peak (equal RMS to MFSK). Should it match house LTC level instead (often
    −18…−10 dBFS)? The decoder does not care.
-6. Should we prefer a correlating detector (better SNR, needs a clock-recovery loop) or keep pure
-   zero-crossing (cheapest, proven by LTC readers)?
+6. ~~Should we prefer a correlating detector or keep pure zero-crossing?~~ Answered by §9: the
+   correlating detector with a transition-driven timing loop gains ~5 dB for ~3× the (still small)
+   CPU cost, and it is what makes FEC useful.
+7. Could a full sequence (Viterbi) detector over the BMC trellis, or decoding the `0`/`1` decision of
+   each half cell jointly with the FEC, gain more? Probably ~1 dB; not tried.
 
 ## 8. Files
 
@@ -332,4 +371,267 @@ On an MCU the raised-cosine edge would be a 16-entry LUT.
 * `cricket_core/tests/support/mod.rs`: new impairments.
 * `cricket_core/tests/bmc_phy.rs`: regression tests. `cricket_core/tests/phy_ab_measurements.rs`: the
   A/B report and the RX parameter sweep (ignored tests).
+* `cricket_core/tests/ltc_fec.rs`: `ltc_fec` profiles: loopback, sync sweep, dropout repair, false lock
+  before a real packet, noise / MFSK rejection.
+* `cricket_core/tests/ltc_fec_ab.rs`: the §9 A/B tables and the false-lock report (ignored tests;
+  `LTC_AB_TRIALS`, `LTC_AB_PROFILES`, `LTC_AB_SET`, `LTC_AB_PARAMS`).
+* `cricket_core/tests/stuck_notes.rs`: `ltc_back_to_back_report` (ignored).
+* `cricket_core/tests/support/mod.rs`: `clicks` (impulse noise).
 * `cricket_cli/src/main.rs`: global `--profile`, `loopback --profiles`.
+
+## 9. LTC + FEC
+
+The link-layer FEC of `docs/proposals/fec.md` (two interleaved RS(7 + p, 7) codewords over GF(16),
+errors-and-erasures decoding plus up to 36 low-reliability erasure candidates, every candidate checked
+by the unchanged CRC-16 / version / type / pad) works on nibbles and does not care how they reached the
+wire. On BMC each extra parity nibble costs 0.83 ms at 4800 bit/s. The question was whether it
+improves LTC, and at what cost compared with simply halving the bit rate.
+
+**Short answer:** with the first (hard-decision) receiver, FEC made LTC *worse*. With the
+soft-decision receiver it is clearly better, mainly against dropouts and impulse noise, for 5 ms more
+airtime. The receiver change alone gains ~5 dB on white noise for every LTC profile. Both are in the
+code: the receiver for all `ltc*` profiles, FEC as the experimental `ltc_fec`, `ltc2400_fec` and
+`ltc9600_fec` profiles (parity 4, 22 body nibbles).
+
+### 9.1 What the receiver had to change
+
+The first receiver turned transition intervals into bits and **aborted on the first invalid interval**,
+so its nibbles were all-or-nothing: no erasures, no reliability, and one bad interval lost the rest of
+the body. FEC needs the opposite: keep going, keep the bit timing, and say which nibbles are doubtful.
+The new receiver (§2.5) does that:
+
+* bits are soft decisions on a half-cell grid that one bad transition cannot shift; each bit has a
+  margin, each nibble reports its weakest bit (`confidence_db`, used to rank the FEC's erasure
+  candidates) and is flagged erased when it contains a dropout;
+* sync is a correlator over the whole preamble and both violations instead of a run of clean intervals,
+  so noise in the preamble no longer prevents the lock (at 4 dB SNR the interval-based sync missed
+  ~30 % of the packets; the new one locks on all of them);
+* the body is abandoned when it has more erasures than the code can fill (8 at parity 4), and a body
+  that looks like noise (mean margin < 0.3, < 60 % of its transitions on the grid) is dropped before
+  the FEC tries it.
+
+Things tried and dropped, measured with the same harness: a preamble-based rate estimate (worse than
+starting at the nominal rate at low SNR); erasing nibbles below a margin threshold (no gain: the
+decoder's reliability-ordered candidates already cover it, and it hurts the uncoded profiles); an input
+impulse clipper (+1–10 % with clicks, −1–3 % on white noise); a narrower or untapered timing window
+(worse on EQ and drift).
+
+### 9.2 The receiver change alone (no FEC)
+
+Single messages (NoteOn, every 4th an MscLite), random offset, 64-sample chunks, **1000 trials per
+cell**, same seeds for every column; "before" is the hard-decision receiver (main at 6427f38). SNR is
+full-band (0–24 kHz) relative to the signal RMS. Clicks: 1–4-sample spikes at the given rate and peak
+level relative to the signal peak, on top of SNR 20 dB; dropouts, EQ, filters: at SNR 20 dB.
+
+| channel | ltc before | **ltc after** | ltc2400 before | **ltc2400 after** | ltc9600 before | **ltc9600 after** |
+|---|---|---|---|---|---|---|
+| SNR 12 dB | 100 | 100 | 100 | 100 | 99.3 | 100 |
+| SNR 10 dB | 99.9 | 100 | 100 | 100 | 95.7 | 100 |
+| SNR 9 dB | 99.9 | 100 | 100 | 100 | 85.4 | 100 |
+| SNR 8 dB | 99.1 | 100 | 100 | 100 | 66.6 | 100 |
+| SNR 7 dB | 95.7 | 100 | 100 | 100 | 39.2 | 99.8 |
+| SNR 6 dB | 89.2 | 100 | 99.8 | 100 | 16.5 | 99.0 |
+| SNR 5 dB | 73.9 | 100 | 99.1 | 100 | 3.6 | 97.0 |
+| SNR 4 dB | 43.9 | 99.8 | 95.8 | 100 | 0.9 | 90.7 |
+| SNR 3 dB | 15.8 | 98.8 | 87.2 | 100 | 0 | 76.6 |
+| SNR 2 dB | 4.4 | 97.1 | 70.0 | 100 | 0 | 51.7 |
+| SNR 1 dB | 0.4 | 91.7 | 45.8 | 99.8 | 0 | 26.2 |
+| SNR 0 dB | 0 | 76.3 | 16.4 | 99.0 | 0 | 7.5 |
+| clean | 100 | 100 | 100 | 100 | 100 | 100 |
+| clicks 20/s @ +0 dB | 96.7 | 100 | 99.8 | 100 | 95.5 | 100 |
+| clicks 50/s @ +6 dB | 77.8 | 93.5 | 76.1 | 99.9 | 80.8 | 91.1 |
+| clicks 200/s @ +6 dB | 37.7 | 76.0 | 34.5 | 99.2 | 40.4 | 68.5 |
+| clicks 100/s @ +12 dB | 36.1 | 69.2 | 35.8 | 71.2 | 52.9 | 74.5 |
+| dropout 1 ms | 1.3 | 22.5 | 4.6 | 55.9 | 0 | 1.9 |
+| dropout 3 ms | 0 | 0.2 | 0 | 6.8 | 0 | 0 |
+| dropout 10 ms | 0 | 0 | 0 | 0 | 100 | 100 |
+| EQ +6 dB @ 3 kHz | 100 | 100 | 100 | 100 | 100 | 100 |
+| EQ +12 dB @ 3 kHz | 0 | 0 | 100 | 100 | 0 | 27.7 |
+| EQ -12 dB @ 3 kHz | 74.6 | 100 | 99.9 | 99.8 | 47.4 | 100 |
+| EQ -12 dB @ 6 kHz | 97.7 | 99.9 | 100 | 100 | 16.0 | 99.0 |
+| 2-pole LP 6000 Hz | 100 | 100 | 100 | 100 | 5.3 | 87.3 |
+| 2-pole LP 4000 Hz | 100 | 100 | 100 | 100 | 0 | 0 |
+| 2-pole LP 3400 Hz | 100 | 100 | 100 | 100 | 0 | 0 |
+| HP 300 Hz | 100 | 100 | 100 | 100 | 100 | 100 |
+| HP 1000 Hz | 98.7 | 100 | 14.2 | 78.1 | 99.8 | 100 |
+| drift +1% + SNR 12 | 100 | 100 | 100 | 100 | 96.3 | 100 |
+| drift -1% + SNR 12 | 99.9 | 100 | 99.9 | 100 | 97.8 | 100 |
+| drift +1% + SNR 6 | 80.4 | 100 | 99.6 | 100 | 3.4 | 95.0 |
+| inverted + SNR 6 | 87.6 | 100 | 99.9 | 100 | 13.3 | 99.6 |
+| level -40 dB + SNR 8 | 99.0 | 100 | 100 | 100 | 66.2 | 99.9 |
+
+No cell got worse by more than one trial in 1000 (ltc2400, EQ −12 dB: 999 → 998). The uncoded `ltc`
+moves its 99 % point from 8 dB to ~3.5 dB SNR, its 50 % point from ~4 dB to below 0 dB. The ltc9600 "dropout 10 ms" row is not meaningful
+(the burst is shorter than the dropout, so the simulator applies none).
+
+### 9.3 FEC on LTC
+
+Same trials. All columns use the new receiver except the second, which is the hard-decision receiver
+with the parity-4 body.
+
+| channel | ltc | ltc + FEC p4, hard-decision RX | ltc_fec p2 | **ltc_fec (p4)** | ltc2400 | ltc2400_fec | ltc9600_fec |
+|---|---|---|---|---|---|---|---|
+| SNR 12 dB | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| SNR 10 dB | 100 | 99.9 | 100 | 100 | 100 | 100 | 100 |
+| SNR 9 dB | 100 | 99.8 | 100 | 100 | 100 | 100 | 100 |
+| SNR 8 dB | 100 | 98.9 | 100 | 100 | 100 | 100 | 100 |
+| SNR 7 dB | 100 | 95.5 | 100 | 100 | 100 | 100 | 99.8 |
+| SNR 6 dB | 100 | 86.3 | 100 | 100 | 100 | 100 | 99.6 |
+| SNR 5 dB | 100 | 66.8 | 100 | 100 | 100 | 100 | 99.3 |
+| SNR 4 dB | 99.8 | 33.9 | 99.8 | 99.8 | 100 | 100 | 97.3 |
+| SNR 3 dB | 98.8 | 9.4 | 99.4 | 99.4 | 100 | 100 | 94.7 |
+| SNR 2 dB | 97.1 | 1.9 | 99.3 | 99.4 | 100 | 100 | 86.1 |
+| SNR 1 dB | 91.7 | 0 | 98.7 | 98.9 | 99.8 | 99.8 | 63.2 |
+| SNR 0 dB | 76.3 | 0 | 95.2 | 96.2 | 99.0 | 99.7 | 28.6 |
+| clean | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| clicks 20/s @ +0 dB | 100 | 95.4 | 100 | 100 | 100 | 100 | 100 |
+| clicks 50/s @ +6 dB | 93.5 | 73.2 | 99.9 | 99.9 | 99.9 | 99.9 | 97.9 |
+| clicks 200/s @ +6 dB | 76.0 | 27.3 | 98.2 | 99.4 | 99.2 | 99.8 | 92.8 |
+| clicks 100/s @ +12 dB | 69.2 | 25.5 | 90.6 | 92.9 | 71.2 | 98.5 | 91.5 |
+| dropout 1 ms | 22.5 | 1.2 | 95.2 | 95.8 | 55.9 | 100 | 91.9 |
+| dropout 3 ms | 0.2 | 0 | 74.1 | 92.3 | 6.8 | 92.6 | 62.3 |
+| dropout 10 ms | 0 | 0 | 0 | 0 | 0 | 82.2 | 0 |
+| EQ +6 dB @ 3 kHz | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| EQ +12 dB @ 3 kHz | 0 | 0 | 1.7 | 2.6 | 100 | 100 | 27.7 |
+| EQ -12 dB @ 3 kHz | 100 | 63.6 | 100 | 99.6 | 99.8 | 99.8 | 100 |
+| EQ -12 dB @ 6 kHz | 99.9 | 96.3 | 99.9 | 99.9 | 100 | 100 | 99.4 |
+| 2-pole LP 6000 Hz | 100 | 100 | 100 | 100 | 100 | 100 | 87.2 |
+| 2-pole LP 4000 Hz | 100 | 100 | 100 | 100 | 100 | 100 | 0 |
+| 2-pole LP 3400 Hz | 100 | 100 | 100 | 100 | 100 | 100 | 0 |
+| HP 300 Hz | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| HP 1000 Hz | 100 | 98.7 | 100 | 100 | 78.1 | 79.3 | 100 |
+| drift +1% + SNR 12 | 100 | 100 | 100 | 100 | 100 | 100 | 100 |
+| drift -1% + SNR 12 | 100 | 99.9 | 100 | 100 | 100 | 100 | 100 |
+| drift +1% + SNR 6 | 100 | 77.3 | 100 | 100 | 100 | 100 | 97.8 |
+| inverted + SNR 6 | 100 | 86.2 | 100 | 100 | 100 | 100 | 99.9 |
+| level -40 dB + SNR 8 | 100 | 99.1 | 100 | 100 | 100 | 100 | 99.9 |
+
+| profile | body nibbles | burst | airtime / msg | decode delay (sim) | engine loopback mean / p95 / jitter |
+|---|---|---|---|---|---|
+| ltc | 16 | 15.9 ms | 16.9 ms | 16.5 ms | 22.0 / 25.5 / 2.5 ms |
+| ltc_fec p2 | 18 | 17.6 ms | 18.5 ms | 18.2 ms | – |
+| **ltc_fec (p4)** | **22** | **20.9 ms** | **21.9 ms** | **21.5 ms** | **25.7 / 30.1 / 3.1 ms** |
+| ltc2400 | 16 | 31.9 ms | 33.7 ms | 32.4 ms | 42.6 / 65.1 / 9.4 ms |
+| ltc2400_fec | 22 | 41.9 ms | 43.7 ms | 42.4 ms | 58.9 / 90.7 / 15.2 ms |
+| ltc9600 | 16 | 8.0 ms | 8.4 ms | 8.6 ms | 11.9 / 15.3 / 2.5 ms |
+| ltc9600_fec | 22 | 10.5 ms | 10.9 ms | 11.1 ms | 15.6 / 19.8 / 3.0 ms |
+
+Decode delay: message start to delivery in the simulator (64-sample chunks). Loopback: `cricket
+loopback --profiles … --notes 60` (engine, paced MIDI in → MIDI out, with releases).
+
+* **With the hard-decision receiver FEC was a net loss**: a longer body is more likely to hit an
+  invalid interval and be aborted, and there were no erasures to fill (34 % vs 44 % at 4 dB SNR).
+* **With the soft receiver, on white noise** the uncoded profile is already ≥ 97 % down to 2 dB, so FEC
+  only shows at the bottom (0 dB: 76 → 96 %), a ~1.5–2 dB gain.
+* **Impulses and dropouts are where FEC pays**: 100 clicks/s at +12 dB 69 → 93 %, a 1 ms dropout
+  22 → 96 %, 3 ms 0 → 92 %. 10 ms (12 nibbles at 4800) is beyond 8 erasures; only 2400 + FEC (6
+  nibbles) survives it.
+* **Parity 2 vs 4**: the same on white noise and light clicks; parity 4 is clearly better on 3 ms
+  dropouts (92 vs 74 %) and a little on heavy clicks (93 vs 91 %). Over `ltc`, parity 2 costs 1.7 ms of
+  airtime and parity 4 costs 5 ms.
+  Network audio drops whole packets of 1–5 ms, so `ltc_fec` uses parity 4.
+* FEC does not help against what breaks the waveform for every bit (EQ +12 dB at 3 kHz, 9600 through a
+  4 kHz low-pass).
+
+### 9.4 FEC at 4800, or 2400 without FEC?
+
+| channel | ltc (16.9 ms) | **ltc_fec (21.9 ms)** | ltc2400 (33.7 ms) | ltc2400_fec (43.7 ms) |
+|---|---|---|---|---|
+| SNR 2 dB | 97.1 | 99.4 | 100 | 100 |
+| SNR 0 dB | 76.3 | 96.2 | 99.0 | 99.7 |
+| clicks 200/s @ +6 dB | 76.0 | 99.4 | 99.2 | 99.8 |
+| clicks 100/s @ +12 dB | 69.2 | 92.9 | 71.2 | 98.5 |
+| dropout 1 ms | 22.5 | 95.8 | 55.9 | 100 |
+| dropout 3 ms | 0.2 | 92.3 | 6.8 | 92.6 |
+| EQ +12 dB @ 3 kHz | 0 | 2.6 | 100 | 100 |
+| HP 1 kHz | 100 | 100 | 78.1 | 79.3 |
+| engine loopback mean | 22 ms | 26 ms | 43 ms | 59 ms |
+
+Halving the bit rate buys ~3 dB on white noise (half the receiver bandwidth) and tolerance to an
+in-band EQ boost, for **+16 ms** of airtime. Spending **+5 ms** on parity instead handles dropouts and
+strong clicks, which 2400 does not, and it is within 3 dB of 2400 on noise. **For the LTC default the
+airtime is better spent on FEC.** 2400 remains the answer only for lines with an in-band EQ boost or
+extreme noise, and 2400 + FEC is the most robust LTC variant (dropouts up to ~10 ms) at 59 ms.
+
+### 9.5 Back-to-back traffic
+
+`stuck_notes.rs` `ltc_back_to_back_report`: ~1400 messages per run (167 NoteOn/NoteOff pairs played
+with chords and runs, NoteOff refreshes, heartbeats, gaps longer than link-dead), random offset and
+chunk sizes. "Before" is the hard-decision receiver (for `ltc_fec`: the parity-4 body on that receiver).
+
+| profile | channel | lost / sent, before | lost NoteOffs, before | lost / sent, after | lost NoteOffs, after |
+|---|---|---|---|---|---|
+| ltc | SNR 6 dB | 164 / 1420 | 141 | 1 / 1420 | 1 |
+| ltc | SNR 3 dB | 1200 / 1446 | 953 | 12 / 1446 | 10 |
+| ltc | SNR 1 dB | 1434 / 1445 | 1149 | 115 / 1445 | 90 |
+| ltc | SNR 20 dB + clicks 200/s @ +6 dB | 932 / 1443 | 747 | 321 / 1443 | 255 |
+| ltc_fec | SNR 6 dB | 194 / 1417 | 162 | 0 / 1417 | 0 |
+| ltc_fec | SNR 3 dB | 1288 / 1441 | 1038 | 5 / 1441 | 5 |
+| ltc_fec | SNR 1 dB | 1439 / 1440 | 1158 | 24 / 1440 | 20 |
+| ltc_fec | SNR 20 dB + clicks 200/s @ +6 dB | 1018 / 1438 | 816 | 15 / 1438 | 10 |
+| ltc2400 | SNR 6 dB | 2 / 1406 | 2 | 0 / 1406 | 0 |
+| ltc2400 | SNR 3 dB | 168 / 1425 | 145 | 0 / 1425 | 0 |
+| ltc2400 | SNR 1 dB | 825 / 1423 | 666 | 3 / 1423 | 2 |
+| ltc2400 | SNR 20 dB + clicks 200/s @ +6 dB | 914 / 1422 | 756 | 12 / 1422 | 9 |
+| ltc2400_fec | SNR 6 dB | 4 / 1393 | 3 | 0 / 1393 | 0 |
+| ltc2400_fec | SNR 3 dB | 174 / 1411 | 138 | 0 / 1411 | 0 |
+| ltc2400_fec | SNR 1 dB | 931 / 1409 | 753 | 3 / 1409 | 3 |
+| ltc2400_fec | SNR 20 dB + clicks 200/s @ +6 dB | 1056 / 1407 | 869 | 1 / 1407 | 1 |
+
+No false messages in any run. Before, several runs had notes stuck for longer than link-dead (up to
+40 s); after, none (one 10 ms stuck episode in `ltc2400_fec` at 1 dB). The uncoded profiles lost far
+more back to back than in single-message trials, because each aborted false lock could swallow the
+next packet; the parallel sync search removes that.
+
+### 9.6 False locks and false messages
+
+`ltc_fec_ab.rs` `ltc_false_message_report`: 60 s of white noise (3 levels) and 60 s of back-to-back
+MFSK traffic (Robust, Fast, Robust FEC at SNR 20 dB) per profile. Messages (bodies that reached the
+CRC / FEC and failed):
+
+| profile | white noise | MFSK traffic |
+|---|---|---|
+| ltc | 0 (0) | 0 (67) |
+| ltc_fec p2 | 0 (0) | 0 (92) |
+| ltc_fec | 0 (0) | 0 (102) |
+| ltc2400 | 0 (0) | 0 (39) |
+| ltc2400_fec | 0 (0) | 0 (240) |
+| ltc9600 / ltc9600_fec | 0 (0) | 0 (0) |
+
+The hard-decision receiver never completed a body on these signals. The correlator is more permissive
+(that is where its sensitivity comes from); without the two body gates of §9.1 white noise produced
+~40–80 failed bodies per minute and MFSK ~240–320. Each failed body is one CRC check without FEC, and
+up to 36 candidate checks with it, each passing with probability ≈ 2⁻¹⁶ (CRC) × 2⁻⁸ (version, type,
+zero pad). At 100 bodies per minute, with every body using all 36 candidates (the worst case), that is about
+one false message per 80 hours of continuous MFSK traffic into an `ltc_fec` receiver, and ~36× less
+for `ltc`. Acceptable for an experiment; to be bounded properly (as for `robust_fec`) before the spec. The cross-decode test (`mfsk_and_bmc_do_not_cross_decode`) passes for
+all six LTC profiles.
+
+### 9.7 "Decode failed → rewind" for BMC
+
+Not needed: the sync correlator keeps running during a body, and a sync that body data cannot produce
+(correlation ≥ 0.95), or one clearly stronger than the current lock, replaces it. A truncated packet
+(preamble, sync and 0…n − 6 body nibbles) immediately followed by a real one decodes the real one in
+all 234 cases over the six LTC profiles (`ltc_fec.rs`, `false_lock_does_not_hide_packet`); with the
+replacement rule disabled all 234 are lost. Replaying logged intervals, as first planned, would not work
+with a soft receiver anyway (it needs the samples), and costs a buffer.
+
+### 9.8 Recommendation
+
+* Make **`ltc_fec` (4800 bit/s, parity 4) the recommended LTC profile**; keep `ltc` for glitch-free
+  digital lines (4 ms faster), `ltc2400` for lines with EQ or very low SNR, and `ltc2400_fec` when
+  dropouts up to ~10 ms are expected. All stay experimental.
+* The soft-decision receiver replaces the hard-decision one for every `ltc*` profile: it is better in
+  every measured condition and costs ~50 more multiply-adds per sample.
+* Open: field data (real converter chains, Dante packet loss) to confirm parity 4, and the
+  miscorrection bound of §9.6.
+
+Reproduce:
+
+```sh
+cargo test --release -p cricket_core --test ltc_fec_ab -- --ignored --nocapture
+LTC_AB_TRIALS=1000 LTC_AB_PROFILES=ltc,ltc_fec2,ltc_fec4,ltc2400,ltc2400_fec4,ltc9600,ltc9600_fec4 \
+  cargo test --release -p cricket_core --test ltc_fec_ab ltc_fec_ab_table -- --ignored --nocapture
+cargo test --release -p cricket_core --test stuck_notes ltc_back_to_back_report -- --ignored --nocapture
+cargo run --release -p cricket_cli -- loopback --profiles ltc,ltc_fec,ltc2400,fast --notes 60
+```

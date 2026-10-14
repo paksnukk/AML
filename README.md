@@ -59,12 +59,13 @@ trusting this table.
 
 ### Experimental profiles
 
-Two more profiles are in the code for evaluation. They are **not part of AML v1**, so both ends must pick the
+More profiles are in the code for evaluation. They are **not part of AML v1**, so both ends must pick the
 same one, and they may change or go away. Select one with `--profile` (e.g. `cricket --profile ltc decode …`).
 
 | Profile | What it is | Measured NoteOn latency\* | Needs |
 |---|---|---|---|
-| `ltc` | LTC-style biphase-mark code at 4800 bit/s (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | A dedicated clean line: ≥ 10 dB SNR, no EQ, compression or limiter |
+| `ltc` | LTC-style biphase-mark code at 4800 bit/s (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter, no dropouts |
+| `ltc_fec` | `ltc` with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~26 ms | As `ltc`, but tolerates short dropouts and impulse noise |
 | `robust_fec` | Robust tones with a Reed–Solomon coded body sent once instead of twice | mean ~265 ms (Robust: ~345 ms) | Same chains as Robust |
 
 The details and measurements are in [docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md) and
@@ -90,7 +91,7 @@ cargo run -p cricket_cli -- encode --simulate
 
 # How fast is it, really? (no hardware needed; default: fast,robust)
 cargo run --release -p cricket_cli -- loopback
-cargo run --release -p cricket_cli -- loopback --profiles robust,robust_fec,fast,ltc --notes 40
+cargo run --release -p cricket_cli -- loopback --profiles robust,robust_fec,fast,ltc,ltc_fec --notes 40
 ```
 
 The binary is called `cricket` (`cargo install --path cricket_cli`, or `target/release/cricket`).

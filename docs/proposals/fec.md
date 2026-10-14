@@ -147,6 +147,10 @@ and use the weakest cell margin as `reliability`. For bursty bit errors, the BMC
 each nibble's 4 bits adjacent, so that one burst damages few symbols. The codeword alternation
 already spreads bursts across both codewords. Nothing in `rs16.rs`/`fec.rs` depends on MFSK.
 
+This is now implemented as the experimental `ltc_fec` profiles. The BMC receiver uses the weakest bit
+margin as `reliability` and erases nibbles that contain a dropout. Marking ambiguous nibbles as erased
+did not help: the reliability-ordered candidates already cover them. See `docs/proposals/ltc-bmc.md` §9.
+
 ## 8. Open questions
 
 - **False lock swallowing a real packet.** After a false lock whose body completes (≤ 8 erasures)
