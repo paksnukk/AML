@@ -1,6 +1,6 @@
 use crate::link::{
     body_nibble_count, bytes_to_nibbles, decode_packet_bytes, deinterleave, encode_packet_bytes,
-    interleave, nibbles_to_bytes, Packet,
+    interleave, nibbles_to_bytes, BodySymbol, FecCodec, Packet,
 };
 use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
 use crate::transport::{
@@ -20,6 +20,8 @@ pub struct ModemStats {
     pub crc_fail: u64,
     pub last_confidence_db: f32,
     pub last_seq: Option<u8>,
+    /// Body symbols repaired by FEC (0 unless `PhyConfig::fec` is enabled).
+    pub fec_corrected: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -37,15 +39,18 @@ pub struct CricketModemTx {
     phy: PhyTx,
     config: PhyConfig,
     seq: u8,
+    fec: Option<FecCodec>,
 }
 
 impl CricketModemTx {
     pub fn new(config: PhyConfig) -> Self {
         let phy = PhyTx::new(config.clone());
+        let fec = FecCodec::new(config.fec);
         Self {
             phy,
             config,
             seq: 0,
+            fec,
         }
     }
 
@@ -72,11 +77,16 @@ impl CricketModemTx {
         };
         let bytes = encode_packet_bytes(&packet).expect("valid packet");
         let mut nibbles = bytes_to_nibbles(&bytes);
-        while nibbles.len() < MAX_BODY_NIBBLES {
-            nibbles.push(0);
-        }
-        nibbles.truncate(MAX_BODY_NIBBLES);
-        let interleaved = interleave(&nibbles, self.config.interleave_depth);
+        let interleaved = if let Some(fec) = &self.fec {
+            // FEC replaces padding + block interleave (codeword interleave).
+            fec.encode_body(&nibbles)
+        } else {
+            while nibbles.len() < MAX_BODY_NIBBLES {
+                nibbles.push(0);
+            }
+            nibbles.truncate(MAX_BODY_NIBBLES);
+            interleave(&nibbles, self.config.interleave_depth)
+        };
 
         let mut audio = Vec::new();
         for _ in 0..self.config.repetition_k {
@@ -95,11 +105,13 @@ impl CricketModemTx {
 
 /// Samples one on-wire repetition occupies: preamble + body symbol periods
 /// plus the one-period gap `CricketModemTx` inserts after each repetition.
+/// The body is [`MAX_BODY_NIBBLES`], or the coded length when FEC is enabled.
 pub fn repetition_samples(config: &PhyConfig) -> u64 {
+    let body_nibbles = config.fec.body_nibbles();
     if let Modulation::Bmc(p) = &config.modulation {
-        return p.repetition_samples(config.sample_rate_hz, MAX_BODY_NIBBLES) as u64;
+        return p.repetition_samples(config.sample_rate_hz, body_nibbles) as u64;
     }
-    ((config.preamble.len() + MAX_BODY_NIBBLES + 1) * config.samples_per_symbol_period()) as u64
+    ((config.preamble.len() + body_nibbles + 1) * config.samples_per_symbol_period()) as u64
 }
 
 /// Silence `CricketModemTx` appends after each repetition: one symbol
@@ -135,6 +147,11 @@ pub struct CricketModemRx {
     phy: PhyRx,
     config: PhyConfig,
     body_nibbles: Vec<u8>,
+    /// Per-symbol detail for the FEC decoder (filled only when FEC is on).
+    body_symbols: Vec<BodySymbol>,
+    body_len: usize,
+    fec: Option<FecCodec>,
+    fec_corrected: u64,
     collecting: bool,
     last_seq: Option<u8>,
     crc_pass: u64,
@@ -150,13 +167,19 @@ pub struct CricketModemRx {
 impl CricketModemRx {
     pub fn new(config: PhyConfig) -> Self {
         let mut phy = PhyRx::new(config.clone());
-        phy.set_expected_body_nibbles(MAX_BODY_NIBBLES);
+        let body_len = config.fec.body_nibbles();
+        phy.set_expected_body_nibbles(body_len);
         let fail_safe = FailSafeMonitor::new(config.link_dead_ms, config.sample_rate_hz);
         let dedup_window = dedup_window_samples(&config);
+        let fec = FecCodec::new(config.fec);
         Self {
             phy,
             config,
-            body_nibbles: Vec::with_capacity(MAX_BODY_NIBBLES),
+            body_nibbles: Vec::with_capacity(body_len),
+            body_symbols: Vec::new(),
+            body_len,
+            fec,
+            fec_corrected: 0,
             collecting: false,
             last_seq: None,
             crc_pass: 0,
@@ -180,6 +203,7 @@ impl CricketModemRx {
             crc_fail: self.crc_fail,
             last_confidence_db: self.phy.last_confidence_db(),
             last_seq: self.last_seq,
+            fec_corrected: self.fec_corrected,
         }
     }
 
@@ -235,11 +259,19 @@ impl CricketModemRx {
                 RxEvent::PreambleLocked { .. } => {
                     self.collecting = true;
                     self.body_nibbles.clear();
+                    self.body_symbols.clear();
                 }
                 RxEvent::BodyNibble { result, end_sample } => {
                     if self.collecting {
                         self.body_nibbles.push(result.nibble);
-                        if self.body_nibbles.len() >= MAX_BODY_NIBBLES {
+                        if self.fec.is_some() {
+                            self.body_symbols.push(BodySymbol {
+                                nibble: result.nibble,
+                                reliability: result.confidence_db,
+                                erased: result.erased,
+                            });
+                        }
+                        if self.body_nibbles.len() >= self.body_len {
                             self.collecting = false;
                             self.try_decode_body(end_sample, &mut outputs);
                         }
@@ -285,9 +317,19 @@ impl CricketModemRx {
     /// Decode the collected body; the last body symbol ended at stream
     /// position `end`.
     fn try_decode_body(&mut self, end: u64, outputs: &mut Vec<ModemOutput>) {
-        let depth = self.config.interleave_depth;
-        let deinterleaved = deinterleave(&self.body_nibbles, depth);
-        let bytes = nibbles_to_bytes(&deinterleaved);
+        let bytes = if self.fec.is_some() {
+            match self.fec_packet_bytes() {
+                Some(bytes) => bytes,
+                None => {
+                    self.crc_fail += 1;
+                    return;
+                }
+            }
+        } else {
+            let depth = self.config.interleave_depth;
+            let deinterleaved = deinterleave(&self.body_nibbles, depth);
+            nibbles_to_bytes(&deinterleaved)
+        };
 
         // Try trimming trailing pad zeros from the byte stream by attempting
         // each valid message size from the HDR type.
@@ -336,6 +378,27 @@ impl CricketModemRx {
                 self.crc_fail += 1;
             }
         }
+    }
+}
+
+impl CricketModemRx {
+    /// FEC-decode the collected body into packet bytes (+ zero pad). A
+    /// candidate is accepted only if its packet passes CRC-16 / version /
+    /// type checks and its pad bytes are zero.
+    fn fec_packet_bytes(&mut self) -> Option<Vec<u8>> {
+        let fec = self.fec.as_ref()?;
+        let decoded = fec.decode_body(&self.body_symbols, |nibbles| {
+            let bytes = nibbles_to_bytes(nibbles);
+            let Some(msg_type) = MessageType::from_u8(bytes[0] & 0x0F) else {
+                return false;
+            };
+            let needed = 2 + msg_type.payload_len() + 2;
+            bytes.len() >= needed
+                && bytes[needed..].iter().all(|&b| b == 0)
+                && decode_packet_bytes(&bytes[..needed]).is_ok()
+        })?;
+        self.fec_corrected += decoded.corrected as u64;
+        Some(nibbles_to_bytes(&decoded.nibbles))
     }
 }
 

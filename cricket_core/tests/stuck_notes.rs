@@ -8,9 +8,10 @@
 //! Heartbeat every 500 ms, and some gaps between note messages are longer than
 //! `link_dead_ms` (the link stays alive through them thanks to heartbeats).
 //!
-//! Size: 1002 pairs in total, 167 per configuration (2 profiles x 3 corruption
-//! levels), SNR 20 dB, random start offset and a random chunk size per
-//! `push_samples` call. The six configurations run on parallel threads and are
+//! Size: 1503 pairs in total, 167 per configuration (3 profiles, including the
+//! experimental `robust_fec`, x 3 corruption levels), SNR 20 dB, random start
+//! offset and a random chunk size per `push_samples` call. The nine
+//! configurations run on parallel threads and are
 //! simulated once per test process (shared by the tests below).
 //!
 //! Run with `-- --nocapture` to see the per-configuration report.
@@ -445,7 +446,7 @@ fn run(name: &str, config: &PhyConfig, p: f64, seed: u64) -> RunResult {
         .count();
 
     RunResult {
-        label: format!("{name:6} p={:.1}%", p * 100.0),
+        label: format!("{name:10} p={:.1}%", p * 100.0),
         sent: stream.sent.len(),
         sent_notes,
         delivered: matched.len(),
@@ -469,7 +470,11 @@ fn results() -> &'static [RunResult] {
     static RESULTS: OnceLock<Vec<RunResult>> = OnceLock::new();
     RESULTS.get_or_init(|| {
         let mut cases = Vec::new();
-        for (name, config) in [("robust", PhyConfig::robust()), ("fast", PhyConfig::fast())] {
+        for (name, config) in [
+            ("robust", PhyConfig::robust()),
+            ("fast", PhyConfig::fast()),
+            ("robust_fec", PhyConfig::robust_fec()),
+        ] {
             for (i, &p) in CORRUPTION_LEVELS.iter().enumerate() {
                 let seed = 0xA6_0000 + (cases.len() as u64) * 101 + i as u64;
                 cases.push((name, config.clone(), p, seed));

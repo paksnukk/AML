@@ -404,6 +404,8 @@ impl BmcRx {
                 confidence_db,
                 // Fraction of the decision margin (0.5 half cell) left unused.
                 purity: (1.0 - 2.0 * libm::sqrtf(mean)).max(0.0),
+                // Hard decisions only: BMC RX does not flag erasures (yet).
+                erased: false,
             },
             end_sample: self.samples_pushed,
         });

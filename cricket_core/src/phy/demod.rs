@@ -20,6 +20,10 @@ pub struct DemodResult {
     pub confidence_db: f32,
     /// Level-independent tone purity (0..~1).
     pub purity: f32,
+    /// Body symbol that failed the detection gate but was kept as an
+    /// erasure for FEC (only when `PhyConfig::fec` is enabled). `nibble` is
+    /// then the best guess (0 if nothing was detected at all).
+    pub erased: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,11 +51,16 @@ enum RxPhase {
     /// Collecting remaining preamble symbols after first matched.
     ConfirmPreamble {
         matched: usize,
+        /// Preamble symbols after the first that failed but were tolerated
+        /// (FEC only, see `FecMode::preamble_misses`).
+        misses: usize,
     },
     /// Reading body nibbles for the current packet repetition.
     Body {
         collected: usize,
         expected: usize,
+        /// Symbols kept as FEC erasures so far.
+        erased: usize,
     },
 }
 
@@ -217,7 +226,10 @@ impl ModemRx {
                         {
                             self.attempt = Some(trigger);
                             self.read = aligned + period as u64;
-                            self.phase = RxPhase::ConfirmPreamble { matched: 1 };
+                            self.phase = RxPhase::ConfirmPreamble {
+                                matched: 1,
+                                misses: 0,
+                            };
                             self.last_confidence_db = det.confidence_db;
                             self.trim(hop);
                             continue;
@@ -226,34 +238,44 @@ impl ModemRx {
                     self.read = trigger + hop as u64;
                     self.trim(hop);
                 }
-                RxPhase::ConfirmPreamble { matched } => {
+                RxPhase::ConfirmPreamble { matched, misses } => {
                     if !self.available(self.read, period) {
                         break;
                     }
                     let window = self.window_at(self.read, sym);
                     let expect = self.config.preamble[matched];
-                    if let Some(det) = self.detect_nibble(&window) {
-                        if det.nibble == expect
-                            && self.level_ok(&det)
+                    let det = self.detect_nibble(&window);
+                    let good = det.as_ref().is_some_and(|det| {
+                        det.nibble == expect
+                            && self.level_ok(det)
                             && det.confidence_db >= self.config.min_confidence_db * 0.5
-                        {
-                            self.read += period as u64;
-                            let next = matched + 1;
-                            self.last_confidence_db = det.confidence_db;
-                            if next >= self.config.preamble.len() {
-                                self.phase = RxPhase::Body {
-                                    collected: 0,
-                                    expected: self.expected_body_nibbles,
-                                };
-                                self.link_state = LinkState::Locked;
-                                events.push(RxEvent::PreambleLocked {
-                                    confidence_db: det.confidence_db,
-                                });
-                            } else {
-                                self.phase = RxPhase::ConfirmPreamble { matched: next };
-                            }
-                            continue;
+                    });
+                    // With FEC the coded body + CRC verify the lock, so a
+                    // bad preamble symbol after the first may be tolerated.
+                    let tolerate = !good && misses < self.config.fec.preamble_misses();
+                    if good || tolerate {
+                        self.read += period as u64;
+                        let next = matched + 1;
+                        let misses = misses + usize::from(tolerate);
+                        let confidence_db = det.map_or(0.0, |d| d.confidence_db);
+                        if good {
+                            self.last_confidence_db = confidence_db;
                         }
+                        if next >= self.config.preamble.len() {
+                            self.phase = RxPhase::Body {
+                                collected: 0,
+                                expected: self.expected_body_nibbles,
+                                erased: 0,
+                            };
+                            self.link_state = LinkState::Locked;
+                            events.push(RxEvent::PreambleLocked { confidence_db });
+                        } else {
+                            self.phase = RxPhase::ConfirmPreamble {
+                                matched: next,
+                                misses,
+                            };
+                        }
+                        continue;
                     }
                     // Preamble mismatch → rewind and search again
                     self.fail_attempt(hop, &mut events);
@@ -262,35 +284,51 @@ impl ModemRx {
                 RxPhase::Body {
                     collected,
                     expected,
+                    erased,
                 } => {
                     if !self.available(self.read, period) {
                         break;
                     }
                     let window = self.window_at(self.read, sym);
-                    if let Some(det) = self.detect_nibble(&window) {
-                        if self.level_ok(&det)
+                    let det = self.detect_nibble(&window);
+                    let gate_ok = det.as_ref().is_some_and(|det| {
+                        self.level_ok(det)
                             && det.confidence_db >= self.config.min_confidence_db * 0.5
-                        {
-                            self.read += period as u64;
-                            self.last_confidence_db = det.confidence_db;
-                            events.push(RxEvent::BodyNibble {
-                                result: det,
-                                end_sample: self.read,
-                            });
-                            let next = collected + 1;
-                            if next >= expected {
-                                self.phase = RxPhase::Search;
-                                self.attempt = None;
-                                self.align_floor = self.read;
-                                self.trim(hop);
-                            } else {
-                                self.phase = RxPhase::Body {
-                                    collected: next,
-                                    expected,
-                                };
-                            }
-                            continue;
+                    });
+                    // With FEC, a symbol that fails the gate becomes an
+                    // erasure instead of aborting, up to what the code can fill.
+                    let keep_as_erasure = !gate_ok && erased < self.config.fec.max_body_erasures();
+                    if gate_ok || keep_as_erasure {
+                        let mut result = det.unwrap_or(DemodResult {
+                            nibble: 0,
+                            power: 0.0,
+                            confidence_db: 0.0,
+                            purity: 0.0,
+                            erased: true,
+                        });
+                        result.erased = !gate_ok;
+                        self.read += period as u64;
+                        if gate_ok {
+                            self.last_confidence_db = result.confidence_db;
                         }
+                        events.push(RxEvent::BodyNibble {
+                            result,
+                            end_sample: self.read,
+                        });
+                        let next = collected + 1;
+                        if next >= expected {
+                            self.phase = RxPhase::Search;
+                            self.attempt = None;
+                            self.align_floor = self.read;
+                            self.trim(hop);
+                        } else {
+                            self.phase = RxPhase::Body {
+                                collected: next,
+                                expected,
+                                erased: erased + usize::from(!gate_ok),
+                            };
+                        }
+                        continue;
                     }
                     // Missed body symbol → rewind and search again
                     self.fail_attempt(hop, &mut events);
@@ -322,6 +360,7 @@ impl ModemRx {
             power,
             confidence_db,
             purity,
+            erased: false,
         })
     }
 

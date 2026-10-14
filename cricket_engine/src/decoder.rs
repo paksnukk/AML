@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 pub struct DecoderConfig {
     pub audio_in: AudioIn,
     pub midi_out: MidiOut,
-    /// PHY profile name ("robust" / "fast"; unknown names mean robust).
+    /// PHY profile name (see `PhyConfig::from_name`; unknown names mean robust).
     pub profile: String,
     /// Override the profile's link-dead timeout in ms (both the modem's
     /// sample-based link-dead and the wall-clock input watchdog). `None`
