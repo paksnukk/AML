@@ -80,7 +80,15 @@ enum Commands {
         wav_in: Option<String>,
     },
     /// Encode→decode loopback with latency measurement (in-process)
-    Loopback,
+    Loopback {
+        /// Profiles to measure, comma-separated (e.g. `fast,robust,robust_fec`;
+        /// `robust_fec` is the experimental FEC profile)
+        #[arg(long, value_delimiter = ',', default_value = "fast,robust")]
+        profiles: Vec<String>,
+        /// NoteOns per profile
+        #[arg(long, default_value_t = LOOPBACK_NOTES)]
+        notes: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -117,8 +125,8 @@ fn main() -> Result<()> {
         Commands::Test { wav_out, wav_in } => {
             run_test_mode(wav_out.as_deref(), wav_in.as_deref())?;
         }
-        Commands::Loopback => {
-            run_loopback_metrics()?;
+        Commands::Loopback { profiles, notes } => {
+            run_loopback_metrics(profiles, *notes)?;
         }
     }
 
@@ -207,16 +215,16 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>) -> Result<()> {
 
 const LOOPBACK_NOTES: usize = 20;
 
-fn run_loopback_metrics() -> Result<()> {
+fn run_loopback_metrics(profiles: &[String], notes: usize) -> Result<()> {
     println!("Cricket engine loopback latency (paced MIDI in → MIDI out)...");
-    for profile in ["fast", "robust"] {
-        let s = measure_midi_loopback(profile, LOOPBACK_NOTES)?;
-        if s.n < LOOPBACK_NOTES {
+    for profile in profiles {
+        let s = measure_midi_loopback(profile, notes)?;
+        if s.n < notes {
             return Err(anyhow!(
                 "{}: only {} of {} NoteOns delivered",
                 profile,
                 s.n,
-                LOOPBACK_NOTES
+                notes
             ));
         }
         println!(
