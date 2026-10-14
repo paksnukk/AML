@@ -126,3 +126,61 @@ fn false_preamble_lock_before_packet_recovers() {
         failures.join("\n")
     );
 }
+
+/// A complete false preamble (e.g. a truncated packet, or noise that happens
+/// to pass the preamble check) whose body window overlaps a real packet: the
+/// false lock collects a full body made of its own few nibbles plus the real
+/// packet's preamble and body, which then fails to decode. The receiver must
+/// rewind past the false trigger and re-scan the buffered audio so the real
+/// packet (single repetition) is still decoded, for every overlap.
+#[test]
+fn failed_body_decode_rewinds_to_packet_inside_it() {
+    let mut failures = Vec::new();
+    let mut total = 0usize;
+    let mut configs = profiles();
+    configs.push(("robust_fec", PhyConfig::robust_fec()));
+    for (name, mut config) in configs {
+        config.repetition_k = 1;
+        let period = config.samples_per_symbol_period();
+        let body = config.fec.body_nibbles();
+        let tx = CricketModemTx::new(config.clone());
+        let spurious = tx.encode_message_with_seq(
+            &TransportMessage::NoteOn {
+                note: 21,
+                velocity: 7,
+            },
+            9,
+        );
+        let msg = TransportMessage::NoteOn {
+            note: 64,
+            velocity: 99,
+        };
+        let packet = tx.encode_message_with_seq(&msg, 3);
+        // With more of its body kept, the spurious packet itself decodes (the
+        // tail is padding, or FEC repairs it) and legitimately owns the
+        // overlap; that is not a false lock.
+        for kept in 0..body - 6 {
+            for (lead, chunk) in [(0usize, 4096usize), (37, 64), (period / 2, 240)] {
+                total += 1;
+                // Spurious preamble + `kept` body symbols, then the real packet.
+                let cut = (config.preamble.len() + kept) * period;
+                let mut audio = vec![0.0; lead + 500];
+                audio.extend_from_slice(&spurious[..cut]);
+                audio.extend_from_slice(&packet);
+                let got = decode_chunked(config.clone(), &audio, chunk);
+                if got != [msg.clone()] {
+                    failures.push(format!(
+                        "[{name}] kept {kept} lead {lead} chunk {chunk}: got {got:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}/{} cases lost the packet inside a failed body:\n{}",
+        failures.len(),
+        total,
+        failures.join("\n")
+    );
+}

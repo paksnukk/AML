@@ -253,8 +253,8 @@ impl CricketModemRx {
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<ModemOutput> {
         let mut outputs = Vec::new();
 
-        let events = self.phy.push_samples(samples);
-        for ev in events {
+        let mut events: VecDeque<RxEvent> = self.phy.push_samples(samples).into();
+        while let Some(ev) = events.pop_front() {
             match ev {
                 RxEvent::PreambleLocked { .. } => {
                     self.collecting = true;
@@ -273,7 +273,15 @@ impl CricketModemRx {
                         }
                         if self.body_nibbles.len() >= self.body_len {
                             self.collecting = false;
-                            self.try_decode_body(end_sample, &mut outputs);
+                            // The phy pauses here until told whether the body
+                            // decoded; a failure rewinds it so a packet that
+                            // starts inside a false lock is not lost.
+                            let more = if self.try_decode_body(end_sample, &mut outputs) {
+                                self.phy.confirm()
+                            } else {
+                                self.phy.reject()
+                            };
+                            events.extend(more);
                         }
                     }
                 }
@@ -315,14 +323,15 @@ impl CricketModemRx {
     }
 
     /// Decode the collected body; the last body symbol ended at stream
-    /// position `end`.
-    fn try_decode_body(&mut self, end: u64, outputs: &mut Vec<ModemOutput>) {
+    /// position `end`. Returns whether it held a valid packet (CRC pass,
+    /// including duplicates), i.e. whether the phy lock was genuine.
+    fn try_decode_body(&mut self, end: u64, outputs: &mut Vec<ModemOutput>) -> bool {
         let bytes = if self.fec.is_some() {
             match self.fec_packet_bytes() {
                 Some(bytes) => bytes,
                 None => {
                     self.crc_fail += 1;
-                    return;
+                    return false;
                 }
             }
         } else {
@@ -335,18 +344,18 @@ impl CricketModemRx {
         // each valid message size from the HDR type.
         if bytes.len() < 4 {
             self.crc_fail += 1;
-            return;
+            return false;
         }
 
         let hdr = bytes[0];
         let type_nibble = hdr & 0x0F;
         let Some(msg_type) = MessageType::from_u8(type_nibble) else {
-            return;
+            return false;
         };
         let needed = 2 + msg_type.payload_len() + 2;
         if bytes.len() < needed {
             self.crc_fail += 1;
-            return;
+            return false;
         }
         let slice = &bytes[..needed];
         match decode_packet_bytes(slice) {
@@ -358,7 +367,7 @@ impl CricketModemRx {
                 self.link_dead = false;
 
                 if self.is_duplicate(slice, end) {
-                    return;
+                    return true;
                 }
                 self.recent.push_back((slice.to_vec(), end));
                 self.last_seq = Some(packet.seq);
@@ -366,16 +375,18 @@ impl CricketModemRx {
                 let Some(msg) =
                     TransportMessage::from_type_payload(packet.msg_type, &packet.payload)
                 else {
-                    return;
+                    return true;
                 };
-                // Panic: the burst below is the only one; the phy has finished
-                // this packet and is back in search. The duplicate history is
+                // Panic: the burst below is the only one; the phy is confirmed
+                // past this packet (back in search) right after. The duplicate history is
                 // kept so the next repetition of the Panic is suppressed.
                 outputs.extend(message_to_midi(&msg).into_iter().map(ModemOutput::Midi));
                 outputs.push(ModemOutput::Message(msg));
+                true
             }
             Err(_) => {
                 self.crc_fail += 1;
+                false
             }
         }
     }

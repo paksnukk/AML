@@ -77,6 +77,24 @@ impl PhyRx {
         }
     }
 
+    /// The completed body decoded; resume (see [`ModemRx::confirm`]).
+    pub fn confirm(&mut self) -> Vec<RxEvent> {
+        match self {
+            Self::Mfsk(rx) => rx.confirm(),
+            // BMC does not pause after a body (no rewind support yet).
+            Self::Bmc(_) => Vec::new(),
+        }
+    }
+
+    /// The completed body failed to decode; rewind and resume (see
+    /// [`ModemRx::reject`]). BMC has no audio buffer to rewind into: no-op.
+    pub fn reject(&mut self) -> Vec<RxEvent> {
+        match self {
+            Self::Mfsk(rx) => rx.reject(),
+            Self::Bmc(_) => Vec::new(),
+        }
+    }
+
     pub fn reset(&mut self) {
         match self {
             Self::Mfsk(rx) => rx.reset(),

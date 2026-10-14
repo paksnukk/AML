@@ -62,6 +62,10 @@ enum RxPhase {
         /// Symbols kept as FEC erasures so far.
         erased: usize,
     },
+    /// Body complete; processing is paused (input is only buffered) until
+    /// the caller reports whether it decoded, via [`ModemRx::confirm`] or
+    /// [`ModemRx::reject`].
+    Verdict,
 }
 
 /// Streaming MFSK-16 receiver with preamble search and symbol clock.
@@ -74,6 +78,14 @@ enum RxPhase {
 /// as if the trigger window had been rejected, and no consumed sample is lost.
 /// Memory stays bounded by one packet (preamble + body periods) plus history
 /// and the caller's chunk.
+///
+/// The attempt stays open after the last body nibble: the receiver pauses
+/// until the caller (normally `CricketModemRx`) reports the packet decode
+/// result. [`confirm`](Self::confirm) accepts the body and continues after
+/// it; [`reject`](Self::reject) (CRC / FEC failure) rewinds like a failed
+/// preamble, so a real packet that starts inside a false lock's body window
+/// is still found. Both resume processing of the buffered input and return
+/// its events. While paused, `push_samples` only buffers.
 pub struct ModemRx {
     config: PhyConfig,
     tones: Vec<f32>,
@@ -127,6 +139,41 @@ impl ModemRx {
 
     pub fn set_expected_body_nibbles(&mut self, n: usize) {
         self.expected_body_nibbles = n;
+    }
+
+    /// True after the last body nibble of a lock attempt, until
+    /// [`confirm`](Self::confirm) or [`reject`](Self::reject) is called.
+    pub fn awaiting_verdict(&self) -> bool {
+        self.phase == RxPhase::Verdict
+    }
+
+    /// The completed body decoded: keep it, continue searching after it, and
+    /// process buffered input. No-op (beyond processing) unless
+    /// [`awaiting_verdict`](Self::awaiting_verdict).
+    pub fn confirm(&mut self) -> Vec<RxEvent> {
+        if self.phase == RxPhase::Verdict {
+            self.phase = RxPhase::Search;
+            self.attempt = None;
+            self.align_floor = self.read;
+            self.trim(self.config.hop_samples());
+        }
+        self.process()
+    }
+
+    /// The completed body failed to decode: treat the lock as false, rewind
+    /// Search to just after the window that triggered it (re-scanning the
+    /// buffered body audio), and process buffered input. No-op (beyond
+    /// processing) unless [`awaiting_verdict`](Self::awaiting_verdict).
+    pub fn reject(&mut self) -> Vec<RxEvent> {
+        if self.phase == RxPhase::Verdict {
+            let hop = self.config.hop_samples();
+            self.phase = RxPhase::Search;
+            self.link_state = LinkState::Search;
+            let trigger = self.attempt.take().unwrap_or(self.read);
+            self.read = trigger + hop as u64;
+            self.trim(hop);
+        }
+        self.process()
     }
 
     pub fn reset(&mut self) {
@@ -317,23 +364,23 @@ impl ModemRx {
                         });
                         let next = collected + 1;
                         if next >= expected {
-                            self.phase = RxPhase::Search;
-                            self.attempt = None;
-                            self.align_floor = self.read;
-                            self.trim(hop);
-                        } else {
-                            self.phase = RxPhase::Body {
-                                collected: next,
-                                expected,
-                                erased: erased + usize::from(!gate_ok),
-                            };
+                            // Keep the attempt (and its audio) until the
+                            // caller's verdict.
+                            self.phase = RxPhase::Verdict;
+                            break;
                         }
+                        self.phase = RxPhase::Body {
+                            collected: next,
+                            expected,
+                            erased: erased + usize::from(!gate_ok),
+                        };
                         continue;
                     }
                     // Missed body symbol → rewind and search again
                     self.fail_attempt(hop, &mut events);
                     self.trim(hop);
                 }
+                RxPhase::Verdict => break,
             }
         }
 
