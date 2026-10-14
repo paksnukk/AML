@@ -56,7 +56,7 @@ impl XorShift64 {
 ///
 /// Processing order: symbol corruption (on the clean, grid-aligned TX
 /// signal) → dropout → clock drift → low-pass(es) → high-pass → peaking EQ
-/// → soft clip → polarity → gain → hum → leading silence → AWGN.
+/// → soft clip → polarity → gain → hum → clicks → leading silence → AWGN.
 #[derive(Debug, Clone)]
 pub struct ChannelSim {
     pub config: PhyConfig,
@@ -88,6 +88,10 @@ pub struct ChannelSim {
     /// One muted stretch (e.g. a network audio packet loss) of this many
     /// samples at a uniformly random position inside the signal.
     pub dropout_samples: usize,
+    /// Impulse noise (clicks, crackle): (mean clicks per second, peak level
+    /// in dB relative to the signal peak). Each click is a 1-4 sample
+    /// rectangular spike of random sign, added after the channel filters.
+    pub clicks: Option<(f32, f32)>,
 }
 
 impl ChannelSim {
@@ -109,6 +113,7 @@ impl ChannelSim {
             invert: false,
             hum: None,
             dropout_samples: 0,
+            clicks: None,
         }
     }
 
@@ -172,6 +177,11 @@ impl ChannelSim {
         self
     }
 
+    pub fn clicks(mut self, per_second: f32, rel_db: f32) -> Self {
+        self.clicks = Some((per_second, rel_db));
+        self
+    }
+
     pub fn dropout_samples(mut self, samples: usize) -> Self {
         self.dropout_samples = samples;
         self
@@ -222,6 +232,21 @@ impl ChannelSim {
             let w = 2.0 * PI * f / rate as f32;
             for (i, s) in samples.iter_mut().enumerate() {
                 *s += amp * (w * i as f32).sin();
+            }
+        }
+        if let Some((per_second, rel_db)) = self.clicks {
+            let peak = self.config.amplitude * self.gain * 10f32.powf(rel_db / 20.0);
+            let p = per_second as f64 / rate as f64;
+            let mut i = 0;
+            while i < samples.len() {
+                if rng.next_f64() < p {
+                    let sign = if rng.below(2) == 0 { 1.0 } else { -1.0 };
+                    let width = 1 + rng.below(4);
+                    for s in samples.iter_mut().skip(i).take(width) {
+                        *s += sign * peak;
+                    }
+                }
+                i += 1;
             }
         }
         if self.offset_samples > 0 {
