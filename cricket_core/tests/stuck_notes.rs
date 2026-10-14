@@ -24,7 +24,7 @@
 mod support;
 
 use cricket_core::modem::{repetition_samples, CricketModemRx, CricketModemTx, ModemOutput};
-use cricket_core::phy::PhyConfig;
+use cricket_core::phy::{Modulation, PhyConfig};
 use cricket_core::transport::{TransportMessage, TxScheduler};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -174,7 +174,10 @@ impl StreamBuilder {
             self.tx.encode_message(&msg)
         };
         self.audio.extend(samples);
-        debug_assert_eq!(self.audio.len() % self.period, 0);
+        debug_assert!(
+            !matches!(self.tx.config().modulation, Modulation::Mfsk)
+                || self.audio.len().is_multiple_of(self.period)
+        );
         self.sent.push(Sent { msg, start });
     }
 
@@ -328,15 +331,32 @@ fn match_delivered(
     (matched, unmatched)
 }
 
-fn run(name: &str, config: &PhyConfig, p: f64, seed: u64) -> RunResult {
+/// Channel corruption on top of the base channel.
+#[derive(Debug, Clone, Copy)]
+enum Corruption {
+    /// Wrong MFSK tone with this probability per symbol, at SNR 20 dB.
+    WrongTone(f64),
+    /// AWGN at this SNR (dB) plus impulse clicks: (per second, dB re peak).
+    SnrClicks(f32, f32, f32),
+}
+
+fn run(name: &str, config: &PhyConfig, corruption: Corruption, seed: u64) -> RunResult {
     let stream = build_stream(config, PAIRS_PER_CONFIG, seed);
     let mut rng = XorShift64::new(seed ^ 0x5EED);
     let offset = rng.below(4 * config.samples_per_symbol_period());
-    let rx_audio = ChannelSim::new(config.clone(), rng.next_u64())
-        .offset(offset)
-        .snr_db(SNR_DB)
-        .symbol_error_prob(p)
-        .apply(&stream.audio);
+    let sim = ChannelSim::new(config.clone(), rng.next_u64()).offset(offset);
+    let rx_audio = match corruption {
+        Corruption::WrongTone(p) => sim.snr_db(SNR_DB).symbol_error_prob(p),
+        Corruption::SnrClicks(snr, rate, level) => {
+            let sim = sim.snr_db(snr);
+            if rate > 0.0 {
+                sim.clicks(rate, level)
+            } else {
+                sim
+            }
+        }
+    }
+    .apply(&stream.audio);
 
     let alive_at = offset + stream.alive_checkpoint;
     let final_dead_from = alive_at as u64;
@@ -446,7 +466,12 @@ fn run(name: &str, config: &PhyConfig, p: f64, seed: u64) -> RunResult {
         .count();
 
     RunResult {
-        label: format!("{name:10} p={:.1}%", p * 100.0),
+        label: match corruption {
+            Corruption::WrongTone(p) => format!("{name:10} p={:.1}%", p * 100.0),
+            Corruption::SnrClicks(snr, rate, level) => {
+                format!("{name:10} {snr}dB {rate}/s@{level:+}")
+            }
+        },
         sent: stream.sent.len(),
         sent_notes,
         delivered: matched.len(),
@@ -466,6 +491,45 @@ fn run(name: &str, config: &PhyConfig, p: f64, seed: u64) -> RunResult {
     }
 }
 
+fn print_results(results: &[RunResult]) {
+    println!(
+        "\n{:<14} {:>5} {:>5} {:>5} {:>5} {:>6} {:>5} {:>6} {:>7} {:>9} {:>8} {:>8} {:>8} {:>4}",
+        "config",
+        "sent",
+        "notes",
+        "deliv",
+        "lost",
+        "lostNO",
+        "false",
+        "stuck",
+        "stuck>LD",
+        "maxStuck",
+        "liveEnd",
+        "burstMid",
+        "burstEnd",
+        "dead"
+    );
+    for r in results {
+        println!(
+            "{:<14} {:>5} {:>5} {:>5} {:>5} {:>6} {:>5} {:>6} {:>7} {:>7.0}ms {:>8} {:>8} {:>8} {:>4}",
+            r.label,
+            r.sent,
+            r.sent_notes,
+            r.delivered,
+            r.lost,
+            r.lost_note_offs,
+            r.false_msgs.len(),
+            r.stuck_episodes,
+            r.stuck_over_link_dead,
+            r.max_stuck_ms,
+            r.sounding_while_alive.len(),
+            r.burst_mid_stream,
+            r.burst_final,
+            r.link_dead_events,
+        );
+    }
+}
+
 fn results() -> &'static [RunResult] {
     static RESULTS: OnceLock<Vec<RunResult>> = OnceLock::new();
     RESULTS.get_or_init(|| {
@@ -477,40 +541,17 @@ fn results() -> &'static [RunResult] {
         ] {
             for (i, &p) in CORRUPTION_LEVELS.iter().enumerate() {
                 let seed = 0xA6_0000 + (cases.len() as u64) * 101 + i as u64;
-                cases.push((name, config.clone(), p, seed));
+                cases.push((name, config.clone(), Corruption::WrongTone(p), seed));
             }
         }
         let results: Vec<RunResult> = std::thread::scope(|s| {
             let handles: Vec<_> = cases
                 .iter()
-                .map(|(name, config, p, seed)| s.spawn(move || run(name, config, *p, *seed)))
+                .map(|(name, config, c, seed)| s.spawn(move || run(name, config, *c, *seed)))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        println!(
-            "\n{:<14} {:>5} {:>5} {:>5} {:>5} {:>6} {:>5} {:>6} {:>7} {:>9} {:>8} {:>8} {:>8} {:>4}",
-            "config", "sent", "notes", "deliv", "lost", "lostNO", "false", "stuck",
-            "stuck>LD", "maxStuck", "liveEnd", "burstMid", "burstEnd", "dead"
-        );
-        for r in &results {
-            println!(
-                "{:<14} {:>5} {:>5} {:>5} {:>5} {:>6} {:>5} {:>6} {:>7} {:>7.0}ms {:>8} {:>8} {:>8} {:>4}",
-                r.label,
-                r.sent,
-                r.sent_notes,
-                r.delivered,
-                r.lost,
-                r.lost_note_offs,
-                r.false_msgs.len(),
-                r.stuck_episodes,
-                r.stuck_over_link_dead,
-                r.max_stuck_ms,
-                r.sounding_while_alive.len(),
-                r.burst_mid_stream,
-                r.burst_final,
-                r.link_dead_events,
-            );
-        }
+        print_results(&results);
         results
     })
 }
@@ -562,5 +603,45 @@ fn all_notes_released_while_link_alive() {
             r.max_stuck_alive_ms,
             r.sounding_while_alive
         );
+    }
+}
+
+/// Back-to-back traffic report for the experimental LTC profiles, with and
+/// without FEC (wrong-tone corruption is MFSK-specific; these get AWGN and
+/// clicks instead). Not an assertion test apart from "no false messages".
+///
+/// ```sh
+/// cargo test --release -p cricket_core --test stuck_notes -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "measurement report; run in release with --ignored --nocapture"]
+fn ltc_back_to_back_report() {
+    let levels = [
+        Corruption::SnrClicks(6.0, 0.0, 0.0),
+        Corruption::SnrClicks(3.0, 0.0, 0.0),
+        Corruption::SnrClicks(1.0, 0.0, 0.0),
+        Corruption::SnrClicks(20.0, 200.0, 6.0),
+    ];
+    let mut cases = Vec::new();
+    for (name, config) in [
+        ("ltc", PhyConfig::ltc()),
+        ("ltc_fec", PhyConfig::ltc_fec()),
+        ("ltc2400", PhyConfig::ltc_with_bit_rate(2400)),
+        ("ltc2400_fec", PhyConfig::ltc_fec_with_bit_rate(2400)),
+    ] {
+        for (i, &c) in levels.iter().enumerate() {
+            cases.push((name, config.clone(), c, 0xB2B_0000 + i as u64));
+        }
+    }
+    let results: Vec<RunResult> = std::thread::scope(|s| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|(name, config, c, seed)| s.spawn(move || run(name, config, *c, *seed)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    print_results(&results);
+    for r in &results {
+        assert!(r.false_msgs.is_empty(), "[{}] {:?}", r.label, r.false_msgs);
     }
 }

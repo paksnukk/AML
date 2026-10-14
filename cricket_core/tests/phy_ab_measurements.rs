@@ -28,6 +28,7 @@ fn profiles() -> Vec<(&'static str, PhyConfig)> {
         ("ltc2400", PhyConfig::ltc_with_bit_rate(2400)),
         ("ltc4800", PhyConfig::ltc_with_bit_rate(4800)),
         ("ltc9600", PhyConfig::ltc_with_bit_rate(9600)),
+        ("ltc_fec", PhyConfig::ltc_fec()),
     ]
 }
 
