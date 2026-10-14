@@ -1,5 +1,6 @@
 use super::{BmcParams, Modulation};
 use crate::phy::{DemodResult, LinkState, PhyConfig, RxEvent};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::f32::consts::PI;
 
@@ -13,7 +14,7 @@ struct Pos {
 impl Pos {
     /// `self - earlier` in samples.
     fn since(self, earlier: Pos) -> f32 {
-        (self.index - earlier.index) as f32 + (self.frac - earlier.frac)
+        (self.index as i64 - earlier.index as i64) as f32 + (self.frac - earlier.frac)
     }
 }
 
@@ -64,16 +65,6 @@ impl Biquad {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Phase {
-    /// Counting preamble half-cell intervals; `half` is their running mean.
-    Search { run: usize, half: f32 },
-    /// First sync violation seen; the next interval must be the second.
-    Sync,
-    /// Reading body bits; `pending_half` = first half of a `1` seen.
-    Body { pending_half: bool },
-}
-
 /// Interval class in half cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interval {
@@ -97,8 +88,71 @@ fn classify(units: f32) -> Interval {
     }
 }
 
+/// Sync peak candidate: squared normalized correlation and body start.
+#[derive(Debug, Clone, Copy)]
+struct SyncPeak {
+    rho: f32,
+    at: Pos,
+}
+
+/// Body being read on a half-cell time grid anchored at the sync.
+#[derive(Debug, Clone)]
+struct Body {
+    /// Stream index all body times are relative to (sync edge, integer part).
+    base: u64,
+    /// Grid point `ref_grid` (in half cells from the body start) lies at
+    /// relative time `ref_t` (samples).
+    ref_t: f32,
+    ref_grid: i32,
+    /// Current half-cell estimate (samples).
+    half: f32,
+    /// Next bit to decide.
+    bit: i32,
+    acc: u8,
+    acc_bits: u8,
+    /// Smallest bit margin in the current nibble (0..=1).
+    nibble_margin: f32,
+    nibble_erased: bool,
+    nibbles: usize,
+    erasures: usize,
+    /// Correlation of the sync that started this body.
+    sync_rho: f32,
+    /// Transitions seen in the body, and those close to a grid point.
+    edges: u16,
+    edges_on_grid: u16,
+    /// Typical `|s1| + |s2|` of a bit (dropout reference).
+    bit_energy: f32,
+    margin_sum: f32,
+}
+
+impl Body {
+    fn grid(&self, g: i32) -> f32 {
+        self.ref_t + (g - self.ref_grid) as f32 * self.half
+    }
+}
+
 /// Streaming biphase-mark receiver emitting the same [`RxEvent`]s as the
 /// MFSK [`ModemRx`](crate::phy::ModemRx) (one `BodyNibble` per 4 bits).
+///
+/// **Sync** is a correlator on the filtered signal: half-cell box sums `B_j`
+/// are matched against the end of the preamble plus the two code violations
+/// (`... + - + - - - - + + +`, sign-free). The best peak of the normalized
+/// correlation `|sum c_j B_j| / sqrt(N sum B_j^2)` above `sync_threshold`
+/// (refined to a fraction of a sample, then snapped to the transition that
+/// ends the second violation) marks the body start. It keeps running while a
+/// body is read: a clearly stronger sync replaces a weaker lock, so a false
+/// lock never hides a real packet and nothing has to be rewound.
+///
+/// **Body** bits are soft decisions on a half-cell grid: each half cell of
+/// the filtered signal is integrated (`s1`, `s2`) and a bit is `1` when the
+/// halves differ in sign (`|s1 - s2| > |s1 + s2|`). The normalized
+/// difference of the two is the bit margin (1 = ideal, 0 = coin toss); a
+/// nibble's reliability is its smallest bit margin, and a nibble containing
+/// a dropout (no signal) is flagged erased. The grid is a second-order loop
+/// driven by the Schmitt-trigger transitions near grid points, so a spurious
+/// or missing transition costs at most the bits it touches, never the rest
+/// of the body. With FEC, a body with more erased nibbles than the code can
+/// fill is abandoned; without FEC the CRC decides.
 pub struct BmcRx {
     config: PhyConfig,
     params: BmcParams,
@@ -112,23 +166,39 @@ pub struct BmcRx {
     env_decay: f32,
     floor: f32,
     prev_y: f32,
+    /// Filtered-signal history (ring, power-of-two length) for integration.
+    history: Vec<f32>,
     /// Schmitt state: `Some(true)` high, `Some(false)` low, `None` gated.
     high: Option<bool>,
     last_zc_up: Option<Pos>,
     last_zc_down: Option<Pos>,
-    last_edge: Option<Pos>,
+    /// Last transitions (ring), to snap a sync peak to the true edge.
+    recent_edges: [Option<Pos>; 8],
+    recent_next: usize,
     samples_pushed: u64,
+    // Sync correlator
+    /// Half-cell box sums (ring, power-of-two length).
+    boxes: Vec<f32>,
+    box_len: usize,
+    /// Template taps: (delay in samples, sign), newest half cell first.
+    taps: Vec<(usize, f32)>,
+    /// Last two squared normalized correlations.
+    rho1: f32,
+    rho2: f32,
+    pending: Option<SyncPeak>,
     // Decoder
-    phase: Phase,
-    half_est: f32,
+    body: Option<Body>,
     link_state: LinkState,
     expected_body_nibbles: usize,
-    acc: u8,
-    acc_bits: u8,
-    nibbles: usize,
-    dev_sum: f32,
-    dev_n: u32,
+    max_erasures: usize,
     last_confidence_db: f32,
+}
+
+/// Nibble reliability in dB from a bit margin `m` in `0..=1`
+/// (`20 log10((1 + m) / (1 - m))`, capped at 40 dB).
+fn margin_db(m: f32) -> f32 {
+    let m = m.clamp(0.0, 1.0);
+    (20.0 * libm::log10f((1.0 + m) / (1.0 - m).max(1e-3))).min(40.0)
 }
 
 impl BmcRx {
@@ -148,6 +218,27 @@ impl BmcRx {
         // Silence floor: min_rms_dbfs is relative to a full-scale sine
         // (-3 dBFS RMS = peak 1.0); the envelope is a peak.
         let floor = libm::powf(10.0, (config.min_rms_dbfs + 3.0) / 20.0);
+        // History: a bit decision looks back ~3 half cells (+ rate error).
+        let history_len =
+            (((4.5 + params.decision_delay) * half_nominal) as usize + 8).next_power_of_two();
+        let max_erasures = config.fec.max_body_erasures();
+
+        // Sync template, newest half cell first: second violation (3 x q),
+        // first violation (3 x p), then the preamble alternating q, p, ...
+        let n_taps = 6 + params.sync_preamble_half_cells;
+        let taps: Vec<(usize, f32)> = (0..n_taps)
+            .map(|j| {
+                let sign = match j {
+                    0..=2 => -1.0,
+                    3..=5 => 1.0,
+                    _ if (j - 6) % 2 == 0 => -1.0,
+                    _ => 1.0,
+                };
+                (libm::roundf(j as f32 * half_nominal) as usize, sign)
+            })
+            .collect();
+        let box_len = (libm::roundf(half_nominal) as usize).max(1);
+        let boxes_len = (taps[n_taps - 1].0 + 1).next_power_of_two();
         Self {
             config,
             params,
@@ -160,20 +251,23 @@ impl BmcRx {
             env_decay,
             floor,
             prev_y: 0.0,
+            history: vec![0.0; history_len.max(box_len.next_power_of_two())],
             high: None,
             last_zc_up: None,
             last_zc_down: None,
-            last_edge: None,
+            recent_edges: [None; 8],
+            recent_next: 0,
             samples_pushed: 0,
-            phase: Phase::Search { run: 0, half: 0.0 },
-            half_est: half_nominal,
+            boxes: vec![0.0; boxes_len],
+            box_len,
+            taps,
+            rho1: 0.0,
+            rho2: 0.0,
+            pending: None,
+            body: None,
             link_state: LinkState::Search,
             expected_body_nibbles: 16,
-            acc: 0,
-            acc_bits: 0,
-            nibbles: 0,
-            dev_sum: 0.0,
-            dev_n: 0,
+            max_erasures,
             last_confidence_db: 0.0,
         }
     }
@@ -186,9 +280,8 @@ impl BmcRx {
         self.link_state
     }
 
-    /// Timing quality of the last packet: `-10 log10(mean squared interval
-    /// error in half cells)`, capped at 40 dB (an ideal line is ~30-40 dB;
-    /// the decision boundary is at 6 dB).
+    /// Mean nibble reliability of the last packet (see [`margin_db`]; an
+    /// ideal line is ~30-40 dB, a coin-toss bit 0 dB).
     pub fn last_confidence_db(&self) -> f32 {
         self.last_confidence_db
     }
@@ -202,10 +295,13 @@ impl BmcRx {
     }
 
     pub fn reset(&mut self) {
-        self.phase = Phase::Search { run: 0, half: 0.0 };
+        self.body = None;
+        self.pending = None;
+        self.rho1 = 0.0;
+        self.rho2 = 0.0;
         self.link_state = LinkState::Search;
         self.high = None;
-        self.last_edge = None;
+        self.recent_edges = [None; 8];
     }
 
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<RxEvent> {
@@ -229,10 +325,28 @@ impl BmcRx {
         self.hp_x1 = x;
         self.hp_y1 = hp;
         let y = self.lp.process(hp);
+        let mask = self.history.len() - 1;
+        self.history[index as usize & mask] = y;
 
+        let active = self.front_end(index, y);
+        self.correlate(index, active, events);
+
+        // Bit decision once its whole cell, and the transitions that time
+        // it, are in the history.
+        if let Some(body) = &self.body {
+            let decide_at = body.grid(2 * body.bit + 2) + self.params.decision_delay * body.half;
+            if (index - body.base) as f32 >= decide_at {
+                self.decide_bit(events);
+            }
+        }
+    }
+
+    /// Envelope, Schmitt trigger and transition timing. Returns false while
+    /// the input is below the silence floor.
+    fn front_end(&mut self, index: u64, y: f32) -> bool {
         // Interpolated zero crossings between samples index-1 and index.
         let prev = self.prev_y;
-        if prev < 0.0 && y >= 0.0 {
+        if prev < 0.0 && y >= 0.0 && index > 0 {
             self.last_zc_up = Some(Pos {
                 index: index - 1,
                 frac: prev / (prev - y),
@@ -252,12 +366,11 @@ impl BmcRx {
             self.env * self.env_decay
         };
         if self.env < self.floor {
-            if self.high.is_some() {
-                self.high = None;
-                self.last_edge = None;
-                self.abort(events);
+            // A body keeps running: the silence shows up as erasures.
+            if self.high.take().is_some() {
+                self.recent_edges = [None; 8];
             }
-            return;
+            return false;
         }
 
         let th = self.params.hysteresis * self.env;
@@ -268,151 +381,307 @@ impl BmcRx {
         } else {
             None
         };
-        let Some(level) = flipped_to else { return };
+        let Some(level) = flipped_to else {
+            return true;
+        };
         let was = self.high.replace(level);
         if was.is_none() {
-            // Leaving the gate: no transition to time this from.
-            self.last_edge = None;
-            return;
+            // Leaving the gate: signal onset, not a code transition.
+            return true;
         }
         let zc = if level {
             self.last_zc_up
         } else {
             self.last_zc_down
         };
-        let Some(edge) = zc else { return };
-        if let Some(prev_edge) = self.last_edge.replace(edge) {
-            let interval = edge.since(prev_edge);
-            self.on_interval(interval, events);
-        }
+        let Some(edge) = zc else {
+            return true;
+        };
+        self.track_edge(edge);
+        self.recent_edges[self.recent_next] = Some(edge);
+        self.recent_next = (self.recent_next + 1) % self.recent_edges.len();
+        true
     }
 
-    /// A body in progress is abandoned (SyncLost); search restarts.
-    fn abort(&mut self, events: &mut Vec<RxEvent>) {
-        if matches!(self.phase, Phase::Body { .. }) {
-            events.push(RxEvent::SyncLost);
+    /// Sync correlator, one output per sample (see the type docs).
+    fn correlate(&mut self, index: u64, active: bool, events: &mut Vec<RxEvent>) {
+        let hmask = self.history.len() - 1;
+        let mut b = 0.0;
+        for k in 0..self.box_len as u64 {
+            if k <= index {
+                b += self.history[(index - k) as usize & hmask];
+            }
         }
-        if !matches!(self.phase, Phase::Search { .. }) {
-            self.link_state = LinkState::Search;
-        }
-        self.phase = Phase::Search { run: 0, half: 0.0 };
-    }
+        let bmask = self.boxes.len() - 1;
+        self.boxes[index as usize & bmask] = b;
 
-    /// Search-mode handling of `interval`: extend or restart the preamble run.
-    fn search(&mut self, interval: f32, run: usize, half: f32) {
-        let tol = 0.3;
-        let reference = if run == 0 { self.half_nominal } else { half };
-        if libm::fabsf(interval / reference - 1.0) < tol {
-            let n = (run + 1).min(8) as f32;
-            let half = if run == 0 {
-                interval
+        let mut rho = 0.0;
+        if active {
+            let mut c = 0.0;
+            let mut energy = 0.0;
+            for &(delay, sign) in &self.taps {
+                let v = self.boxes[(index as usize).wrapping_sub(delay) & bmask];
+                c += sign * v;
+                energy += v * v;
+            }
+            // Normalized correlation, squared: c^2 / (N sum v^2) <= 1.
+            let norm = self.taps.len() as f32 * energy;
+            if norm > 1e-12 {
+                rho = c * c / norm;
+            }
+        }
+
+        // Local maximum at index - 1?
+        let (r2, r1, r0) = (self.rho2, self.rho1, rho);
+        self.rho2 = r1;
+        self.rho1 = r0;
+        let th = self.params.sync_threshold;
+        if index >= 2 && r1 >= th * th && r1 > r2 && r1 >= r0 {
+            let den = r2 - 2.0 * r1 + r0;
+            let delta = if den < 0.0 {
+                (0.5 * (r2 - r0) / den).clamp(-0.5, 0.5)
             } else {
-                half + (interval - half) / n
+                0.0
             };
-            self.phase = Phase::Search { run: run + 1, half };
-            return;
-        }
-        let rate_ok = libm::fabsf(half / self.half_nominal - 1.0) <= self.params.max_rate_error;
-        if run >= self.params.min_train_intervals
-            && rate_ok
-            && classify(interval / half) == Interval::Violation
-        {
-            self.half_est = half;
-            self.phase = Phase::Sync;
-            return;
-        }
-        // Restart; this interval may itself start a new run.
-        self.phase = Phase::Search { run: 0, half: 0.0 };
-        if libm::fabsf(interval / self.half_nominal - 1.0) < tol {
-            self.phase = Phase::Search {
-                run: 1,
-                half: interval,
-            };
-        }
-    }
-
-    fn on_interval(&mut self, interval: f32, events: &mut Vec<RxEvent>) {
-        match self.phase {
-            Phase::Search { run, half } => self.search(interval, run, half),
-            Phase::Sync => {
-                if classify(interval / self.half_est) == Interval::Violation {
-                    self.phase = Phase::Body {
-                        pending_half: false,
-                    };
-                    self.link_state = LinkState::Locked;
-                    self.acc = 0;
-                    self.acc_bits = 0;
-                    self.nibbles = 0;
-                    self.dev_sum = 0.0;
-                    self.dev_n = 0;
-                    events.push(RxEvent::PreambleLocked {
-                        confidence_db: self.last_confidence_db,
-                    });
-                } else {
-                    self.phase = Phase::Search { run: 0, half: 0.0 };
-                    self.search(interval, 0, 0.0);
+            // Box sums end half a sample after their last sample.
+            let t = delta + 0.5;
+            let at = if t >= 1.0 {
+                Pos {
+                    index,
+                    frac: t - 1.0,
                 }
+            } else {
+                Pos {
+                    index: index - 1,
+                    frac: t,
+                }
+            };
+            if self.pending.is_none_or(|p| r1 > p.rho) {
+                self.pending = Some(SyncPeak { rho: r1, at });
             }
-            Phase::Body { pending_half } => {
-                let units = interval / self.half_est;
-                let class = classify(units);
-                let (bit, measured_half) = match (class, pending_half) {
-                    (Interval::Half, false) => {
-                        self.phase = Phase::Body { pending_half: true };
-                        (None, interval)
-                    }
-                    (Interval::Half, true) => (Some(1u8), interval),
-                    (Interval::Full, false) => (Some(0u8), interval / 2.0),
-                    _ => {
-                        self.abort(events);
-                        // The offending interval may begin a new preamble.
-                        self.search(interval, 0, 0.0);
-                        return;
-                    }
-                };
-                // Track the clock (rate drift / SRC) and the timing quality.
-                self.half_est += (measured_half - self.half_est) / 16.0;
-                let err = units - libm::roundf(units);
-                self.dev_sum += err * err;
-                self.dev_n += 1;
-                if let Some(b) = bit {
-                    self.phase = Phase::Body {
-                        pending_half: false,
-                    };
-                    self.push_bit(b, events);
-                }
+        }
+
+        // Accept the best peak once no better one followed for 3.5 half
+        // cells (side peaks sit 2 and 3 half cells before the true one).
+        if let Some(peak) = self.pending {
+            let since = Pos { index, frac: 0.0 }.since(peak.at);
+            if since >= 3.5 * self.half_nominal {
+                self.pending = None;
+                self.on_sync(peak, events);
             }
         }
     }
 
-    fn push_bit(&mut self, bit: u8, events: &mut Vec<RxEvent>) {
-        self.acc = (self.acc << 1) | bit;
-        self.acc_bits += 1;
-        if self.acc_bits < 4 {
+    /// Grid timing loop: a transition near a half-cell grid point pulls the
+    /// grid towards it (phase) and nudges the half-cell length (rate).
+    fn track_edge(&mut self, edge: Pos) {
+        let kp = self.params.pll_phase_gain;
+        let ki = self.params.pll_rate_gain;
+        let Some(body) = &mut self.body else { return };
+        let t = (edge.index as i64 - body.base as i64) as f32 + edge.frac;
+        let u = (t - body.ref_t) / body.half + body.ref_grid as f32;
+        let g = libm::roundf(u);
+        let err = u - g;
+        let window = self.params.pll_window;
+        body.edges = body.edges.saturating_add(1);
+        if libm::fabsf(err) < 0.25 {
+            body.edges_on_grid = body.edges_on_grid.saturating_add(1);
+        }
+        if libm::fabsf(err) > window || g < 0.0 {
+            return; // Too far off the grid to be a code transition.
+        }
+        // Transitions near the edge of the window (ISI, noise) count less.
+        let err = err * (1.0 - self.params.pll_taper * libm::fabsf(err) / window);
+        let g = g as i32;
+        body.ref_t = body.grid(g) + kp * err * body.half;
+        body.ref_grid = g;
+        let half = body.half * (1.0 + ki * err);
+        let max_dev = 1.5 * self.params.max_rate_error;
+        body.half = half.clamp(
+            self.half_nominal * (1.0 - max_dev),
+            self.half_nominal * (1.0 + max_dev),
+        );
+    }
+
+    fn on_sync(&mut self, peak: SyncPeak, events: &mut Vec<RxEvent>) {
+        if let Some(body) = &self.body {
+            // Inside a body only a clearly stronger sync, or one that body
+            // data cannot produce, takes over.
+            let certain = self.params.resync_certain * self.params.resync_certain;
+            if peak.rho < body.sync_rho + self.params.resync_margin && peak.rho < certain {
+                return;
+            }
+        }
+        // The body starts at the nominal rate; a rate error is left to the
+        // timing loop (a preamble estimate is too noisy at low SNR).
+        let half = self.half_nominal;
+        let at = self.sync_edge(peak.at);
+        let bit_energy = self.env * self.window_fraction() * 2.0 * half;
+        self.body = Some(Body {
+            base: at.index,
+            ref_t: at.frac,
+            ref_grid: 0,
+            half,
+            bit: 0,
+            acc: 0,
+            acc_bits: 0,
+            nibble_margin: 1.0,
+            nibble_erased: false,
+            nibbles: 0,
+            erasures: 0,
+            sync_rho: peak.rho,
+            edges: 0,
+            edges_on_grid: 0,
+            bit_energy,
+            margin_sum: 0.0,
+        });
+        self.link_state = LinkState::Locked;
+        events.push(RxEvent::PreambleLocked {
+            confidence_db: margin_db(peak.rho),
+        });
+    }
+
+    /// Body start for a correlation peak at `at`: preferably a transition
+    /// preceded by two violation-length intervals (the end of the second
+    /// violation) within 1.5 half cells, else the nearest transition within
+    /// `sync_snap` half cells, else the peak itself.
+    fn sync_edge(&self, at: Pos) -> Pos {
+        let half = self.half_nominal;
+        let n = self.recent_edges.len();
+        // Chronological order, oldest first.
+        let edge = |k: usize| self.recent_edges[(self.recent_next + k) % n];
+        let mut best: Option<(f32, Pos)> = None;
+        for k in 2..n {
+            let (Some(e0), Some(e1), Some(e2)) = (edge(k - 2), edge(k - 1), edge(k)) else {
+                continue;
+            };
+            let d = libm::fabsf(e2.since(at)) / half;
+            let v1 = classify(e1.since(e0) / half) == Interval::Violation;
+            let v2 = classify(e2.since(e1) / half) == Interval::Violation;
+            if v1 && v2 && d < 1.5 && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, e2));
+            }
+        }
+        if let Some((_, e)) = best {
+            return e;
+        }
+        self.recent_edges
+            .iter()
+            .flatten()
+            .map(|e| (libm::fabsf(e.since(at)) / half, *e))
+            .filter(|(d, _)| *d < self.params.sync_snap)
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal))
+            .map_or(at, |(_, e)| e)
+    }
+
+    /// Fraction of each half cell that is integrated.
+    fn window_fraction(&self) -> f32 {
+        1.0 - self.params.rx_window_trim - self.params.rx_window_outer_trim
+    }
+
+    /// Weighted sum of the filtered signal over relative time `[a, b]`
+    /// (sample `n` covers `[n - 0.5, n + 0.5]`).
+    fn integrate(&self, base: u64, a: f32, b: f32) -> f32 {
+        let mask = self.history.len() - 1;
+        let oldest = self
+            .samples_pushed
+            .saturating_sub(self.history.len() as u64);
+        let lo = libm::floorf(a + 0.5) as i64;
+        let hi = libm::floorf(b + 0.5) as i64;
+        let mut sum = 0.0;
+        for n in lo..=hi {
+            let w = (n as f32 + 0.5).min(b) - (n as f32 - 0.5).max(a);
+            let idx = base as i64 + n;
+            if w <= 0.0 || idx < oldest as i64 || idx >= self.samples_pushed as i64 {
+                continue;
+            }
+            sum += w * self.history[idx as usize & mask];
+        }
+        sum
+    }
+
+    fn decide_bit(&mut self, events: &mut Vec<RxEvent>) {
+        let Some(body) = &self.body else { return };
+        let inner = self.params.rx_window_trim * body.half;
+        let outer = self.params.rx_window_outer_trim * body.half;
+        let g = 2 * body.bit;
+        let (t0, t1, t2) = (body.grid(g), body.grid(g + 1), body.grid(g + 2));
+        // Every cell starts with a transition, so the half cells either side
+        // of this cell are inverted second looks at its first and second
+        // half: averaging them in halves the noise of both estimates.
+        let s0 = self.integrate(body.base, body.grid(g - 1) + inner, t0 - outer);
+        let s1 = self.integrate(body.base, t0 + outer, t1 - inner);
+        let s2 = self.integrate(body.base, t1 + inner, t2 - outer);
+        let s3 = self.integrate(body.base, t2 + outer, body.grid(g + 3) - inner);
+        let (s1, s2) = (0.5 * (s1 - s0), 0.5 * (s2 - s3));
+        let one = libm::fabsf(s1 - s2);
+        let zero = libm::fabsf(s1 + s2);
+        let energy = libm::fabsf(s1) + libm::fabsf(s2);
+        let dropout = energy < self.params.dropout_ratio * body.bit_energy;
+        let margin = if dropout {
+            0.0
+        } else {
+            libm::fabsf(one - zero) / (one + zero).max(1e-12)
+        };
+
+        let body = self.body.as_mut().expect("body");
+        if !dropout {
+            body.bit_energy += (energy - body.bit_energy) / 8.0;
+        }
+        body.bit += 1;
+        body.acc = (body.acc << 1) | (one > zero) as u8;
+        body.acc_bits += 1;
+        body.nibble_margin = body.nibble_margin.min(margin);
+        body.nibble_erased |= dropout;
+        if body.acc_bits < 4 {
             return;
         }
-        let nibble = self.acc & 0x0F;
-        self.acc = 0;
-        self.acc_bits = 0;
-        let mean = self.dev_sum / self.dev_n.max(1) as f32;
-        let confidence_db = (-10.0 * libm::log10f(mean.max(1e-4))).min(40.0);
-        self.last_confidence_db = confidence_db;
+        let nibble = body.acc & 0x0F;
+        let margin = body.nibble_margin;
+        let erased = body.nibble_erased || margin < self.params.erase_margin;
+        body.acc = 0;
+        body.acc_bits = 0;
+        body.nibble_margin = 1.0;
+        body.nibble_erased = false;
+        body.nibbles += 1;
+        body.margin_sum += margin;
+        if erased {
+            body.erasures += 1;
+            // Without FEC an erasure is just a likely bit error: the CRC
+            // decides, and the parallel sync search loses nothing meanwhile.
+            if self.max_erasures > 0 && body.erasures > self.max_erasures {
+                // More gaps than the code can fill: not (or no longer) a packet.
+                self.body = None;
+                self.link_state = LinkState::Search;
+                events.push(RxEvent::SyncLost);
+                return;
+            }
+        }
+        let confidence_db = margin_db(margin);
+        let done = body.nibbles >= self.expected_body_nibbles;
+        if done {
+            let mean = body.margin_sum / body.nibbles as f32;
+            let on_grid = body.edges_on_grid as f32 / body.edges.max(1) as f32;
+            self.body = None;
+            if mean < self.params.min_body_margin || on_grid < self.params.min_on_grid {
+                // Noise-like body: a false lock (noise, MFSK tones). Dropping
+                // it keeps the CRC / FEC from ever seeing it.
+                self.link_state = LinkState::Search;
+                events.push(RxEvent::SyncLost);
+                return;
+            }
+            self.last_confidence_db = margin_db(mean);
+            // Packet complete; stay Locked (as the MFSK receiver does).
+        }
         events.push(RxEvent::BodyNibble {
             result: DemodResult {
                 nibble,
                 power: self.env * self.env,
                 confidence_db,
-                // Fraction of the decision margin (0.5 half cell) left unused.
-                purity: (1.0 - 2.0 * libm::sqrtf(mean)).max(0.0),
-                // Hard decisions only: BMC RX does not flag erasures (yet).
-                erased: false,
+                purity: margin,
+                erased,
             },
             end_sample: self.samples_pushed,
         });
-        self.nibbles += 1;
-        if self.nibbles >= self.expected_body_nibbles {
-            // Packet complete; stay Locked (as the MFSK receiver does).
-            self.phase = Phase::Search { run: 0, half: 0.0 };
-        }
     }
 }

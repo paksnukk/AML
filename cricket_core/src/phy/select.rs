@@ -3,6 +3,7 @@
 
 use super::bmc::{BmcRx, BmcTx, Modulation};
 use super::{LinkState, ModemRx, ModemTx, PhyConfig, RxEvent};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 /// Transmit phy selected by `config.modulation`.
@@ -29,16 +30,17 @@ impl PhyTx {
 }
 
 /// Receive phy selected by `config.modulation`; both emit [`RxEvent`]s.
+/// Boxed: the receivers differ a lot in size and live for the whole stream.
 pub enum PhyRx {
-    Mfsk(ModemRx),
-    Bmc(BmcRx),
+    Mfsk(Box<ModemRx>),
+    Bmc(Box<BmcRx>),
 }
 
 impl PhyRx {
     pub fn new(config: PhyConfig) -> Self {
         match config.modulation {
-            Modulation::Mfsk => Self::Mfsk(ModemRx::new(config)),
-            Modulation::Bmc(_) => Self::Bmc(BmcRx::new(config)),
+            Modulation::Mfsk => Self::Mfsk(Box::new(ModemRx::new(config))),
+            Modulation::Bmc(_) => Self::Bmc(Box::new(BmcRx::new(config))),
         }
     }
 
@@ -81,13 +83,15 @@ impl PhyRx {
     pub fn confirm(&mut self) -> Vec<RxEvent> {
         match self {
             Self::Mfsk(rx) => rx.confirm(),
-            // BMC does not pause after a body (no rewind support yet).
+            // BMC does not pause after a body: its sync search never stops,
+            // so there is nothing to rewind (see `BmcRx`).
             Self::Bmc(_) => Vec::new(),
         }
     }
 
     /// The completed body failed to decode; rewind and resume (see
-    /// [`ModemRx::reject`]). BMC has no audio buffer to rewind into: no-op.
+    /// [`ModemRx::reject`]). No-op for BMC: its sync correlator keeps running
+    /// during a body and a real sync replaces a false lock directly.
     pub fn reject(&mut self) -> Vec<RxEvent> {
         match self {
             Self::Mfsk(rx) => rx.reject(),

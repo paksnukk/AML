@@ -48,13 +48,28 @@
 //!
 //! # Receiver
 //!
-//! DC blocker -> 2nd-order low-pass -> peak envelope -> Schmitt trigger with
-//! a threshold proportional to the envelope (level-independent) -> transition
-//! times taken from the interpolated zero crossing that preceded each Schmitt
-//! flip (sub-sample timing, chatter-free) -> interval classification against
-//! a half-cell estimate that is acquired on the preamble and tracked through
-//! the body. Each interval is measured on its own, so clock drift never
-//! accumulates; only the ratio to the estimate matters.
+//! DC blocker -> 2nd-order low-pass, then two paths on the filtered signal:
+//!
+//! * **Sync:** a correlator of half-cell box sums against the end of the
+//!   preamble plus the two violations; the best peak above a threshold
+//!   (snapped to the transition that ends the second violation when one is
+//!   close) starts a body. It keeps running during a body, and a clearly
+//!   stronger sync replaces a weaker lock, so a false lock never hides a
+//!   real packet (the BMC equivalent of the MFSK "rewind on failed decode").
+//! * **Body:** soft decisions on a half-cell time grid: each bit compares
+//!   the integrals of its two half cells (`1` = opposite signs). The
+//!   normalized decision margin is the bit's reliability; a nibble carries
+//!   its weakest bit's margin (as `confidence_db`) for the FEC decoder, and
+//!   a nibble with a dropout (no signal) is flagged erased. The grid is a
+//!   second-order timing loop pulled by the transitions (peak envelope ->
+//!   Schmitt trigger with an envelope-relative threshold -> interpolated
+//!   zero-crossing times), so a spurious or missing transition only costs
+//!   the bits it touches. With FEC a body is abandoned once it has more
+//!   erased nibbles than the code can fill.
+//!
+//! Per-sample cost: the filters, envelope and Schmitt trigger as before,
+//! one box-sum update (`half cell` adds), and the correlator (22 multiply-
+//! adds plus 22 squares); per bit, two half-cell integrals.
 
 mod rx;
 mod tx;
@@ -92,10 +107,58 @@ pub struct BmcParams {
     pub hysteresis: f32,
     /// Peak-envelope release time constant, in bit cells.
     pub envelope_release_bits: f32,
-    /// Consecutive preamble half-cell intervals needed before a sync is accepted.
-    pub min_train_intervals: usize,
-    /// Accepted deviation of the measured half cell from nominal (0.05 = +-5 %).
+    /// Preamble half cells (before the two sync violations) in the RX
+    /// sync correlator template.
+    pub sync_preamble_half_cells: usize,
+    /// Sync correlator threshold: normalized correlation (0..=1) a peak must
+    /// reach. A clean sync scores ~1; body data can reach 0.82 (two
+    /// mismatched half cells of 22), which is why a lock is only replaced by
+    /// a stronger sync.
+    pub sync_threshold: f32,
+    /// While a body is read, a new sync replaces the lock only if its
+    /// squared correlation exceeds the lock's by this much.
+    pub resync_margin: f32,
+    /// A sync whose correlation reaches this replaces any lock (body data
+    /// cannot exceed 0.82 on a clean line).
+    pub resync_certain: f32,
+    /// A transition within this many half cells of the sync correlation
+    /// peak sets the body start (0 = use the peak).
+    pub sync_snap: f32,
+    /// Accepted deviation of the bit rate from nominal (0.05 = +-5 %).
     pub max_rate_error: f32,
+    /// Part of each half cell left out of the soft-decision integration
+    /// next to the mid-cell point, as a fraction of a half cell.
+    pub rx_window_trim: f32,
+    /// Same, next to the cell boundaries.
+    pub rx_window_outer_trim: f32,
+    /// Body timing loop: phase correction per transition (fraction of the
+    /// measured offset).
+    pub pll_phase_gain: f32,
+    /// Body timing loop: relative half-cell correction per transition and
+    /// half cell of offset.
+    pub pll_rate_gain: f32,
+    /// A bit is decided this many half cells after its cell ends (at least
+    /// 1.5: the decision also uses the first half of the next cell).
+    pub decision_delay: f32,
+    /// Body timing loop: only transitions within this many half cells of a
+    /// grid point steer it.
+    pub pll_window: f32,
+    /// Body timing loop: weight reduction towards the window edge (0 = none,
+    /// 1 = linear down to zero).
+    pub pll_taper: f32,
+    /// A bit whose integrated level falls below this fraction of the
+    /// running bit level is a dropout: its nibble is erased.
+    pub dropout_ratio: f32,
+    /// A completed body whose mean nibble margin (weakest bit per nibble,
+    /// 0..=1) is below this is dropped as a false lock. Noise scores
+    /// ~0.1-0.25, a real packet at 0 dB SNR ~0.4-0.6.
+    pub min_body_margin: f32,
+    /// ... or whose transitions fall within 0.25 half cells of the timing
+    /// grid less often than this.
+    pub min_on_grid: f32,
+    /// A nibble whose weakest bit margin (0..=1) is below this is flagged
+    /// as an erasure (only matters with FEC; 0 disables).
+    pub erase_margin: f32,
 }
 
 impl BmcParams {
@@ -109,10 +172,25 @@ impl BmcParams {
             edge_frac: 0.5,
             rx_lowpass_ratio: 1.5,
             rx_highpass_ratio: 0.05,
-            hysteresis: 0.2,
+            hysteresis: 0.3,
             envelope_release_bits: 8.0,
-            min_train_intervals: 8,
+            sync_preamble_half_cells: 16,
+            sync_threshold: 0.75,
+            sync_snap: 0.5,
+            resync_margin: 0.05,
+            resync_certain: 0.95,
             max_rate_error: 0.05,
+            rx_window_trim: 0.15,
+            rx_window_outer_trim: 0.15,
+            pll_phase_gain: 0.3,
+            pll_rate_gain: 0.02,
+            decision_delay: 1.5,
+            pll_window: 0.45,
+            pll_taper: 0.5,
+            dropout_ratio: 0.25,
+            min_body_margin: 0.3,
+            min_on_grid: 0.6,
+            erase_margin: 0.0,
         }
     }
 
