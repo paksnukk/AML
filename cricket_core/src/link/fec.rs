@@ -50,6 +50,16 @@ impl FecMode {
         }
     }
 
+    /// Preamble symbols after the first that the receiver may miss and
+    /// still lock: the coded body and CRC-16 verify the lock instead.
+    /// The first symbol (which triggers fine alignment) must always match.
+    pub fn preamble_misses(&self) -> usize {
+        match *self {
+            FecMode::None => 0,
+            FecMode::Rs16 { .. } => 1,
+        }
+    }
+
     /// Body symbols the receiver may accept as erasures (failed detection
     /// gate) before abandoning a lock: the most the code could fill in.
     pub fn max_body_erasures(&self) -> usize {

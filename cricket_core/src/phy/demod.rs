@@ -51,6 +51,9 @@ enum RxPhase {
     /// Collecting remaining preamble symbols after first matched.
     ConfirmPreamble {
         matched: usize,
+        /// Preamble symbols after the first that failed but were tolerated
+        /// (FEC only, see `FecMode::preamble_misses`).
+        misses: usize,
     },
     /// Reading body nibbles for the current packet repetition.
     Body {
@@ -223,7 +226,10 @@ impl ModemRx {
                         {
                             self.attempt = Some(trigger);
                             self.read = aligned + period as u64;
-                            self.phase = RxPhase::ConfirmPreamble { matched: 1 };
+                            self.phase = RxPhase::ConfirmPreamble {
+                                matched: 1,
+                                misses: 0,
+                            };
                             self.last_confidence_db = det.confidence_db;
                             self.trim(hop);
                             continue;
@@ -232,35 +238,44 @@ impl ModemRx {
                     self.read = trigger + hop as u64;
                     self.trim(hop);
                 }
-                RxPhase::ConfirmPreamble { matched } => {
+                RxPhase::ConfirmPreamble { matched, misses } => {
                     if !self.available(self.read, period) {
                         break;
                     }
                     let window = self.window_at(self.read, sym);
                     let expect = self.config.preamble[matched];
-                    if let Some(det) = self.detect_nibble(&window) {
-                        if det.nibble == expect
-                            && self.level_ok(&det)
+                    let det = self.detect_nibble(&window);
+                    let good = det.as_ref().is_some_and(|det| {
+                        det.nibble == expect
+                            && self.level_ok(det)
                             && det.confidence_db >= self.config.min_confidence_db * 0.5
-                        {
-                            self.read += period as u64;
-                            let next = matched + 1;
-                            self.last_confidence_db = det.confidence_db;
-                            if next >= self.config.preamble.len() {
-                                self.phase = RxPhase::Body {
-                                    collected: 0,
-                                    expected: self.expected_body_nibbles,
-                                    erased: 0,
-                                };
-                                self.link_state = LinkState::Locked;
-                                events.push(RxEvent::PreambleLocked {
-                                    confidence_db: det.confidence_db,
-                                });
-                            } else {
-                                self.phase = RxPhase::ConfirmPreamble { matched: next };
-                            }
-                            continue;
+                    });
+                    // With FEC the coded body + CRC verify the lock, so a
+                    // bad preamble symbol after the first may be tolerated.
+                    let tolerate = !good && misses < self.config.fec.preamble_misses();
+                    if good || tolerate {
+                        self.read += period as u64;
+                        let next = matched + 1;
+                        let misses = misses + usize::from(tolerate);
+                        let confidence_db = det.map_or(0.0, |d| d.confidence_db);
+                        if good {
+                            self.last_confidence_db = confidence_db;
                         }
+                        if next >= self.config.preamble.len() {
+                            self.phase = RxPhase::Body {
+                                collected: 0,
+                                expected: self.expected_body_nibbles,
+                                erased: 0,
+                            };
+                            self.link_state = LinkState::Locked;
+                            events.push(RxEvent::PreambleLocked { confidence_db });
+                        } else {
+                            self.phase = RxPhase::ConfirmPreamble {
+                                matched: next,
+                                misses,
+                            };
+                        }
+                        continue;
                     }
                     // Preamble mismatch → rewind and search again
                     self.fail_attempt(hop, &mut events);

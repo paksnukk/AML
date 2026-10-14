@@ -127,6 +127,33 @@ fn corrects_wrong_symbols_and_reports_them() {
     assert!(corrected >= 1, "fec_corrected = {corrected}");
 }
 
+/// Erasure-tolerant body + tolerant preamble must not turn noise or random
+/// tone streams into messages (CRC-16 + version/type/pad checks).
+#[test]
+fn noise_and_random_tones_produce_no_messages() {
+    let config = PhyConfig::robust_fec();
+    let rate = config.sample_rate_hz as usize;
+    let mut rng = XorShift64::new(0x0BAD);
+    // 10 s of white noise.
+    let noise: Vec<f32> = (0..10 * rate)
+        .map(|_| (rng.gaussian() * 0.3) as f32)
+        .collect();
+    // 10 s of random MFSK symbols with preambles sprinkled in.
+    let phy = cricket_core::phy::ModemTx::new(config.clone());
+    let mut nibbles = Vec::new();
+    while nibbles.len() * config.samples_per_symbol_period() < 10 * rate {
+        if rng.below(8) == 0 {
+            nibbles.extend_from_slice(&config.preamble);
+        }
+        nibbles.push(rng.below(16) as u8);
+    }
+    let tones = phy.synthesize_nibbles(&nibbles);
+    for audio in [noise, tones] {
+        let got = decode_chunked(config.clone(), &audio, 512);
+        assert!(got.is_empty(), "false messages: {got:?}");
+    }
+}
+
 /// Same trials through both profiles: single-copy FEC must deliver at least
 /// as often as two uncoded copies under random wrong-tone symbols.
 #[test]
