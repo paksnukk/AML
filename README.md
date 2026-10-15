@@ -33,14 +33,43 @@ The packet is sent as **16-tone FSK**: one pure tone at a time, and each tone ca
 - **Copies are counted once.** Repeated copies of a packet are dropped by sequence number within a short
   time window.
 - **Nothing is left hanging.** A heartbeat keeps the link alive. If no valid packet arrives for 2 s, or the
-  audio input stops delivering samples, the decoder sends **Sustain off + All Notes Off** once. Each
-  released note's NoteOff is repeated a few times in idle airtime, so a NoteOff lost to noise
-  doesn't leave a note droning forever.
-- **Important messages first.** The transmitter sends Panic, then NoteOffs, then NoteOns, Program
-  Changes and MSC, then NoteOff repeats, then heartbeats. When fast playing would overflow the airtime,
-  it drops the oldest queued NoteOns, never a NoteOff or Panic, and never a chord of up to 4 notes.
+  audio input stops delivering samples, the decoder sends **Sustain off + All Notes Off on all 16
+  channels** once (and re-centers any pitch bend it left bent). Each released note's NoteOff is
+  repeated a few times in idle airtime, so a NoteOff lost to noise doesn't leave a note droning forever.
+- **Important messages first.** The transmitter sends Panic and All Notes Off / All Sound Off, then
+  NoteOffs and MSC, then everything else, then NoteOff repeats, then heartbeats. When fast playing would
+  overflow the airtime, it drops the oldest queued NoteOns, never a NoteOff, MSC or Panic, and never a
+  chord of up to 4 notes.
+- **Faders don't clog the line.** Controllers, pitch bend and aftertouch are *latest value wins*: while
+  a value is still waiting to be sent, a newer one replaces it. A fader sending 200 values a second
+  costs one queued message, its final position arrives within about two message times, and a note
+  waits at most for the controller value of its own channel that was set before it. Bank Select,
+  RPN/NRPN and Program Change are never merged or reordered, and a NoteOff never overtakes a sustain
+  pedal it was played after.
 
-Supported messages: NoteOn, NoteOff, Program Change, MSC (Go / Stop / Resume / Load), Panic.
+## What it carries
+
+- **All MIDI 1.0 channel messages on all 16 channels:** Note On / Off (with release velocity),
+  Polyphonic and Channel Aftertouch, Control Change (including the channel mode messages 120–127),
+  Program Change and Pitch Bend; plus Song Position, Song Select and Tune Request.
+- **MIDI Show Control (MSC):** GO, STOP, RESUME, GO_OFF and GO/JAM_CLOCK with an optional cue number
+  and cue list, LOAD with a cue number and optional list, FIRE (macro 0–127), ALL_OFF, RESTORE, RESET, STANDBY ±, SEQUENCE ±,
+  START/STOP/ZERO_CLOCK, MTC_CHASE_ON/OFF, OPEN/CLOSE_CUE_LIST.
+  - Cue numbers **0–999.9 with at most one decimal**, cue lists **1–15**. Numbers are carried as
+    numbers: `05`, `5.0` and `5` all arrive as `5` (worth knowing if the receiving end is QLab, which
+    matches cue numbers as text).
+  - The **device ID and command format are set on the decoder** (default: device `0x7F`, all-call;
+    format `0x01`, Lighting (General)); the encoder accepts MSC for any device ID and format.
+  - An MSC message that does not fit (cue `12.345`, cue `1000`, list `16`, a cue path, TIMED_GO, SET,
+    SET_CLOCK, OPEN/CLOSE_CUE_PATH) is **not sent**, and the encoder raises an alarm such as
+    "MSC cue 12.345 not representable". It never sends a different cue.
+- **Panic** (the GUI button): All Notes Off everywhere.
+
+**Not carried, on purpose:** other System Exclusive, MIDI Clock and the other real-time messages
+(Start/Stop/Continue, Active Sensing), and MIDI Time Code. A packet takes 20–270 ms of airtime
+depending on the profile; clock and timecode need a steady stream with sub-millisecond timing, so they
+would arrive useless and would delay every note and cue behind them. Run timecode as LTC on its own
+audio channel instead. Large SysEx dumps would block the line for seconds.
 
 ## Profiles
 
@@ -85,6 +114,10 @@ cargo run -p cricket_cli -- encode --midi-in-name "My Keyboard" --audio-out-name
 
 # Receiving side: tones in → MIDI out
 cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1"
+
+# ... sending MSC to a console that listens on device ID 1 (default: 0x7F all-call, format 0x01)
+cargo run -p cricket_cli -- decode --audio-in-name "Dante RX 1-2" --midi-out-name "IAC Bus 1" \
+    --msc-device-id 1 --msc-format 0x01
 
 # No hardware at hand? Encoder plays a C-major scale on its own
 cargo run -p cricket_cli -- encode --simulate

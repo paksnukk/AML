@@ -191,6 +191,8 @@ where the old receiver produced none.
 
 ### 9.1 Analytic model
 
+(This is the AML v1.0 message set; §9.7 redoes the count for v1.1, which carries all MIDI channels and full MSC.)
+
 Treat a candidate as a uniformly random 14-nibble data block. It must have version `1` (4 bits), a
 known type (6 of 16), zero bytes after the packet (pad) and, new, a payload within the ranges of spec §5
 (MIDI data bytes < 0x80; MscLite `cmd` 0–3, `cuelist` 0–15, `cue` 0–127). Then the CRC-16.
@@ -309,7 +311,7 @@ target; before, it was 530 hours and 1.7 hours.**
 
 Fast (`cargo test`): `link::fec` unit tests check that a body GMD could decode beyond the bound is not
 offered to the CRC, that a dropout plus one weak symbol still decodes and two do not, and that the
-whitening is applied and required; `link::packet` checks the range, version and pad rejection;
+whitening is applied and required; `link::packet` checks the payload, version, SEQ and pad rejection;
 `fec_false_accept.rs` checks that random bodies (0/4/8 erasures) never decode and offer < 0.1 / 0.35 /
 1.3 candidates per body, and that MFSK traffic into `ltc2400_fec`, uncoded LTC into `ltc_fec` and AML v1
 traffic into `robust_fec` never decode and stay below 0.9 / 0.15 / 0.15 candidates per false body (the
@@ -350,6 +352,48 @@ except `ltc2400_fec` with a 10 ms dropout (−0.7) and `robust_fec` at −4 dB (
 wins far beyond the code's radius, in a region where that profile is not usable anyway), and the
 whitening changes the bit patterns on air, which moves pattern-sensitive cells both ways (`ltc_fec`
 behind +12 dB of EQ at 3 kHz: +53; −12 dB: −0.9).
+
+### 9.7 Message set of AML v1.1: all MIDI channels and MSC
+
+AML v1.1 (spec §5) carries every MIDI 1.0 short message on all 16 channels (one `Midi` type whose
+payload is the status byte and the data bytes) and MIDI Show Control with cue numbers 0–999.9 and
+cue lists 1–15 (`Msc`). That is more information per packet than the six v1.0 types, and every valid
+encoding is one more block a random candidate can match: the structure check (§9.1) must still leave
+enough redundancy. Counted over all byte values (`canonical_payloads` in `fec_false_accept.rs`):
+
+| type | canonical payloads (of 2²⁴) |
+|---|---|
+| Midi: 80 three-byte channel statuses × 2¹⁴ (minus NoteOn velocity 0), 32 two-byte × 2⁷, Song Position 2¹⁴, Song Select 2⁷, Tune Request 1 | 1,329,281 |
+| Msc: 5 cue commands × (1 + 10,000 cues × 16 list values), LOAD 160,000, FIRE 128, 3 without data, 11 list commands 174 | 960,310 |
+| Heartbeat, Panic (24 pad bits each) | 1 + 1 |
+
+Carrying the channel alone costs 4 bits, so at the v1.0 header layout the structure would have
+dropped from 17.4 to 10.9 bits (90× more false accepts). The SEQ byte pays for it: SEQ is now a 2-bit
+counter and its six upper bits are reserved zero (spec §4.1). Duplicate suppression only needs message
+`n` and `n + 4` to differ, and they are always more than a dedup window apart (the window is shorter
+than two messages). Structure per random candidate: version 2⁻⁴ × SEQ 2⁻⁶ × Σ over types of
+2⁻⁴ × (canonical payloads / 2²⁴) = **8.3 × 10⁻⁶ = 2⁻¹⁶·⁸⁷** (v1.0: 5.8 × 10⁻⁶ = 2⁻¹⁷·⁴), i.e.
+**1.44× more** false accepts per candidate. The simulated random bodies agree (7 / 8 gate erasures:
+5.9 / 9.8 × 10⁻⁶ per candidate). Of the residual false messages 58 % would be MIDI and 42 % MSC; a false
+MSC GO is 7 % of them, 1.22× as likely per candidate as with v1.0 MscLite.
+
+Measured (`false_accept_report`, `FALSE_SECONDS=120`, same signals as §9.4):
+
+| profile | signal | candidates / min | years per false message |
+|---|---|---|---|
+| ltc_fec | MFSK traffic | 37 | 404 |
+| ltc_fec | uncoded LTC (misconfigured TX) | 123 | 122 |
+| ltc2400_fec | MFSK traffic | 77 | **196** |
+| ltc2400_fec | music-like / speech-like | 2.0 / 1.5 | 7,500 / 10,000 |
+| ltc2400_fec | uncoded LTC (misconfigured TX) | 89 | 169 |
+| ltc9600_fec | uncoded LTC (misconfigured TX) | 241 | **62** |
+| robust_fec | AML v1 Robust / Fast traffic | 4 | 3,700 |
+
+No candidate passed the structure check and no false message was observed; white noise, clicks and
+SMPTE LTC produced no candidate on any profile. The worst cases are 196 years for natural audio and
+62 years for a misconfigured transmitter, still 20× and 6× better than the 10-year target. Keeping 17.4
+bits would have meant cue lists 1–3 or no cue decimals, or a 1-bit SEQ whose dedup margin is half a
+repetition; the 0.5 bit was judged the better trade.
 
 ## 10. Acquisition hardening
 
