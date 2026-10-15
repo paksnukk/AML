@@ -382,8 +382,9 @@ GF(16) RS decodes), not per sample. The TX is unchanged and cheap: per sample it
 ## 9. LTC + FEC
 
 The link-layer FEC of `docs/proposals/fec.md` (two interleaved RS(7 + p, 7) codewords over GF(16),
-errors-and-erasures decoding plus up to 36 low-reliability erasure candidates, every candidate checked
-by the unchanged CRC-16 / version / type / pad) works on nibbles and does not care how they reached the
+errors-and-erasures decoding plus low-reliability erasure candidates within an errata-weight bound,
+every candidate checked by the unchanged CRC-16 / version / type / pad / payload ranges, body XORed with
+a whitening sequence; see `fec.md` §9 for the false-accept measures) works on nibbles and does not care how they reached the
 wire. On BMC each extra parity nibble costs 0.83 ms at 4800 bit/s. The question was whether it
 improves LTC, and at what cost compared with simply halving the bit rate.
 
@@ -506,6 +507,10 @@ with the parity-4 body.
 | inverted + SNR 6 | 100 | 86.2 | 100 | 100 | 100 | 100 | 99.9 |
 | level -40 dB + SNR 8 | 100 | 99.1 | 100 | 100 | 100 | 100 | 99.9 |
 
+(Measured before the false-accept measures of `fec.md` §9. They move the FEC columns by ≤ 1 point
+except `ltc9600_fec` at SNR 2 / 1 / 0 dB (−2 to −3), `ltc9600_fec` dropout 3 ms (+2.4), `ltc2400_fec`
+HP 1 kHz (+2.2), `ltc_fec` EQ ±12 dB at 3 kHz (+53 / −0.9); see `fec.md` §9.6.)
+
 | profile | body nibbles | burst | airtime / msg | decode delay (sim) | engine loopback mean / p95 / jitter |
 |---|---|---|---|---|---|
 | ltc | 16 | 15.9 ms | 16.9 ms | 16.5 ms | 22.0 / 25.5 / 2.5 ms |
@@ -601,10 +606,18 @@ CRC / FEC and failed):
 The hard-decision receiver never completed a body on these signals. The correlator is more permissive
 (that is where its sensitivity comes from); without the two body gates of §9.1 white noise produced
 ~40–80 failed bodies per minute and MFSK ~240–320. Each failed body is one CRC check without FEC, and
-up to 36 candidate checks with it, each passing with probability ≈ 2⁻¹⁶ (CRC) × 2⁻⁸ (version, type,
-zero pad). At 100 bodies per minute, with every body using all 36 candidates (the worst case), that is about
-one false message per 80 hours of continuous MFSK traffic into an `ltc_fec` receiver, and ~36× less
-for `ltc`. Acceptable for an experiment; to be bounded properly (as for `robust_fec`) before the spec. The cross-decode test (`mfsk_and_bmc_do_not_cross_decode`) passes for
+with it as many checks as the decoder finds candidates.
+
+**Bounded since** (`fec.md` §9): the first estimate (36 candidates per body, one false message per
+~80 h of MFSK traffic into `ltc_fec`) was replaced by a measurement of the pre-CRC rate. With the decoder
+of this section the real numbers were 1.7–1.9 candidates per MFSK false body and one false message per
+~1,300 h (`ltc_fec`) and ~530 h (`ltc2400_fec`) of continuous MFSK traffic, and per 1.7–7 h of traffic
+from a misconfigured transmitter (`ltc` into an `ltc*_fec` receiver). Payload range checks, a body-level
+errata-weight bound on the candidates and a whitened body bring the worst measured case to 185 years
+(MFSK traffic into `ltc2400_fec`) and 89 years (`ltc` into `ltc9600_fec`), against a target of at most
+one per 10 years. White noise, clicks, music-like and speech-like audio and SMPTE LTC produce no false
+body at all, or (music, speech into `ltc2400_fec`) ≥ 5,000 years. Delivery moved by ≤ 0.5 points in the
+key cells (`ltc_fec`, `ltc2400_fec`: SNR, clicks, dropouts) (`fec.md` §9.6). The cross-decode test (`mfsk_and_bmc_do_not_cross_decode`) passes for
 all six LTC profiles.
 
 ### 9.7 "Decode failed → rewind" for BMC
@@ -623,8 +636,8 @@ with a soft receiver anyway (it needs the samples), and costs a buffer.
   dropouts up to ~10 ms are expected. All stay experimental.
 * The soft-decision receiver replaces the hard-decision one for every `ltc*` profile: it is better in
   every measured condition and costs ~50 more multiply-adds per sample.
-* Open: field data (real converter chains, Dante packet loss) to confirm parity 4, and the
-  miscorrection bound of §9.6.
+* Open: field data (real converter chains, Dante packet loss) to confirm parity 4. The
+  miscorrection bound of §9.6 is done (`fec.md` §9).
 
 Reproduce:
 

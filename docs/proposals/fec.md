@@ -31,8 +31,12 @@ abandons a lock on the first body symbol that fails the detection gate.
   of 4 wrong tones or 8 erased symbols.
 - **Decoder.** Errors-and-erasures (Forney syndromes, Berlekamp–Massey, Chien, Forney). A small
   GMD search adds 0..4 extra erasures on the lowest-`confidence_db` symbols and finally tries
-  errors-only. Each codeword yields at most 6 candidates. A candidate pair is accepted only if the
-  CRC-16, version, type and zero padding all check out.
+  errors-only. Each codeword yields at most 5 distinct candidates. A candidate pair is tried only if
+  its errata weight `Σ(2e + f)` is at most 8 (or it changes at most one symbol besides the gate
+  erasures), lightest first, and accepted only if the CRC-16, version, type, zero padding and payload
+  ranges all check out (§9).
+- **Whitening.** The 22 body nibbles are XORed with a fixed sequence (`fec::WHITENING`), so a body
+  without FEC on the same phy does not line up with the packet checks (§9).
 - **RX changes (only with FEC):** a body symbol that fails the gate is kept as an erasure, up to 8 per
   body (above that the attempt is abandoned and rewinds as today). One preamble symbol after the
   first may also fail, because the coded body + CRC now verify the lock. Without this change, the
@@ -48,18 +52,21 @@ preamble-miss handling in `phy/demod.rs`. `ModemStats::fec_corrected` counts the
 |---|---|---|
 | Preamble | `A 5 C 3` | unchanged (RX tolerates 1 miss after the first) |
 | Packet bytes (HDR, SEQ, PAYLOAD, CRC-16) | — | unchanged |
-| Body | 16 nibbles, block-interleaved (depth 4) | 22 nibbles: 2 × RS(11,7), symbol-interleaved |
+| Body | 16 nibbles, block-interleaved (depth 4) | 22 nibbles: 2 × RS(11,7), symbol-interleaved, XOR whitening |
 | Copies K | 2 | 1 |
 | On-wire per message | 2 × 21 periods = 273 ms | 27 periods = 175.5 ms |
 
 - **No header flag is possible.** The header sits inside the codeword, and the receiver has to know
   the body length before it can decode. The FEC mode must be a profile setting on both ends, the
   same way Robust and Fast are today (profiles are not signalled on the wire).
-- **Coexistence is safe.** A mismatched receiver locks the preamble, reads the wrong body length,
-  fails CRC and drops the packet. No false messages.
+- **Coexistence.** A mismatched receiver locks the preamble, reads the wrong body length and
+  normally drops the packet. Before §9 this was not safe enough: AML v1 Robust/Fast traffic into a
+  `robust_fec` receiver reached the CRC with ~1000 candidates per minute, about one false message
+  per day of continuous traffic. With the measures of §9 it is ≳ 4,000 years.
 - **Spec changes if adopted:** a new §4.6 "Body FEC" (field polynomial `x^4+x+1`, generator roots
   α^1..α^4, systematic, wire order data-first/highest-degree-first, two codewords over
-  data nibbles 0–6 and 7–13, alternating on the wire). §4.3 interleave applies to uncoded profiles
+  data nibbles 0–6 and 7–13, alternating on the wire, XORed with the whitening sequence, and the
+  receiver acceptance rules of §9: weight bound and payload ranges). §4.3 interleave applies to uncoded profiles
   only. In §4.4 the dedup window uses the profile's body length. §3.2 gets the erasure and
   preamble-miss rules. §6 gets a new profile entry. `PROTOCOL_VERSION` can stay `0x1`: the packet
   format is identical, only the body coding differs per profile.
@@ -92,7 +99,8 @@ with another tone (plus SNR 20 dB). A dropout mutes one stretch at a random posi
 | low-pass 2.5 kHz, SNR 6 | 100 | 98.5 | **99.0** | 98.8 | 100 |
 | drift 500 ppm, SNR 0 | 100 | 98.5 | **98.8** | 98.8 | 100 |
 
-No cell produced a false message. The no-preamble-tolerance variant (first prototype) scored worse
+No cell produced a false message. (Measured before the false-accept measures of §9; they move the
+`fec p4 K1` cells by at most 1.1 points, see §9.6.) The no-preamble-tolerance variant (first prototype) scored worse
 at K = 1, because the preamble was then the main loss: wrong tone 1/2/5 % = 96.8/92.8/77.0,
 AWGN −3 dB = 62.5, dropout 10 ms = 93.0.
 
@@ -158,13 +166,181 @@ did not help: the reliability-ordered candidates already cover them. See `docs/p
   already happens with uncoded bodies. Tolerating erasures and preamble misses makes it somewhat more
   likely, though the stuck-note run shows a net gain. The fix is a "decode failed → rewind" hook
   from the modem to the phy.
-- **Miscorrection budget.** Up to 36 candidate pairs are CRC-checked per body. A rough bound on
-  undetected error is 36 × 2⁻¹⁶ × P(junk decodes) × (version/type/pad filters ≈ 2⁻⁸), which is
-  negligible. No false message was seen in any test (noise, random tone streams, all impairments).
-  The bound still needs a proper analysis before this goes in the spec.
+- **Miscorrection budget.** Analysed, measured and bounded in §9.
 - **Variable body length.** NoteOn needs only 12 data nibbles, so 2 × RS(10,6) = 20 symbols would
   save 13 ms. It would require the type to be known early, e.g. a separately protected first codeword.
 - **Parity per profile.** Is 4 right for real converter chains? A field trial with
   `fec_corrected` / CRC stats on real Dante/MADI/analog paths should decide it.
 - **Should the preamble-miss rule be part of the FEC mode or a separate phy knob?** In the prototype
   it is tied to `FecMode` to keep `PhyConfig` changes minimal.
+
+## 9. False accepts: analysis, target, measures
+
+A false message needs three things: a false lock whose body passes the phy gates (a **false body**), a
+pair of RS decodings of it (a **candidate**: both decoders report success, the pre-CRC event), and a
+candidate that passes every packet check. The erasure-tolerant decoder makes the second step easy, so
+the question is how often the third one happens. The soft-decision LTC receiver made it urgent: back-to-back
+MFSK audio into an `ltc_fec` receiver produces ~110 false bodies per minute (`ltc2400_fec`: ~310),
+where the old receiver produced none.
+
+### 9.1 Analytic model
+
+Treat a candidate as a uniformly random 14-nibble data block. It must have version `1` (4 bits), a
+known type (6 of 16), zero bytes after the packet (pad) and, new, a payload within the ranges of spec §5
+(MIDI data bytes < 0x80; MscLite `cmd` 0–3, `cuelist` 0–15, `cue` 0–127). Then the CRC-16.
+
+| type | pad bits | range bits | pass, v1 checks | pass, + range checks |
+|---|---|---|---|---|
+| NoteOn | 8 | 2 | 2⁻⁸ | 2⁻¹⁰ |
+| NoteOff, ProgramChange | 16 | 1 | 2⁻¹⁶ | 2⁻¹⁷ |
+| MscLite | 0 | 11 | 1 | 2⁻¹¹ |
+| Heartbeat, Panic | 24 | 0 | 2⁻²⁴ | 2⁻²⁴ |
+
+Per candidate, structure (version, type, pad, ranges) passes with probability 2⁻⁸ × Σ = **3.9 × 10⁻³**
+with the v1 checks (8.0 bits: MscLite has no pad and dominated) and **5.8 × 10⁻⁶** with the range
+checks (17.4 bits). With the CRC (2⁻¹⁶) a candidate becomes a message with probability
+**6.0 × 10⁻⁸** (24 bits) before and **8.8 × 10⁻¹¹** (33.4 bits) after. Of the residual false messages
+66 % would be NoteOn and 33 % MscLite (8 % MSC GO).
+
+Candidates per false body: per codeword the decoder tries the gate erasures plus 0–4 extra erasures on
+the weakest symbols and errors-only, so at most 5 distinct decodings, at most **25 pairs** (not 36 as
+§8 and `ltc-bmc.md` §9.6 first estimated). A random word lies within errors-only radius 2 of an RS(11,7)
+codeword with probability 12541/16⁴ = 0.19, and the 4-erasure attempt always "succeeds" (it has no
+redundancy left to fail), so every random body offers candidates. Simulated (`random_bodies`, uniformly
+random nibbles and reliabilities):
+
+| gate erasures in the body | 0 | 2 | 4 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|
+| candidates per body, before | 2.35 | 2.34 | 2.02 | 1.64 | 1.52 | 1.45 |
+| candidates per body, after (§9.3) | 0.04 | 0.08 | 0.18 | 0.31 | 0.85 | 1.02 |
+
+Per false body: before 2.35 × 6.0 × 10⁻⁸ ≈ **1.4 × 10⁻⁷**; after 0.04–1.02 × 8.8 × 10⁻¹¹ ≈
+**3.5 × 10⁻¹² – 9 × 10⁻¹¹**, 1,500–40,000 times less.
+
+### 9.2 Target
+
+**At most one false message per 10 years of continuous worst-case audio, per receiver.** Ten years is
+about the service life of a show rig, and continuous worst-case audio is pessimistic (a receiver's input
+is mostly Cricket traffic or silence), so a rig should never see one. A false NoteOn is audible but
+recoverable (NoteOff refreshes, link-dead); a false MSC GO fires a cue, which is worse, and is 8 % of the
+residual, i.e. ≥ 125 years at the target. "Worst-case audio" covers what a receiver can plausibly be fed:
+other Cricket profiles (MFSK traffic, and a transmitter on the same phy without FEC, i.e. a
+misconfigured end), white noise, clicks, music, speech and SMPTE timecode.
+
+### 9.3 Measures
+
+1. **Payload range checks** (`MessageType::payload_in_range`, used by `link::fec_candidate_is_valid`):
+   ×680 on random candidates, free (a transmitter never sends out-of-range values). Applied to FEC
+   candidates only; uncoded AML v1 decoding is unchanged.
+2. **Body-level errata-weight bound.** A candidate pair is tried only if `Σ(2e + f) ≤ 2 × parity` (8) —
+   `e` = changed symbols that passed the gate, `f` = gate erasures, counted over the whole body however
+   GMD found the codeword — or if it changes at most one symbol besides the gate erasures (a dropout
+   plus one weak symbol). Pairs are tried lightest first. GMD can still fix an uneven split (3 errors in
+   one codeword, ≤ 1 in the other) but no longer offers codewords far beyond the code's radius, which are
+   what random bodies decode to. Candidates per random body 2.35 → 0.04; per MFSK false body 1.7–1.9
+   → 0.4–0.5.
+3. **Whitening.** The coded body is XORed with a fixed sequence (`fec::WHITENING`), making it a coset
+   of the code. Without it, an uncoded body on the same phy (an `ltc` transmitter into an `ltc_fec`
+   receiver, or Robust into `robust_fec`) lines up with the checks: its first nibble is the version, its
+   pad nibbles are zero, its payload is in range: a third of its candidates had a valid header and 1 in 19
+   passed every check but the CRC (random: 1 in 255), one false message every 2–22 hours of traffic
+   (table below). The first mask
+   nibble is `0x8`, so the version nibble goes on air as `1001`; with `0x2` (`0011`) `ltc2400_fec`
+   behind a 1 kHz high-pass lost 6 points (the bits right after the BMC sync matter there), with `0x8`
+   it gains 2.
+
+Considered and not chosen: a tighter bound (`Σ ≤ 7` or `≤ 6`, another 10–100× fewer candidates, but
+−1 to −3 points at SNR ≤ 0 dB and under clicks, where the GMD wins live); the bound without the
+one-error exception (−7.5 points for `ltc9600_fec` with a 3 ms dropout); skipping the GMD search on
+low-quality bodies (the bound already removes what matters; true GMD wins are within it); stricter
+phy gates for bodies that need correction (MFSK false bodies have the same mean reliability as true
+bodies at 0 dB SNR, so there is no clean separation).
+
+Cost: per body the same ≤ 10 RS decodes as before, plus an 11-symbol compare per candidate, a sort of
+≤ 25 pairs and 22 XORs; fewer CRC checks. `no_std` + `alloc` unchanged.
+
+### 9.4 Measurements
+
+`cricket_core/tests/fec_false_accept.rs`, `false_accept_report` (10 minutes of each signal per profile,
+`FALSE_SECONDS=600`). It runs the modem's receive flow, counts false bodies, candidates (pre-CRC) and
+candidates passing the structure, and estimates years per false message as
+`1 / (max(observed structural passes, candidates × P(structure)) × 2⁻¹⁶)`. Signals: back-to-back MFSK
+traffic (Robust, Fast, Robust FEC at SNR 20 dB), white noise (σ = 0.003, 0.05, 0.5), clicks (100/s and
+1000/s, 1–4 samples, random level and sign), music-like (1–3 voices of harmonic and square-ish tones with
+envelopes, drum hits, pink noise), speech-like (pitch-varying pulse train through three formant
+resonators, syllable envelope, pauses, fricative noise), SMPTE LTC at 25 and 30 fps, and transmitters
+without FEC on the same phy (uncoded LTC at the profile's rate into the LTC FEC profiles; AML v1 Robust
+and Fast into `robust_fec`). "Before" is main at 7bcc900 (the same harness with that decoder).
+
+| profile | signal | false bodies / min | candidates / min, before → after | years per false message, before → after |
+|---|---|---|---|---|
+| ltc_fec | MFSK traffic | 110 | 207 → 43 | 0.15 (1,300 h) → **510** |
+| ltc_fec | uncoded LTC (misconfigured TX) | 3,240 | 5,815 → 124 | 0.0004 (3.5 h) → **175** |
+| ltc2400_fec | MFSK traffic | 312 → 237¹ | 522 → 116 | 0.061 (530 h) → **185** |
+| ltc2400_fec | music-like | 19 | 42 → 0 | 0.75 → > 70,000² |
+| ltc2400_fec | speech-like | 16 | 31 → 4 | 1.0 → 5,400 |
+| ltc2400_fec | uncoded LTC (misconfigured TX) | 1,620 | 2,950 → 82 | 0.0008 (7 h) → **260** |
+| ltc9600_fec | uncoded LTC (misconfigured TX) | 6,470 | 11,600 → 241 | 0.0002 (1.7 h) → **89** |
+| robust_fec | AML v1 Robust / Fast traffic | 441 | 1,014 → 4.6 | 0.0025 (22 h) → **4,700** |
+
+¹ The MFSK signal contains `robust_fec` bursts, whose whitened bodies differ. ² No candidate in 10 min.
+
+No false body at all in 10 minutes (before or after) for white noise, clicks and SMPTE LTC on every
+profile, music and speech on `ltc_fec` and `ltc9600_fec`, MFSK on `ltc9600_fec`, and every signal except
+AML v1 traffic on `robust_fec`. Even at the 95 % bound for zero (3 bodies per 10 minutes, each with
+1.02 candidates) that is > 70,000 years. No false message was observed in any run.
+
+The physical ceiling is one false body per body length (the misconfigured-transmitter rows are close
+to it). If every slot held a body with 8 erasures, the rate would be one false message per ~6.5 years at
+4800 bit/s (13 at 2400, 3 at 9600). No natural signal comes near that: it needs a valid sync and a
+dropout in every body.
+
+**Result: the worst measured case is 185 years for natural audio (MFSK traffic into `ltc2400_fec`) and
+89 years for a misconfigured transmitter (`ltc` into `ltc9600_fec`), 18× and 9× better than the
+target; before, it was 530 hours and 1.7 hours.**
+
+### 9.5 Regression tests
+
+Fast (`cargo test`): `link::fec` unit tests check that a body GMD could decode beyond the bound is not
+offered to the CRC, that a dropout plus one weak symbol still decodes and two do not, and that the
+whitening is applied and required; `link::packet` checks the range, version and pad rejection;
+`fec_false_accept.rs` checks that random bodies (0/4/8 erasures) never decode and offer < 0.1 / 0.35 /
+1.3 candidates per body, and that MFSK traffic into `ltc2400_fec`, uncoded LTC into `ltc_fec` and AML v1
+traffic into `robust_fec` never decode and stay below 0.9 / 0.15 / 0.15 candidates per false body (the
+old decoder: 2.35 per random body, 1.8 per MFSK body). The full measurement is the ignored
+`false_accept_report`:
+
+```sh
+FALSE_SECONDS=600 cargo test --release -p cricket_core --test fec_false_accept -- --ignored --nocapture
+```
+
+### 9.6 Delivery before and after
+
+Same harnesses and seeds as §4 and `ltc-bmc.md` §9.3, 1000 trials per cell. "Before" is main at 7bcc900.
+
+| channel | ltc_fec | ltc2400_fec | ltc9600_fec |
+|---|---|---|---|
+| SNR 4 dB | 99.8 → 99.9 | 100 → 100 | 97.3 → 97.3 |
+| SNR 2 dB | 99.4 → 99.5 | 100 → 100 | 86.1 → 84.0 |
+| SNR 1 dB | 98.9 → 98.8 | 99.8 → 99.9 | 63.2 → 60.2 |
+| SNR 0 dB | 96.2 → 96.3 | 99.7 → 99.8 | 28.6 → 26.1 |
+| clicks 200/s @ +6 dB | 99.4 → 98.9 | 99.8 → 99.8 | 92.8 → 91.8 |
+| clicks 100/s @ +12 dB | 92.9 → 92.4 | 98.5 → 98.1 | 91.5 → 91.8 |
+| dropout 1 ms | 95.8 → 95.6 | 100 → 100 | 91.9 → 91.9 |
+| dropout 3 ms | 92.3 → 92.2 | 92.6 → 92.6 | 62.3 → 64.7 |
+| dropout 10 ms | 0 → 0 | 82.2 → 81.5 | 0 → 0 |
+| EQ +12 dB @ 3 kHz | 2.6 → 55.2 | 100 → 100 | 27.7 → 27.6 |
+| EQ −12 dB @ 3 kHz | 99.6 → 98.7 | 99.8 → 99.8 | 100 → 100 |
+| HP 1000 Hz | 100 → 100 | 79.3 → 81.5 | 100 → 100 |
+| drift +1 % + SNR 6 | 100 → 100 | 100 → 100 | 97.8 → 96.9 |
+
+All other LTC cells moved by ≤ 0.6 points. `robust_fec` (`fec p4 K1` in §4, 1000 trials): AWGN
+0 / −2 / −3 / −4 dB 98.3 / 92.0 / 75.3 / 17.8 → 98.4 / 92.2 / 75.6 / 16.7; wrong tone 1 / 2 / 5 / 10 %
+98.8 / 98.1 / 91.1 / 74.9 → 98.8 / 98.1 / 90.9 / 74.9; dropout 10 / 30 / 60 ms 96.2 / 95.3 / 70.5 →
+96.2 / 95.3 / 70.7; the rest unchanged.
+
+The key cells (SNR, clicks, dropouts on `ltc_fec`, `ltc2400_fec`, `robust_fec`) are within 0.5 points,
+except `ltc2400_fec` with a 10 ms dropout (−0.7) and `robust_fec` at −4 dB (−1.1). The trade-offs: `ltc9600_fec` at SNR ≤ 2 dB loses 2–3 points (GMD
+wins far beyond the code's radius, in a region where that profile is not usable anyway), and the
+whitening changes the bit patterns on air, which moves pattern-sensitive cells both ways (`ltc_fec`
+behind +12 dB of EQ at 3 kHz: +53; −12 dB: −0.9).
