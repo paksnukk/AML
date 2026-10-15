@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use cricket_core::phy::PhyConfig;
-use cricket_core::transport::TransportMessage;
+use cricket_core::transport::{MscCommand, MscCue, MscMessage, MscTarget, TransportMessage};
 use cricket_core::wav::{read_wav_f32, write_wav_f32};
 use cricket_engine::measure_midi_loopback;
 use cricket_engine::{
-    audio, midi, AlarmKind, AudioIn, AudioOut, DecoderConfig, DecoderHandle, DeviceSelector,
-    EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
+    audio, format_message, midi, AlarmKind, AudioIn, AudioOut, DecoderConfig, DecoderHandle,
+    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut,
 };
 use std::sync::mpsc::Receiver;
 
@@ -71,6 +71,16 @@ enum Commands {
         /// Output MIDI port by exact name
         #[arg(long, value_name = "NAME", conflicts_with = "midi_out")]
         midi_out_name: Option<String>,
+
+        /// MSC device ID put on MSC output (0–127, decimal or 0x hex;
+        /// 0x7F = all-call)
+        #[arg(long, value_name = "ID", value_parser = parse_7bit, default_value = "0x7F")]
+        msc_device_id: u8,
+
+        /// MSC command format put on MSC output (0x01 Lighting (General),
+        /// 0x10 Sound (General), 0x7F All-types, …)
+        #[arg(long, value_name = "FORMAT", value_parser = parse_7bit, default_value = "0x01")]
+        msc_format: u8,
     },
     /// List available Audio and MIDI devices
     ListDevices,
@@ -119,10 +129,16 @@ fn main() -> Result<()> {
             audio_in_name,
             midi_out,
             midi_out_name,
+            msc_device_id,
+            msc_format,
         } => {
             run_decoder(
                 selector(*audio_in, audio_in_name),
                 selector(*midi_out, midi_out_name),
+                MscTarget {
+                    device_id: *msc_device_id,
+                    command_format: *msc_format,
+                },
                 profile,
             )?;
         }
@@ -138,6 +154,19 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// A 7-bit value, decimal or `0x` hex.
+fn parse_7bit(s: &str) -> Result<u8, String> {
+    let v = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16),
+        None => s.parse::<u8>(),
+    }
+    .map_err(|e| format!("{}: {}", s, e))?;
+    if v > 0x7F {
+        return Err(format!("{} is above 0x7F", s));
+    }
+    Ok(v)
 }
 
 /// Device from an index flag or a name flag (clap rejects both at once);
@@ -175,11 +204,33 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>, profile: &str) -> 
     let config = PhyConfig::from_name(profile);
     let messages = vec![
         TransportMessage::NoteOn {
+            channel: 0,
             note: 60,
             velocity: 100,
         },
-        TransportMessage::NoteOff { note: 60 },
-        TransportMessage::ProgramChange { program: 10 },
+        TransportMessage::ControlChange {
+            channel: 9,
+            controller: 7,
+            value: 90,
+        },
+        TransportMessage::PitchBend {
+            channel: 15,
+            value: 12_000,
+        },
+        TransportMessage::NoteOff {
+            channel: 0,
+            note: 60,
+            velocity: 40,
+        },
+        TransportMessage::ProgramChange {
+            channel: 2,
+            program: 10,
+        },
+        TransportMessage::Msc(MscMessage::cue(
+            MscCommand::Go,
+            MscCue::from_tenths(145).expect("in range"),
+            Some(1),
+        )),
         TransportMessage::Heartbeat,
     ];
 
@@ -204,17 +255,14 @@ fn run_test_mode(wav_out: Option<&str>, wav_in: Option<&str>, profile: &str) -> 
     let decoded = cricket_core::decode_samples(config, &samples);
     println!("Decoded {} messages:", decoded.len());
     for m in &decoded {
-        println!("  {:?}", m);
+        let (kind, payload) = format_message(m);
+        println!("  {} {}", kind, payload);
     }
 
     if wav_in.is_none() {
-        // Filter heartbeats optionally — expect at least note on/off/program
-        assert!(decoded
-            .iter()
-            .any(|m| matches!(m, TransportMessage::NoteOn { .. })));
-        assert!(decoded
-            .iter()
-            .any(|m| matches!(m, TransportMessage::NoteOff { .. })));
+        if decoded != messages {
+            return Err(anyhow!("decoded messages differ from the sent ones"));
+        }
         println!("Test Passed!");
     }
     Ok(())
@@ -248,7 +296,10 @@ fn print_events(events: &Receiver<EngineEvent>, what: &str) -> Result<()> {
     for event in events {
         match event {
             EngineEvent::Log(line) => println!("{}", line),
-            EngineEvent::Decoded(msg) => println!("[MSG] {:?}", msg),
+            EngineEvent::Decoded(msg) => {
+                let (kind, payload) = format_message(&msg);
+                println!("[MSG] {} {}", kind, payload);
+            }
             EngineEvent::Alarm {
                 kind: AlarmKind::LinkDead,
                 ..
@@ -262,7 +313,12 @@ fn print_events(events: &Receiver<EngineEvent>, what: &str) -> Result<()> {
     Err(anyhow!("{} stopped", what))
 }
 
-fn run_decoder(audio_in: DeviceSelector, midi_out: DeviceSelector, profile: &str) -> Result<()> {
+fn run_decoder(
+    audio_in: DeviceSelector,
+    midi_out: DeviceSelector,
+    msc: MscTarget,
+    profile: &str,
+) -> Result<()> {
     println!("Initializing Cricket decoder...");
     let midi_out = match midi_out {
         DeviceSelector::Default => MidiOut::None,
@@ -277,6 +333,7 @@ fn run_decoder(audio_in: DeviceSelector, midi_out: DeviceSelector, profile: &str
         midi_out,
         profile: profile.into(),
         link_dead_ms: None,
+        msc,
     })?;
     print_events(dec.events(), "Decoder")
 }

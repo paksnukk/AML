@@ -17,7 +17,8 @@ pub mod settings;
 use cricket_core::phy::PhyConfig;
 use cricket_engine::{
     audio, format_message, link_state_name, midi, AudioIn, AudioOut, DecoderConfig, DecoderHandle,
-    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut, TransportMessage,
+    DeviceSelector, EncoderConfig, EncoderHandle, EngineEvent, MidiIn, MidiOut, MscTarget,
+    TransportMessage,
 };
 use settings::{load_settings, save_settings, AppSettings};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -294,7 +295,8 @@ fn encoder_panic(state: State<'_, AppState>) -> Result<(), String> {
 
 /// Start the decoder. `audio_in` / `midi_out` are device names as listed by
 /// `get_input_devices` / `get_midi_outputs` (`None` = default audio input /
-/// no MIDI out). A name that is not present fails in the engine (reported as
+/// no MIDI out). `msc_device_id` / `msc_command_format` address the MSC
+/// SysEx sent to MIDI out (`None` = all-call `0x7F` / Lighting `0x01`). A name that is not present fails in the engine (reported as
 /// a log line); no other device is picked. Returns the run id carried by
 /// this run's `worker_stopped` event.
 #[tauri::command]
@@ -304,8 +306,15 @@ fn start_decoder(
     audio_in: Option<String>,
     midi_out: Option<String>,
     profile: String,
+    msc_device_id: Option<u8>,
+    msc_command_format: Option<u8>,
 ) -> Result<u64, String> {
     let mut slot = state.decoder.lock().unwrap();
+    let defaults = MscTarget::default();
+    let msc = MscTarget {
+        device_id: msc_device_id.unwrap_or(defaults.device_id) & 0x7F,
+        command_format: msc_command_format.unwrap_or(defaults.command_format) & 0x7F,
+    };
     shutdown(slot.take(), DecoderHandle::stop);
 
     let mut handle = DecoderHandle::start(DecoderConfig {
@@ -316,6 +325,7 @@ fn start_decoder(
         },
         profile,
         link_dead_ms: None,
+        msc,
     })
     .map_err(|e| e.to_string())?;
     let run = Run {

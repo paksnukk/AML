@@ -113,12 +113,16 @@ pub fn open_output(selector: &DeviceSelector) -> Result<midir::MidiOutputConnect
         .map_err(|e| anyhow!("MIDI connect: {}", e))
 }
 
-/// Connect to the selected input port; `on_message` gets every message.
+/// Connect to the selected input port; `on_message` gets every message
+/// except MIDI clock / MTC / active sensing (SysEx is delivered, for MSC).
 pub fn open_input(
     selector: &DeviceSelector,
     mut on_message: MidiCallback,
 ) -> Result<midir::MidiInputConnection<()>> {
-    let midi_in = midir::MidiInput::new("cricket encode in").map_err(|e| anyhow!("{}", e))?;
+    let mut midi_in = midir::MidiInput::new("cricket encode in").map_err(|e| anyhow!("{}", e))?;
+    // SysEx must come through (MSC); clock, MTC and active sensing are not
+    // carried, so drop them at the source.
+    midi_in.ignore(midir::Ignore::TimeAndActiveSense);
     let ports = midi_in.ports();
     let index = port_index(selector, &port_names(&midi_in, &ports), "in")?;
     let port = &ports[index];

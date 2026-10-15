@@ -15,7 +15,7 @@ mod support;
 use cricket_core::link::FecMode;
 use cricket_core::modem::{repetition_samples, CricketModemRx, CricketModemTx, ModemOutput};
 use cricket_core::phy::PhyConfig;
-use cricket_core::transport::{MscCommand, TransportMessage};
+use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use support::{ChannelSim, XorShift64};
@@ -140,7 +140,7 @@ struct Cell {
     false_msgs: usize,
 }
 
-/// `trials` single-message transmissions (NoteOn, every 4th an MscLite;
+/// `trials` single-message transmissions (NoteOn, every 4th an MSC GO;
 /// random start offset; 64-sample chunks so delivery time has ~1.3 ms
 /// resolution). The dropout lands anywhere in the message.
 fn run_cell(config: &PhyConfig, imp: Imp, trials: usize, seed: u64) -> Cell {
@@ -152,20 +152,25 @@ fn run_cell(config: &PhyConfig, imp: Imp, trials: usize, seed: u64) -> Cell {
     };
     for t in 0..trials {
         let msg = if t % 4 == 3 {
-            TransportMessage::MscLite {
-                cmd: MscCommand::Go,
-                cuelist: rng.below(16) as u8,
-                cue: rng.below(128) as u8,
+            {
+                let list = rng.below(16) as u8;
+                let cue = rng.below(128) as u16;
+                TransportMessage::Msc(MscMessage::cue(
+                    MscCommand::Go,
+                    MscCue::from_tenths(cue * 10 + u16::from(list % 10)).unwrap(),
+                    (list > 0).then_some(list),
+                ))
             }
         } else {
             TransportMessage::NoteOn {
+                channel: 0,
                 note: rng.below(128) as u8,
                 velocity: 1 + rng.below(127) as u8,
             }
         };
         let offset = 200 + rng.below(400);
         let tx = CricketModemTx::new(config.clone());
-        let mut clean = tx.encode_message_with_seq(&msg, rng.below(256) as u8);
+        let mut clean = tx.encode_message_with_seq(&msg, rng.below(4) as u8);
         let msg_len = clean.len();
         clean.extend(std::iter::repeat_n(0.0, config.sample_rate_hz as usize / 8));
         let mut sim = imp.sim(config, rng.next_u64(), offset);
@@ -418,6 +423,7 @@ fn ltc_false_message_report() {
                         let mut i = 0usize;
                         while audio.len() < 48_000 * 20 {
                             audio.extend(tx.encode_message(&TransportMessage::NoteOn {
+                                channel: 0,
                                 note: (i % 128) as u8,
                                 velocity: 1 + (i * 7 % 127) as u8,
                             }));

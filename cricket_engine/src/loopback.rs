@@ -5,6 +5,7 @@
 use crate::memory::{MemoryAudio, MemoryMidiInjector, MemoryMidiInput, RecordingMidiSink};
 use crate::{
     AudioIn, AudioOut, DecoderConfig, DecoderHandle, EncoderConfig, EncoderHandle, MidiIn, MidiOut,
+    MscTarget,
 };
 use anyhow::{anyhow, Result};
 use cricket_core::modem::repetition_samples;
@@ -104,6 +105,7 @@ pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<Latency
         midi_out: MidiOut::Custom(Box::new(rec.clone())),
         profile: profile.into(),
         link_dead_ms: None,
+        msc: MscTarget::default(),
     })?;
 
     let (midi_in, injector) = MemoryMidiInput::new();

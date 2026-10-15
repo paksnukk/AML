@@ -1,13 +1,13 @@
 //! TX worker: MIDI in / injected messages → `CricketModemTx` → audio out.
 
 use crate::audio::{AudioOut, AudioSink};
-use crate::events::{AlarmKind, EngineEvent};
+use crate::events::{format_message, AlarmKind, EngineEvent};
 use crate::midi::{self, MidiCallback, MidiIn};
 use crate::{closed_receiver, Emitter, Worker};
 use anyhow::Result;
 use cricket_core::modem::{repetition_samples, CricketModemTx};
 use cricket_core::phy::PhyConfig;
-use cricket_core::transport::{midi_to_message, TransportMessage, TxScheduler};
+use cricket_core::transport::{midi_input, MidiInput, TransportMessage, TxScheduler};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -26,7 +26,14 @@ pub struct EncoderConfig {
     pub simulate: bool,
 }
 
-type Pending = Arc<Mutex<VecDeque<TransportMessage>>>;
+/// What the MIDI callback and [`EncoderHandle::send`] hand to the worker.
+enum Incoming {
+    Message(TransportMessage),
+    /// A message that cannot be carried exactly; reported, not sent.
+    Rejected(String),
+}
+
+type Pending = Arc<Mutex<VecDeque<Incoming>>>;
 
 /// A running encoder worker. Dropping it stops the worker.
 pub struct EncoderHandle {
@@ -55,7 +62,7 @@ impl EncoderHandle {
     /// Queue a message for transmission (same queue as MIDI input).
     pub fn send(&self, msg: TransportMessage) {
         if let Ok(mut q) = self.pending.lock() {
-            q.push_back(msg);
+            q.push_back(Incoming::Message(msg));
         }
     }
 
@@ -113,10 +120,13 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         let pending = pending.clone();
         move || -> MidiCallback {
             Box::new(move |message: &[u8]| {
-                if let Some(msg) = midi_to_message(message) {
-                    if let Ok(mut q) = pending.lock() {
-                        q.push_back(msg);
-                    }
+                let incoming = match midi_input(message) {
+                    MidiInput::Message(msg) => Incoming::Message(msg),
+                    MidiInput::Rejected(e) => Incoming::Rejected(format!("{} — not sent", e)),
+                    MidiInput::Ignored => return,
+                };
+                if let Ok(mut q) = pending.lock() {
+                    q.push_back(incoming);
                 }
             })
         }
@@ -192,12 +202,21 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         let tx_time = (stream_start.elapsed().as_secs_f64() * f64::from(stream_sample_rate)) as u64;
 
-        let incoming: Vec<TransportMessage> = pending
+        let incoming: Vec<Incoming> = pending
             .lock()
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
-        for msg in incoming {
-            scheduler.push(msg, tx_time);
+        for item in incoming {
+            match item {
+                Incoming::Message(msg) => scheduler.push(msg, tx_time),
+                Incoming::Rejected(message) => {
+                    ev.log(format!("WARNING: {}", message));
+                    ev.send(EngineEvent::Alarm {
+                        kind: AlarmKind::MessageRejected,
+                        message,
+                    });
+                }
+            }
         }
 
         if scheduler.note_on_dropped {
@@ -207,11 +226,19 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
 
         if use_sim && last_sim.elapsed() >= SIM_INTERVAL {
             if let Some(prev) = sim_sounding.take() {
-                scheduler.push(TransportMessage::NoteOff { note: prev }, tx_time);
+                scheduler.push(
+                    TransportMessage::NoteOff {
+                        channel: 0,
+                        note: prev,
+                        velocity: 64,
+                    },
+                    tx_time,
+                );
             }
             let note = 60 + scale[note_idx % scale.len()];
             scheduler.push(
                 TransportMessage::NoteOn {
+                    channel: 0,
                     note,
                     velocity: 100,
                 },
@@ -230,7 +257,8 @@ fn run(cfg: EncoderConfig, pending: Pending, ev: &Emitter, stop: &AtomicBool) {
         if buffered < refill_samples {
             if let Some(result) = scheduler.poll_detailed(tx_time + buffered) {
                 if result.user {
-                    ev.log(format!("TX {:?}", result.msg));
+                    let (kind, payload) = format_message(&result.msg);
+                    ev.log(format!("TX {} {}", kind, payload).trim_end().to_string());
                 }
                 let audio = if matches!(result.msg, TransportMessage::Heartbeat) {
                     tx.encode_heartbeat()

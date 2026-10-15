@@ -6,6 +6,13 @@ use alloc::vec::Vec;
 /// AML v1 is `0x1`; packets with any other version are rejected.
 pub const PROTOCOL_VERSION: u8 = 0x1;
 
+/// SEQ values: a 2-bit counter (0–3, wrapping). The upper six bits of the
+/// SEQ byte are reserved and must be zero (spec §4.1): duplicate suppression
+/// only needs SEQ to differ between consecutive messages (§4.4), and the
+/// reserved bits keep random data from passing as a packet
+/// (`docs/proposals/fec.md` §9.7).
+pub const SEQ_MODULUS: u8 = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub msg_type: MessageType,
@@ -18,8 +25,13 @@ pub enum PacketDecodeError {
     TooShort,
     BadCrc,
     UnknownType(u8),
-    BadPayloadLen { expected: usize, got: usize },
+    BadPayloadLen {
+        expected: usize,
+        got: usize,
+    },
     BadVersion(u8),
+    /// SEQ outside 0–3 (reserved bits set).
+    BadSeq(u8),
 }
 
 pub fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
@@ -48,6 +60,9 @@ pub fn encode_packet_bytes(packet: &Packet) -> Result<Vec<u8>, PacketDecodeError
             expected,
             got: packet.payload.len(),
         });
+    }
+    if packet.seq >= SEQ_MODULUS {
+        return Err(PacketDecodeError::BadSeq(packet.seq));
     }
     let hdr = (PROTOCOL_VERSION << 4) | (packet.msg_type as u8 & 0x0F);
     let mut body = Vec::with_capacity(2 + expected + 2);
@@ -83,6 +98,9 @@ pub fn decode_packet_bytes(bytes: &[u8]) -> Result<Packet, PacketDecodeError> {
     let msg_type =
         MessageType::from_u8(type_nibble).ok_or(PacketDecodeError::UnknownType(type_nibble))?;
     let seq = data[1];
+    if seq >= SEQ_MODULUS {
+        return Err(PacketDecodeError::BadSeq(seq));
+    }
     let payload = data[2..].to_vec();
     let expected = msg_type.payload_len();
     if payload.len() != expected {
@@ -99,11 +117,11 @@ pub fn decode_packet_bytes(bytes: &[u8]) -> Result<Packet, PacketDecodeError> {
 }
 
 /// Whether an FEC-decoded data block (packet nibbles + zero pad) holds a
-/// valid packet: CRC-16, version and type checks pass, the pad is zero and
-/// the payload is in range ([`MessageType::payload_in_range`]).
+/// valid packet: CRC-16, version, type and SEQ checks pass, the pad is zero
+/// and the payload is canonical ([`MessageType::payload_in_range`]).
 ///
 /// Besides the CRC-16 this leaves about 17 bits of structure a random block
-/// must also match (`docs/proposals/fec.md` §9), which is what keeps the
+/// must also match (`docs/proposals/fec.md` §9.7), which is what keeps the
 /// erasure-tolerant FEC decoder from turning noise into messages.
 pub fn fec_candidate_is_valid(nibbles: &[u8]) -> bool {
     let bytes = nibbles_to_bytes(nibbles);
@@ -114,9 +132,10 @@ pub fn fec_candidate_is_valid(nibbles: &[u8]) -> bool {
         return false;
     };
     let needed = 2 + msg_type.payload_len() + 2;
-    // Cheapest checks first: version, pad, range, then the CRC.
+    // Cheapest checks first: version, SEQ, pad, range, then the CRC.
     hdr >> 4 == PROTOCOL_VERSION
         && bytes.len() >= needed
+        && bytes[1] < SEQ_MODULUS
         && bytes[needed..].iter().all(|&b| b == 0)
         && msg_type.payload_in_range(&bytes[2..needed - 2])
         && decode_packet_bytes(&bytes[..needed]).is_ok()
@@ -138,21 +157,43 @@ mod tests {
     #[test]
     fn packet_roundtrip() {
         let p = Packet {
-            msg_type: MessageType::NoteOn,
-            seq: 7,
-            payload: vec![60, 100],
+            msg_type: MessageType::Midi,
+            seq: 3,
+            payload: vec![0x93, 60, 100],
         };
         let bytes = encode_packet_bytes(&p).unwrap();
+        assert_eq!(bytes.len(), 7);
         let decoded = decode_packet_bytes(&bytes).unwrap();
         assert_eq!(decoded, p);
     }
 
     #[test]
+    fn seq_is_two_bits_with_reserved_zero_bits() {
+        let mut p = Packet {
+            msg_type: MessageType::Heartbeat,
+            seq: 4,
+            payload: vec![],
+        };
+        assert_eq!(encode_packet_bytes(&p), Err(PacketDecodeError::BadSeq(4)));
+        p.seq = 2;
+        let mut bytes = encode_packet_bytes(&p).unwrap();
+        bytes[1] = 0x42;
+        let n = bytes.len();
+        let crc = crc16_ccitt(&bytes[..n - 2]);
+        bytes[n - 2] = (crc >> 8) as u8;
+        bytes[n - 1] = crc as u8;
+        assert_eq!(
+            decode_packet_bytes(&bytes),
+            Err(PacketDecodeError::BadSeq(0x42))
+        );
+    }
+
+    #[test]
     fn header_carries_version_and_rejects_others() {
         let p = Packet {
-            msg_type: MessageType::NoteOn,
-            seq: 7,
-            payload: vec![60, 100],
+            msg_type: MessageType::Midi,
+            seq: 1,
+            payload: vec![0x90, 60, 100],
         };
         let mut bytes = encode_packet_bytes(&p).unwrap();
         assert_eq!(bytes[0] >> 4, PROTOCOL_VERSION);
@@ -172,11 +213,11 @@ mod tests {
     }
 
     /// The FEC acceptance check: CRC-valid blocks are still rejected when the
-    /// version, pad or payload range is wrong (spec §5 ranges).
+    /// version, SEQ, pad or payload is not canonical (spec §5.1).
     #[test]
-    fn fec_candidate_checks_version_pad_and_ranges() {
-        let block = |hdr: u8, payload: &[u8], pad: u8| -> Vec<u8> {
-            let mut b = vec![hdr, 42];
+    fn fec_candidate_checks_version_seq_pad_and_payload() {
+        let block = |hdr: u8, seq: u8, payload: &[u8], pad: u8| -> Vec<u8> {
+            let mut b = vec![hdr, seq];
             b.extend_from_slice(payload);
             let crc = crc16_ccitt(&b);
             b.push((crc >> 8) as u8);
@@ -187,26 +228,42 @@ mod tests {
             }
             bytes_to_nibbles(&b)
         };
-        let ok = |hdr: u8, payload: &[u8]| fec_candidate_is_valid(&block(hdr, payload, 0));
-        assert!(ok(0x10, &[60, 100]));
-        assert!(ok(0x10, &[0x7F, 0x7F]));
-        assert!(ok(0x13, &[3, 15, 127]));
+        let ok = |hdr: u8, payload: &[u8]| fec_candidate_is_valid(&block(hdr, 2, payload, 0));
+        assert!(ok(0x10, &[0x90, 60, 100]));
+        assert!(ok(0x10, &[0x9F, 0x7F, 0x7F]));
+        assert!(ok(0x10, &[0xC3, 5, 0]));
+        assert!(ok(0x10, &[0xF6, 0, 0]));
+        assert!(ok(0x13, &[0x08, 0x80, 0x01])); // GO 0.0 list 1
         assert!(ok(0x14, &[]));
-        // Out of range (MIDI data >= 0x80, MSC cmd > 3, cuelist > 15, cue > 127).
-        assert!(!ok(0x10, &[0x80, 100]));
-        assert!(!ok(0x10, &[60, 0xFF]));
-        assert!(!ok(0x11, &[0x80]));
-        assert!(!ok(0x12, &[0x90]));
-        assert!(!ok(0x13, &[4, 0, 0]));
-        assert!(!ok(0x13, &[0, 16, 0]));
-        assert!(!ok(0x13, &[0, 0, 128]));
-        // Wrong version, unknown type, non-zero pad.
-        assert!(!ok(0x20, &[60, 100]));
-        assert!(!ok(0x16, &[]));
-        assert!(!fec_candidate_is_valid(&block(0x14, &[], 0x01)));
+        assert!(ok(0x15, &[]));
+        // Not canonical: data >= 0x80, unsupported status, unused byte set,
+        // NoteOn velocity 0, MSC fields out of range.
+        assert!(!ok(0x10, &[0x90, 0x80, 100]));
+        assert!(!ok(0x10, &[0x90, 60, 0xFF]));
+        assert!(!ok(0x10, &[0x90, 60, 0]));
+        assert!(!ok(0x10, &[0xF0, 0, 0]));
+        assert!(!ok(0x10, &[0xF8, 0, 0]));
+        assert!(!ok(0x10, &[0x60, 0, 0]));
+        assert!(!ok(0x10, &[0xC0, 5, 1]));
+        assert!(!ok(0x13, &[0x00, 0, 0]));
+        assert!(!ok(0x13, &[0x08, 0x80, 0x00])); // list without cue
+                                                 // Wrong version, unknown types, SEQ reserved bits, non-zero pad.
+        assert!(!ok(0x20, &[0x90, 60, 100]));
+        for t in [1u8, 2, 6, 7, 15] {
+            assert!(!ok(0x10 | t, &[]));
+            assert!(!ok(0x10 | t, &[0x90, 60, 100]));
+        }
+        assert!(!fec_candidate_is_valid(&block(
+            0x10,
+            4,
+            &[0x90, 60, 100],
+            0
+        )));
+        assert!(!fec_candidate_is_valid(&block(0x14, 0x80, &[], 0)));
+        assert!(!fec_candidate_is_valid(&block(0x14, 0, &[], 0x01)));
         // A corrupted CRC.
-        let mut b = block(0x10, &[60, 100], 0);
-        b[10] ^= 1;
+        let mut b = block(0x10, 0, &[0x90, 60, 100], 0);
+        b[11] ^= 1;
         assert!(!fec_candidate_is_valid(&b));
     }
 }

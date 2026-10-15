@@ -55,6 +55,7 @@ fn memory_decoder(source: testing::MemorySource, rec: &RecordingMidiSink) -> Dec
         midi_out: MidiOut::Custom(Box::new(rec.clone())),
         profile: "fast".into(),
         link_dead_ms: None,
+        msc: MscTarget::default(),
     })
     .unwrap()
 }
@@ -78,20 +79,48 @@ fn loopback_midi_in_to_midi_out() {
     // The encoder connects its MIDI input on its own thread.
     assert!(wait_for(Duration::from_secs(5), || injector.inject(&[0x90, 64, 100])));
     injector.inject(&[0x80, 64, 0]);
-    enc.send(TransportMessage::ProgramChange { program: 5 });
+    enc.send(TransportMessage::ProgramChange {
+        channel: 0,
+        program: 5,
+    });
+    // Other channels and message kinds, MSC as SysEx; clock, other SysEx
+    // and an MSC cue that does not fit are not carried.
+    injector.inject(&[0xF8]);
+    injector.inject(&[0xF0, 0x43, 0x10, 0x4C, 0x00, 0xF7]);
+    injector.inject(&[
+        0xF0, 0x7F, 0x01, 0x02, 0x01, 0x01, b'1', b'.', b'2', b'5', 0xF7,
+    ]);
+    injector.inject(&[0xBA, 7, 99]);
+    injector.inject(&[0xEF, 0x00, 0x60]);
+    injector.inject(&[
+        0xF0, 0x7F, 0x01, 0x02, 0x01, 0x01, b'1', b'2', b'.', b'5', 0x00, b'2', 0xF7,
+    ]);
 
     let note_on = vec![0x90, 64, 100];
-    let note_off = vec![0x80, 64, 0x40];
+    let note_off = vec![0x80, 64, 0];
     let program = vec![0xC0, 5];
+    let cc = vec![0xBA, 7, 99];
+    let bend = vec![0xEF, 0x00, 0x60];
+    // GO 12.5 list 2, re-addressed to the receiver's device ID and format.
+    let msc = vec![
+        0xF0, 0x7F, 0x7F, 0x02, 0x01, 0x01, b'1', b'2', b'.', b'5', 0x00, b'2', 0xF7,
+    ];
+    let want = [&note_on, &note_off, &program, &cc, &bend, &msc];
     let got_all = wait_for(Duration::from_secs(15), || {
         let m = rec.messages();
-        m.contains(&note_on) && m.contains(&note_off) && m.contains(&program)
+        want.iter().all(|w| m.contains(w))
     });
     let midi = rec.messages();
     assert!(got_all, "MIDI out: {:?}", midi);
     let pos = |m: &Vec<u8>| midi.iter().position(|x| x == m).unwrap();
     assert!(pos(&note_on) < pos(&note_off), "order: {:?}", midi);
     assert!(pos(&note_off) < pos(&program), "order: {:?}", midi);
+    assert_eq!(
+        midi.iter().filter(|m| m.first() == Some(&0xF0)).count(),
+        1,
+        "only the representable MSC: {:?}",
+        midi
+    );
 
     assert!(enc.stop());
     assert!(dec.stop());
@@ -99,6 +128,7 @@ fn loopback_midi_in_to_midi_out() {
     let dec_events: Vec<EngineEvent> = dec.events().try_iter().collect();
     assert!(
         dec_events.contains(&EngineEvent::Decoded(TransportMessage::NoteOn {
+            channel: 0,
             note: 64,
             velocity: 100
         }))
@@ -108,11 +138,19 @@ fn loopback_midi_in_to_midi_out() {
         .any(|e| matches!(e, EngineEvent::Level(_))));
     assert_eq!(dec_events.last(), Some(&EngineEvent::Stopped));
 
-    let enc_logs = log_lines(&enc.events().try_iter().collect::<Vec<_>>());
+    let enc_events: Vec<EngineEvent> = enc.events().try_iter().collect();
+    assert_eq!(
+        alarms(&enc_events, AlarmKind::MessageRejected),
+        vec![
+            "MSC cue 1.25 not representable (cues 0–999.9 with at most one decimal) — not sent"
+                .to_string()
+        ]
+    );
+    let enc_logs = log_lines(&enc_events);
     assert!(
         enc_logs
             .iter()
-            .any(|l| l == "TX NoteOn { note: 64, velocity: 100 }"),
+            .any(|l| l == "TX NoteOn ch=1 note=64 vel=100"),
         "{:?}",
         enc_logs
     );
@@ -204,6 +242,7 @@ fn audio_open_error_is_logged_and_worker_ends() {
         midi_out: MidiOut::None,
         profile: "robust".into(),
         link_dead_ms: None,
+        msc: MscTarget::default(),
     })
     .unwrap();
     let logs = log_lines(&expect_stopped_then_closed(dec.events()));
@@ -263,6 +302,7 @@ fn cleared(events: &[EngineEvent], kind: AlarmKind) -> usize {
 /// (enough for the decoder to finish the packet, far less than link-dead).
 fn packet_audio(tx: &mut CricketModemTx, note: u8, silence_ms: usize) -> Vec<f32> {
     let mut audio = tx.encode_message(&TransportMessage::NoteOn {
+        channel: 0,
         note,
         velocity: 100,
     });
@@ -276,6 +316,7 @@ fn stall_decoder(source: testing::MemorySource, rec: &RecordingMidiSink) -> Deco
         midi_out: MidiOut::Custom(Box::new(rec.clone())),
         profile: "fast".into(),
         link_dead_ms: Some(TEST_LINK_DEAD_MS as u32),
+        msc: MscTarget::default(),
     })
     .unwrap()
 }
@@ -356,6 +397,9 @@ fn input_stall_after_packet_sends_one_burst_in_time() {
     assert_eq!(midi.first(), Some(&vec![0x90, 60, 100]), "{:?}", midi);
     assert_eq!(count(&midi, &ALL_NOTES_OFF), 1, "{:?}", midi);
     assert_eq!(count(&midi, &SUSTAIN_OFF), 1, "{:?}", midi);
+    // The burst covers every channel.
+    assert_eq!(count(&midi, &[0xBF, 0x7B, 0x00]), 1, "{:?}", midi);
+    assert_eq!(midi.len(), 1 + 32, "{:?}", midi);
 
     assert!(dec.stop());
     let events: Vec<EngineEvent> = dec.events().try_iter().collect();

@@ -10,7 +10,7 @@ use cricket_core::modem::{
     encode_to_samples, repetition_samples, CricketModemRx, CricketModemTx, ModemOutput,
 };
 use cricket_core::phy::{Modulation, PhyConfig};
-use cricket_core::transport::{MscCommand, TransportMessage};
+use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage};
 use support::{decode_chunked, ChannelSim, XorShift64};
 
 fn fec_profiles() -> Vec<(&'static str, PhyConfig)> {
@@ -34,16 +34,24 @@ fn all_profiles() -> Vec<(&'static str, PhyConfig)> {
 fn all_types() -> Vec<TransportMessage> {
     vec![
         TransportMessage::NoteOn {
+            channel: 0,
             note: 60,
             velocity: 100,
         },
-        TransportMessage::NoteOff { note: 60 },
-        TransportMessage::ProgramChange { program: 42 },
-        TransportMessage::MscLite {
-            cmd: MscCommand::Go,
-            cuelist: 15,
-            cue: 127,
+        TransportMessage::NoteOff {
+            channel: 0,
+            note: 60,
+            velocity: 64,
         },
+        TransportMessage::ProgramChange {
+            channel: 0,
+            program: 42,
+        },
+        TransportMessage::Msc(MscMessage::cue(
+            MscCommand::Go,
+            MscCue::from_tenths(1270).unwrap(),
+            Some(15),
+        )),
         TransportMessage::Heartbeat,
         TransportMessage::Panic,
     ]
@@ -104,6 +112,7 @@ fn sync_offset_chunk_sweep() {
     let mut failures = Vec::new();
     for offset in 0..97 {
         let messages = [TransportMessage::NoteOn {
+            channel: 0,
             note: (offset % 128) as u8,
             velocity: 1 + (offset % 127) as u8,
         }];
@@ -123,15 +132,15 @@ fn sync_offset_chunk_sweep() {
 /// reported in the stats); the uncoded profile loses those packets.
 #[test]
 fn dropout_in_body_is_repaired() {
-    let msg = TransportMessage::MscLite {
-        cmd: MscCommand::Load,
-        cuelist: 3,
-        cue: 99,
-    };
+    let msg = TransportMessage::Msc(MscMessage::cue(
+        MscCommand::Load,
+        MscCue::from_tenths(990).unwrap(),
+        Some(3),
+    ));
     let run = |config: &PhyConfig| -> (usize, usize, u64) {
         let half = half_cell(config);
         let tx = CricketModemTx::new(config.clone());
-        let clean = tx.encode_message_with_seq(&msg, 9);
+        let clean = tx.encode_message_with_seq(&msg, 1);
         let body_start = (22.0 * half) as usize;
         let body_len = (8.0 * config.fec.body_nibbles() as f32 * half) as usize;
         let drop = config.sample_rate_hz as usize / 1000;
@@ -174,12 +183,14 @@ fn false_lock_does_not_hide_packet() {
         let tx = CricketModemTx::new(config.clone());
         let spurious = tx.encode_message_with_seq(
             &TransportMessage::NoteOn {
+                channel: 0,
                 note: 21,
                 velocity: 7,
             },
-            9,
+            2,
         );
         let msg = TransportMessage::NoteOn {
+            channel: 0,
             note: 64,
             velocity: 99,
         };
@@ -220,6 +231,7 @@ fn noise_and_mfsk_produce_no_messages() {
         .collect();
     let notes: Vec<_> = (0..12)
         .map(|i| TransportMessage::NoteOn {
+            channel: 0,
             note: i * 9,
             velocity: 1 + i * 5,
         })

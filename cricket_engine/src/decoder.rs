@@ -7,7 +7,8 @@
 //! - emits `Alarm { AudioInputStalled }` and a log line (once per stall);
 //! - if the link is alive (a valid packet received and link-dead not fired
 //!   since), declares link-dead on the modem and sends the fail-safe burst
-//!   (CC64=0 + CC123) to the MIDI sink, exactly once.
+//!   (CC64=0 + CC123 on every channel, spec §5.3) to the MIDI sink, exactly
+//!   once.
 //!
 //! When samples resume it emits `AlarmCleared { AudioInputStalled }`. The
 //! outage has already been handled: `declare_link_dead` disarmed the modem's
@@ -25,7 +26,7 @@ use crate::{closed_receiver, Emitter, Worker};
 use anyhow::Result;
 use cricket_core::modem::{CricketModemRx, ModemOutput, ModemStats};
 use cricket_core::phy::{LinkState, PhyConfig};
-use cricket_core::transport::{fail_safe_burst, TransportMessage};
+use cricket_core::transport::{MscTarget, TransportMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -41,6 +42,9 @@ pub struct DecoderConfig {
     /// sample-based link-dead and the wall-clock input watchdog). `None`
     /// uses the profile value; mainly for tests.
     pub link_dead_ms: Option<u32>,
+    /// Device ID and command format of the MSC SysEx sent to MIDI out
+    /// (spec §5.4; default all-call `0x7F`, Lighting (General) `0x01`).
+    pub msc: MscTarget,
 }
 
 /// A running decoder worker. Dropping it stops the worker.
@@ -153,6 +157,7 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
     }
 
     let mut rx = CricketModemRx::new(config);
+    rx.set_msc_target(cfg.msc);
     let mut rms_accumulator = 0.0f32;
     let mut sample_count_for_meter = 0usize;
     let meter_report_interval = (stream_sample_rate as usize) / 20;
@@ -207,8 +212,9 @@ fn run(cfg: DecoderConfig, ev: &Emitter, stop: &AtomicBool) {
                 stalled = true;
                 let silent_ms = last_sample_at.elapsed().as_millis();
                 if rx.declare_link_dead() {
+                    let burst = rx.fail_safe_burst();
                     if let Some(sink) = midi_out.as_mut() {
-                        for bytes in fail_safe_burst() {
+                        for bytes in burst {
                             let _ = sink.send(&bytes);
                         }
                     }

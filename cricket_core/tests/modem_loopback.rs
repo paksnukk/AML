@@ -2,7 +2,7 @@ use cricket_core::modem::{
     decode_samples, encode_to_samples, CricketModemRx, CricketModemTx, ModemOutput,
 };
 use cricket_core::phy::PhyConfig;
-use cricket_core::transport::{MscCommand, TransportMessage};
+use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage};
 #[cfg(feature = "std")]
 use cricket_core::wav::{read_wav_f32, write_wav_f32};
 
@@ -11,10 +11,15 @@ fn loopback_note_on_off() {
     let config = PhyConfig::robust();
     let messages = vec![
         TransportMessage::NoteOn {
+            channel: 0,
             note: 60,
             velocity: 100,
         },
-        TransportMessage::NoteOff { note: 60 },
+        TransportMessage::NoteOff {
+            channel: 0,
+            note: 60,
+            velocity: 64,
+        },
     ];
     let samples = encode_to_samples(config.clone(), &messages);
     let decoded = decode_samples(config, &samples);
@@ -25,12 +30,15 @@ fn loopback_note_on_off() {
 fn loopback_program_and_msc() {
     let config = PhyConfig::robust();
     let messages = vec![
-        TransportMessage::ProgramChange { program: 42 },
-        TransportMessage::MscLite {
-            cmd: MscCommand::Go,
-            cuelist: 3,
-            cue: 12,
+        TransportMessage::ProgramChange {
+            channel: 0,
+            program: 42,
         },
+        TransportMessage::Msc(MscMessage::cue(
+            MscCommand::Go,
+            MscCue::from_tenths(120).unwrap(),
+            Some(3),
+        )),
         TransportMessage::Heartbeat,
     ];
     let samples = encode_to_samples(config.clone(), &messages);
@@ -43,6 +51,7 @@ fn loopback_program_and_msc() {
 fn loopback_via_wav_file() {
     let config = PhyConfig::robust();
     let messages = vec![TransportMessage::NoteOn {
+        channel: 0,
         note: 64,
         velocity: 80,
     }];
@@ -62,6 +71,7 @@ fn loopback_via_wav_file() {
 fn duplicate_repetition_suppressed() {
     let config = PhyConfig::robust();
     let messages = vec![TransportMessage::NoteOn {
+        channel: 0,
         note: 72,
         velocity: 64,
     }];
@@ -96,6 +106,7 @@ fn streaming_rx_emits_stats() {
 fn level_offset_still_decodes() {
     let config = PhyConfig::robust();
     let messages = vec![TransportMessage::NoteOn {
+        channel: 0,
         note: 55,
         velocity: 90,
     }];
@@ -118,6 +129,7 @@ fn fast_profile_latency_budget() {
     let samples = encode_to_samples(
         fast.clone(),
         &[TransportMessage::NoteOn {
+            channel: 0,
             note: 60,
             velocity: 90,
         }],
@@ -132,6 +144,7 @@ fn fast_profile_latency_budget() {
     assert_eq!(
         decoded,
         vec![TransportMessage::NoteOn {
+            channel: 0,
             note: 60,
             velocity: 90
         }]

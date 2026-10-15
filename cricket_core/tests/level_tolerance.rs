@@ -15,6 +15,7 @@ const CHUNK_SIZES: [usize; 5] = [64, 128, 240, 512, 4096];
 
 fn note_on_for(i: usize) -> TransportMessage {
     TransportMessage::NoteOn {
+        channel: 0,
         note: (i % 128) as u8,
         velocity: (1 + (i * 7) % 127) as u8,
     }

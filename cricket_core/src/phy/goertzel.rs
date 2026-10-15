@@ -144,6 +144,7 @@ mod tests {
     fn perfect_grid_demod_note60() {
         let config = PhyConfig::robust();
         let msg = TransportMessage::NoteOn {
+            channel: 0,
             note: 60,
             velocity: 100,
         };

@@ -2,7 +2,7 @@
 //!
 //! The packet bytes (HDR, SEQ, PAYLOAD, CRC-16 — unchanged) are split into
 //! nibbles, zero-padded to [`FEC_DATA_NIBBLES`] (14 = the largest packet,
-//! MscLite, 7 bytes) and protected by two shortened Reed–Solomon codewords
+//! MSC, 7 bytes) and protected by two shortened Reed–Solomon codewords
 //! RS(7 + p, 7) over GF(16) (`p` = parity nibbles per codeword). The two
 //! codewords are interleaved symbol by symbol on the wire
 //! (`a0 b0 a1 b1 …`), so a burst of `2p` consecutive bad symbols is still

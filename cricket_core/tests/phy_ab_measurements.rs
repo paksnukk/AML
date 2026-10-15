@@ -87,6 +87,7 @@ fn conditions() -> Vec<(&'static str, Impair)> {
 
 fn note_on_for(i: usize) -> TransportMessage {
     TransportMessage::NoteOn {
+        channel: 0,
         note: (i % 128) as u8,
         velocity: (1 + (i * 7) % 127) as u8,
     }

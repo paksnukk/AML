@@ -15,22 +15,30 @@ use cricket_core::modem::{
     encode_to_samples, repetition_samples, CricketModemRx, CricketModemTx, ModemOutput,
 };
 use cricket_core::phy::{Acquisition, PhyConfig};
-use cricket_core::transport::{MscCommand, TransportMessage};
+use cricket_core::transport::{MscCommand, MscCue, MscMessage, TransportMessage};
 use support::{decode_chunked, ChannelSim, XorShift64};
 
 fn all_types() -> Vec<TransportMessage> {
     vec![
         TransportMessage::NoteOn {
+            channel: 0,
             note: 60,
             velocity: 100,
         },
-        TransportMessage::NoteOff { note: 60 },
-        TransportMessage::ProgramChange { program: 42 },
-        TransportMessage::MscLite {
-            cmd: MscCommand::Go,
-            cuelist: 15,
-            cue: 127,
+        TransportMessage::NoteOff {
+            channel: 0,
+            note: 60,
+            velocity: 64,
         },
+        TransportMessage::ProgramChange {
+            channel: 0,
+            program: 42,
+        },
+        TransportMessage::Msc(MscMessage::cue(
+            MscCommand::Go,
+            MscCue::from_tenths(1270).unwrap(),
+            Some(15),
+        )),
         TransportMessage::Heartbeat,
         TransportMessage::Panic,
     ]
@@ -67,12 +75,12 @@ fn defaults_are_unchanged() {
 fn joint_acquisition_tolerates_two_missing_preamble_symbols() {
     let config = PhyConfig::robust_fec();
     let period = config.samples_per_symbol_period();
-    let msg = TransportMessage::MscLite {
-        cmd: MscCommand::Go,
-        cuelist: 2,
-        cue: 77,
-    };
-    let packet = CricketModemTx::new(config.clone()).encode_message_with_seq(&msg, 5);
+    let msg = TransportMessage::Msc(MscMessage::cue(
+        MscCommand::Go,
+        MscCue::from_tenths(770).unwrap(),
+        Some(2),
+    ));
+    let packet = CricketModemTx::new(config.clone()).encode_message_with_seq(&msg, 1);
     let muted_sets: [&[usize]; 9] = [
         &[0],
         &[1],
@@ -127,6 +135,7 @@ fn sync_offset_sweep() {
     let mut failures = Vec::new();
     for offset in (0..2 * period).step_by(5) {
         let messages = [TransportMessage::NoteOn {
+            channel: 0,
             note: (offset % 128) as u8,
             velocity: 1 + (offset % 127) as u8,
         }];
@@ -146,13 +155,13 @@ fn sync_offset_sweep() {
 #[test]
 fn corrects_wrong_symbols_and_reports_them() {
     let config = PhyConfig::robust_fec();
-    let msg = TransportMessage::MscLite {
-        cmd: MscCommand::Load,
-        cuelist: 3,
-        cue: 99,
-    };
+    let msg = TransportMessage::Msc(MscMessage::cue(
+        MscCommand::Load,
+        MscCue::from_tenths(990).unwrap(),
+        Some(3),
+    ));
     let tx = CricketModemTx::new(config.clone());
-    let audio = tx.encode_message_with_seq(&msg, 9);
+    let audio = tx.encode_message_with_seq(&msg, 1);
     // Overwrite body symbols 0..4 (2 per codeword) with a different tone.
     let period = config.samples_per_symbol_period();
     let pre = config.preamble.len();
@@ -284,7 +293,7 @@ struct Cell {
     lost_body_only: usize,
 }
 
-/// `trials` single-message transmissions (random NoteOn / MscLite, random
+/// `trials` single-message transmissions (random NoteOn / MSC GO, random
 /// start offset, 64-sample chunks so delivery time has ~1.3 ms resolution).
 fn run_cell(config: &PhyConfig, imp: Impairment, trials: usize, seed: u64) -> Cell {
     let mut rng = XorShift64::new(seed);
@@ -297,20 +306,25 @@ fn run_cell(config: &PhyConfig, imp: Impairment, trials: usize, seed: u64) -> Ce
     let period = config.samples_per_symbol_period();
     for t in 0..trials {
         let msg = if t % 4 == 3 {
-            TransportMessage::MscLite {
-                cmd: MscCommand::Go,
-                cuelist: rng.below(16) as u8,
-                cue: rng.below(128) as u8,
+            {
+                let list = rng.below(16) as u8;
+                let cue = rng.below(128) as u16;
+                TransportMessage::Msc(MscMessage::cue(
+                    MscCommand::Go,
+                    MscCue::from_tenths(cue * 10 + u16::from(list % 10)).unwrap(),
+                    (list > 0).then_some(list),
+                ))
             }
         } else {
             TransportMessage::NoteOn {
+                channel: 0,
                 note: rng.below(128) as u8,
                 velocity: 1 + rng.below(127) as u8,
             }
         };
         let offset = 200 + rng.below(4 * config.samples_per_symbol_period());
         let tx = CricketModemTx::new(config.clone());
-        let mut clean = tx.encode_message_with_seq(&msg, rng.below(256) as u8);
+        let mut clean = tx.encode_message_with_seq(&msg, rng.below(4) as u8);
         clean.extend(std::iter::repeat_n(0.0, config.sample_rate_hz as usize / 4));
         let sim_seed = rng.next_u64();
         let audio = imp.sim(config, sim_seed, offset).apply(&clean);
@@ -679,6 +693,7 @@ fn false_trigger_report() {
         let sent = 200u32;
         for i in 0..sent {
             clean.extend(tx.encode_message(&TransportMessage::NoteOn {
+                channel: 0,
                 note: (i % 128) as u8,
                 velocity: 1 + (i % 127) as u8,
             }));

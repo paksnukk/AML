@@ -1,4 +1,4 @@
-//! Link-dead detection (docs/aml-v1-spec.md §5.2).
+//! Link-dead detection (docs/aml-v1-spec.md §5.3).
 //!
 //! `FailSafeMonitor` is the single authority for link-dead. It works on
 //! absolute stream positions (sample indices since the receiver started), so

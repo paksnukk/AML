@@ -1,4 +1,4 @@
-//! Persistent GUI settings (device names, profile, mode).
+//! Persistent GUI settings (device names, profile, mode, MSC output address).
 //!
 //! Devices are stored by **name** (v1.1 goal 7) so a selection survives
 //! restarts and re-plugging. Files written before that stored enumeration
@@ -21,6 +21,9 @@ pub struct AppSettings {
     pub audio_out: Option<String>,
     pub midi_in: Option<String>,
     pub midi_out: Option<String>,
+    /// MSC device ID and command format of the decoder's MSC output.
+    pub msc_device_id: u8,
+    pub msc_command_format: u8,
 }
 
 impl Default for AppSettings {
@@ -32,6 +35,8 @@ impl Default for AppSettings {
             audio_out: None,
             midi_in: None,
             midi_out: None,
+            msc_device_id: 0x7F,
+            msc_command_format: 0x01,
         }
     }
 }
@@ -60,6 +65,10 @@ struct StoredSettings {
     midi_in: Option<StoredDevice>,
     #[serde(default)]
     midi_out: Option<StoredDevice>,
+    #[serde(default)]
+    msc_device_id: Option<u8>,
+    #[serde(default)]
+    msc_command_format: Option<u8>,
 }
 
 impl StoredSettings {
@@ -138,6 +147,14 @@ pub fn parse_settings(json: &str, names: impl FnOnce() -> DeviceNames) -> Parsed
             audio_out: to_name(stored.audio_out, &names.audio_out),
             midi_in: to_name(stored.midi_in, &names.midi_in),
             midi_out: to_name(stored.midi_out, &names.midi_out),
+            msc_device_id: stored
+                .msc_device_id
+                .filter(|v| *v < 0x80)
+                .unwrap_or(defaults.msc_device_id),
+            msc_command_format: stored
+                .msc_command_format
+                .filter(|v| *v < 0x80)
+                .unwrap_or(defaults.msc_command_format),
         },
         migrated,
     }
@@ -217,6 +234,8 @@ mod tests {
                 audio_out: Some("Speakers".into()),
                 midi_in: None,
                 midi_out: Some("UM-ONE".into()),
+                msc_device_id: 0x7F,
+                msc_command_format: 0x01,
             }
         );
         // The new JSON stores names.
@@ -229,7 +248,9 @@ mod tests {
                 "audio_in": "USB Interface",
                 "audio_out": "Speakers",
                 "midi_in": null,
-                "midi_out": "UM-ONE"
+                "midi_out": "UM-ONE",
+                "msc_device_id": 127,
+                "msc_command_format": 1
             })
         );
     }
@@ -252,6 +273,8 @@ mod tests {
             audio_out: None,
             midi_in: Some("UM-ONE".into()),
             midi_out: None,
+            msc_device_id: 3,
+            msc_command_format: 0x10,
         };
         let json = serde_json::to_string(&settings).unwrap();
         let parsed = parse_settings(&json, || panic!("must not enumerate devices"));

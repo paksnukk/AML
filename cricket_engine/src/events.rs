@@ -1,7 +1,7 @@
 //! Events workers report to their owner (GUI, CLI, tests).
 
 use cricket_core::phy::LinkState;
-use cricket_core::transport::TransportMessage;
+use cricket_core::transport::{TransportMessage, PITCH_BEND_CENTER};
 
 /// Something a decoder or encoder worker reports. Delivered in order on the
 /// handle's event channel; [`EngineEvent::Stopped`] is always the last one.
@@ -57,16 +57,21 @@ pub enum AlarmKind {
     AudioInputStalled,
     /// The audio device (input or output stream) reported an error.
     AudioDeviceError,
+    /// The encoder received a message it must not send because it cannot
+    /// carry it exactly (e.g. an MSC cue with more than one decimal). The
+    /// message was dropped.
+    MessageRejected,
 }
 
 impl AlarmKind {
     /// Stable identifier used by the GUI (`"link_dead"`,
-    /// `"audio_input_stalled"`, `"audio_device_error"`).
+    /// `"audio_input_stalled"`, `"audio_device_error"`, `"message_rejected"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             AlarmKind::LinkDead => "link_dead",
             AlarmKind::AudioInputStalled => "audio_input_stalled",
             AlarmKind::AudioDeviceError => "audio_device_error",
+            AlarmKind::MessageRejected => "message_rejected",
         }
     }
 }
@@ -80,21 +85,65 @@ pub fn link_state_name(state: LinkState) -> &'static str {
     }
 }
 
-/// `(frame_type, payload)` display strings for a message.
+/// `(frame_type, payload)` display strings for a message. MIDI channels
+/// are shown 1–16.
 pub fn format_message(msg: &TransportMessage) -> (String, String) {
-    match msg {
-        TransportMessage::NoteOn { note, velocity } => {
-            ("NoteOn".into(), format!("note={} vel={}", note, velocity))
-        }
-        TransportMessage::NoteOff { note } => ("NoteOff".into(), format!("note={}", note)),
-        TransportMessage::ProgramChange { program } => {
-            ("ProgramChange".into(), format!("program={}", program))
-        }
-        TransportMessage::MscLite { cmd, cuelist, cue } => (
-            "MscLite".into(),
-            format!("{:?} cuelist={} cue={}", cmd, cuelist, cue),
+    use TransportMessage as M;
+    let (kind, payload) = match *msg {
+        M::NoteOn {
+            channel,
+            note,
+            velocity,
+        } => (
+            "NoteOn",
+            format!("ch={} note={} vel={}", channel + 1, note, velocity),
         ),
-        TransportMessage::Heartbeat => ("Heartbeat".into(), String::new()),
-        TransportMessage::Panic => ("Panic".into(), String::new()),
-    }
+        M::NoteOff {
+            channel,
+            note,
+            velocity,
+        } => (
+            "NoteOff",
+            format!("ch={} note={} vel={}", channel + 1, note, velocity),
+        ),
+        M::PolyPressure {
+            channel,
+            note,
+            pressure,
+        } => (
+            "PolyPressure",
+            format!("ch={} note={} pressure={}", channel + 1, note, pressure),
+        ),
+        M::ControlChange {
+            channel,
+            controller,
+            value,
+        } => (
+            "ControlChange",
+            format!("ch={} cc={} value={}", channel + 1, controller, value),
+        ),
+        M::ProgramChange { channel, program } => (
+            "ProgramChange",
+            format!("ch={} program={}", channel + 1, program),
+        ),
+        M::ChannelPressure { channel, pressure } => (
+            "ChannelPressure",
+            format!("ch={} pressure={}", channel + 1, pressure),
+        ),
+        M::PitchBend { channel, value } => (
+            "PitchBend",
+            format!(
+                "ch={} value={:+}",
+                channel + 1,
+                i32::from(value) - i32::from(PITCH_BEND_CENTER)
+            ),
+        ),
+        M::SongPosition { beats } => ("SongPosition", format!("beats={}", beats)),
+        M::SongSelect { song } => ("SongSelect", format!("song={}", song)),
+        M::TuneRequest => ("TuneRequest", String::new()),
+        M::Msc(m) => ("MSC", m.to_string()),
+        M::Heartbeat => ("Heartbeat", String::new()),
+        M::Panic => ("Panic", String::new()),
+    };
+    (kind.into(), payload)
 }

@@ -21,10 +21,12 @@
 
 mod support;
 
-use cricket_core::link::{crc16_ccitt, nibbles_to_bytes, BodySymbol, FecCodec, PROTOCOL_VERSION};
+use cricket_core::link::{
+    crc16_ccitt, nibbles_to_bytes, BodySymbol, FecCodec, PROTOCOL_VERSION, SEQ_MODULUS,
+};
 use cricket_core::modem::{encode_to_samples, CricketModemTx};
 use cricket_core::phy::{PhyConfig, PhyRx, RxEvent};
-use cricket_core::transport::{MessageType, MscCommand, TransportMessage};
+use cricket_core::transport::{MessageType, TransportMessage};
 use std::f32::consts::PI;
 use support::{ChannelSim, XorShift64};
 
@@ -53,6 +55,7 @@ fn mfsk_traffic(seconds: f32, seed: u64, profiles: &[PhyConfig]) -> Vec<f32> {
         let mut block = Vec::new();
         while block.len() < RATE {
             block.extend(tx.encode_message(&TransportMessage::NoteOn {
+                channel: 0,
                 note: (i % 128) as u8,
                 velocity: 1 + (i * 7 % 127) as u8,
             }));
@@ -76,6 +79,7 @@ fn bmc_traffic(config: &PhyConfig, seconds: f32, seed: u64) -> Vec<f32> {
     while out.len() < n {
         let msgs: Vec<_> = (0..50)
             .map(|k| TransportMessage::NoteOn {
+                channel: 0,
                 note: ((i + k) % 128) as u8,
                 velocity: 1 + ((i + k) * 7 % 127) as u8,
             })
@@ -320,9 +324,9 @@ fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
 struct Checks {
     /// Version nibble and type nibble valid.
     header: bool,
-    /// ... and the bytes after the packet are zero.
+    /// ... and the SEQ reserved bits and the bytes after the packet are zero.
     pad: bool,
-    /// ... and the payload is canonical (MIDI data < 0x80, MSC fields valid).
+    /// ... and the payload is canonical (spec §5.1).
     payload: bool,
     /// CRC-16 matches.
     crc: bool,
@@ -339,16 +343,8 @@ fn checks(nibbles: &[u8]) -> Checks {
     }
     c.header = true;
     let needed = 2 + t.payload_len() + 2;
-    c.pad = bytes[needed..].iter().all(|&b| b == 0);
-    let p = &bytes[2..2 + t.payload_len()];
-    c.payload = c.pad
-        && match t {
-            MessageType::NoteOn | MessageType::NoteOff | MessageType::ProgramChange => {
-                p.iter().all(|&b| b < 0x80)
-            }
-            MessageType::MscLite => MscCommand::from_u8(p[0]).is_some() && p[1] < 16 && p[2] < 0x80,
-            MessageType::Heartbeat | MessageType::Panic => true,
-        };
+    c.pad = bytes[1] < SEQ_MODULUS && bytes[needed..].iter().all(|&b| b == 0);
+    c.payload = c.pad && t.payload_in_range(&bytes[2..2 + t.payload_len()]);
     let crc = crc16_ccitt(&bytes[..needed - 2]);
     c.crc = bytes[needed - 2] == (crc >> 8) as u8 && bytes[needed - 1] == crc as u8;
     c
@@ -362,7 +358,7 @@ struct FalseStats {
     /// Candidate packets (pairs of successful RS decodes) checked.
     candidates: u64,
     header_pass: u64,
-    /// Structurally valid apart from the CRC (lenient payload: v1 masking).
+    /// Structurally valid apart from the CRC and the payload check.
     struct_lenient: u64,
     /// ... with canonical payloads.
     struct_strict: u64,
@@ -443,17 +439,40 @@ fn run_false(config: &PhyConfig, audio: &[f32]) -> FalseStats {
     st
 }
 
+const TYPES: [MessageType; 4] = [
+    MessageType::Midi,
+    MessageType::Msc,
+    MessageType::Heartbeat,
+    MessageType::Panic,
+];
+
+/// Canonical payloads of `t` (spec §5.1), counted over all byte values.
+fn canonical_payloads(t: MessageType) -> u64 {
+    match t.payload_len() {
+        0 => 1,
+        3 => (0..1u32 << 24)
+            .filter(|v| t.payload_in_range(&v.to_be_bytes()[1..]))
+            .count() as u64,
+        n => unreachable!("payload length {n}"),
+    }
+}
+
 /// Probability that a uniformly random 14-nibble data block passes the
-/// structural checks: (lenient, strict). Version 1/16, type 6/16, then
-/// per type 2^-(pad bits + payload constraint bits).
+/// structural checks: (lenient: header, SEQ and pad only; strict: and a
+/// canonical payload). Version 1/16, type 1/16 each, SEQ 2^-6, then per
+/// type the pad bits and the canonical fraction of the payload.
 fn analytic_struct() -> (f64, f64) {
-    let p = |bits: i32| 2f64.powi(-bits);
-    // (pad bits, canonical-payload bits) per type: NoteOn, NoteOff, PC,
-    // MscLite, Heartbeat, Panic.
-    let types = [(8, 2), (16, 1), (16, 1), (0, 11), (24, 0), (24, 0)];
-    let lenient: f64 = types.iter().map(|&(pad, _)| p(pad)).sum();
-    let strict: f64 = types.iter().map(|&(pad, pl)| p(pad + pl)).sum();
-    (lenient / 256.0, strict / 256.0)
+    let mut lenient = 0.0;
+    let mut strict = 0.0;
+    for t in TYPES {
+        let pad_bits = 8 * (3 - t.payload_len() as i32);
+        let p_pad = 2f64.powi(-pad_bits);
+        lenient += p_pad;
+        let space = 2f64.powi(8 * t.payload_len() as i32);
+        strict += p_pad * canonical_payloads(t) as f64 / space;
+    }
+    let header_seq = 1.0 / (16.0 * 16.0 * 64.0);
+    (lenient * header_seq, strict * header_seq)
 }
 
 fn env_list(name: &str, default: &str) -> Vec<String> {
@@ -589,7 +608,14 @@ fn false_accept_report() {
         "ltc_fec,ltc2400_fec,ltc9600_fec,robust_fec",
     );
     let (a_len, a_strict) = analytic_struct();
-    println!("\nAnalytic structural pass per random candidate: lenient {a_len:.3e}, strict {a_strict:.3e}");
+    for t in TYPES {
+        println!("{t:?}: {} canonical payloads", canonical_payloads(t));
+    }
+    println!(
+        "\nAnalytic structural pass per random candidate: lenient {a_len:.3e} ({:.2} bits), strict {a_strict:.3e} ({:.2} bits)",
+        -a_len.log2(),
+        -a_strict.log2()
+    );
     println!(
         "CRC-16 factor 2^-16; per candidate false accept: lenient {:.3e}, strict {:.3e}",
         a_len * CRC_FACTOR,
@@ -631,7 +657,7 @@ fn false_accept_report() {
     });
 
     println!("\n### Non-Cricket audio, {seconds} s per signal\n");
-    println!("| profile | signal | false bodies / min | candidates / min | header pass / min | struct pass, v1 checks (count) | struct pass, + range checks (count) | false msgs | est. years / false msg, v1 checks | est. years / false msg, + range checks |");
+    println!("| profile | signal | false bodies / min | candidates / min | header pass / min | struct pass, no payload check (count) | struct pass, canonical payload (count) | false msgs | est. years / false msg, no payload check | est. years / false msg, canonical payload |");
     println!("|---|---|---|---|---|---|---|---|---|---|");
     let mut total_false = 0;
     let fmt = |y: f64| {

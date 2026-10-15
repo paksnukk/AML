@@ -26,11 +26,12 @@ fn tone(config: &PhyConfig, nibble: u8, len: usize, phase: f32) -> Vec<f32> {
 /// receiver never locked.
 fn first_body_error(config: &PhyConfig, offset: usize, chunk: usize) -> Option<i64> {
     let msg = TransportMessage::NoteOn {
+        channel: 0,
         note: (offset % 128) as u8,
         velocity: 100,
     };
     let mut audio = vec![0.0; offset];
-    audio.extend(CricketModemTx::new(config.clone()).encode_message_with_seq(&msg, 7));
+    audio.extend(CricketModemTx::new(config.clone()).encode_message_with_seq(&msg, 1));
     audio.extend(vec![0.0; 4096]);
 
     let mut rx = ModemRx::new(config.clone());
@@ -96,6 +97,7 @@ fn false_preamble_lock_before_packet_recovers() {
         config.repetition_k = 1;
         let period = config.samples_per_symbol_period();
         let msg = TransportMessage::NoteOn {
+            channel: 0,
             note: 64,
             velocity: 99,
         };
@@ -146,12 +148,14 @@ fn failed_body_decode_rewinds_to_packet_inside_it() {
         let tx = CricketModemTx::new(config.clone());
         let spurious = tx.encode_message_with_seq(
             &TransportMessage::NoteOn {
+                channel: 0,
                 note: 21,
                 velocity: 7,
             },
-            9,
+            2,
         );
         let msg = TransportMessage::NoteOn {
+            channel: 0,
             note: 64,
             velocity: 99,
         };

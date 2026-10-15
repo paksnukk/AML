@@ -16,6 +16,7 @@ fn profiles() -> Vec<(&'static str, PhyConfig)> {
 
 fn note_on_for(i: usize) -> TransportMessage {
     TransportMessage::NoteOn {
+        channel: 0,
         note: (i % 128) as u8,
         velocity: (1 + (i * 7) % 127) as u8,
     }
@@ -113,10 +114,15 @@ fn sync_offset_two_messages() {
                 let note = (offset % 128) as u8;
                 let messages = [
                     TransportMessage::NoteOn {
+                        channel: 0,
                         note,
                         velocity: (1 + offset % 127) as u8,
                     },
-                    TransportMessage::NoteOff { note },
+                    TransportMessage::NoteOff {
+                        channel: 0,
+                        note,
+                        velocity: 64,
+                    },
                 ];
                 if let Some(f) = run_case(&config, &messages, offset, chunk) {
                     failures.push(format!("[{name}] {f}"));

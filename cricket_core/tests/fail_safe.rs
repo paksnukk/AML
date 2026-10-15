@@ -44,6 +44,7 @@ fn silence(config: &PhyConfig, ms: usize) -> Vec<f32> {
 
 fn note_on(note: u8) -> TransportMessage {
     TransportMessage::NoteOn {
+        channel: 0,
         note,
         velocity: 100,
     }
@@ -203,7 +204,7 @@ fn bad_crc_traffic_then_silence_single_burst() {
     while stream.len() < target {
         stream.extend(bad_crc_repetition(&config, seq));
         stream.extend(silence(&config, 50));
-        seq = seq.wrapping_add(1);
+        seq = (seq + 1) % 4;
     }
     stream.extend(silence(&config, 3 * config.link_dead_ms as usize));
     for chunk in CHUNK_SIZES {
@@ -261,6 +262,19 @@ fn panic_emits_exactly_one_burst() {
             1,
             "chunk {chunk}: Panic CC64=0"
         );
+        // ... on every channel (1–16), sustain off before All Notes Off.
+        let burst: Vec<&[u8]> = before
+            .iter()
+            .filter_map(|e| match &e.out {
+                ModemOutput::Midi(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(burst.len(), 32, "chunk {chunk}");
+        for ch in 0..16u8 {
+            assert_eq!(burst[2 * ch as usize], [0xB0 | ch, 0x40, 0x00]);
+            assert_eq!(burst[2 * ch as usize + 1], [0xB0 | ch, 0x7B, 0x00]);
+        }
         assert!(
             before
                 .iter()
@@ -309,7 +323,11 @@ fn dedup_repetitions_delivered_once() {
     let mut tx = CricketModemTx::new(config.clone());
     let msgs = [
         note_on(60),
-        TransportMessage::NoteOff { note: 60 },
+        TransportMessage::NoteOff {
+            channel: 0,
+            note: 60,
+            velocity: 64,
+        },
         note_on(62),
     ];
     let mut stream = Vec::new();
@@ -363,9 +381,13 @@ fn dedup_same_seq_different_payload_delivered() {
     let config = PhyConfig::robust();
     let tx = CricketModemTx::new(config.clone());
     let a = note_on(60);
-    let b = TransportMessage::NoteOff { note: 60 };
-    let mut stream = tx.encode_message_with_seq(&a, 5);
-    stream.extend(tx.encode_message_with_seq(&b, 5));
+    let b = TransportMessage::NoteOff {
+        channel: 0,
+        note: 60,
+        velocity: 64,
+    };
+    let mut stream = tx.encode_message_with_seq(&a, 1);
+    stream.extend(tx.encode_message_with_seq(&b, 1));
     for chunk in CHUNK_SIZES {
         assert_eq!(
             decode_stream(&config, &stream, chunk),

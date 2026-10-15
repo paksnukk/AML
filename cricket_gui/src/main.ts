@@ -20,6 +20,12 @@ const profileHint = document.getElementById("profile-hint") as HTMLElement;
 const simulateCheck = document.getElementById(
   "simulate-check",
 ) as HTMLInputElement;
+const mscDeviceSelect = document.getElementById(
+  "msc-device-select",
+) as HTMLSelectElement;
+const mscFormatSelect = document.getElementById(
+  "msc-format-select",
+) as HTMLSelectElement;
 
 const refreshBtn = document.getElementById(
   "refresh-devices-btn",
@@ -89,6 +95,59 @@ interface AppSettings {
   audio_out: string | null;
   midi_in: string | null;
   midi_out: string | null;
+  msc_device_id: number;
+  msc_command_format: number;
+}
+
+const hex = (v: number) =>
+  `0x${v.toString(16).toUpperCase().padStart(2, "0")}`;
+
+/** Fill the MSC selects once: device IDs and the common command formats. */
+function populateMscSelects() {
+  if (mscDeviceSelect.options.length > 0) return;
+  const add = (select: HTMLSelectElement, value: number, text: string) => {
+    const o = document.createElement("option");
+    o.value = String(value);
+    o.textContent = text;
+    select.appendChild(o);
+  };
+  add(mscDeviceSelect, 0x7f, "All-call (0x7F)");
+  for (let id = 0; id <= 0x6f; id++) {
+    add(mscDeviceSelect, id, `${id} (${hex(id)})`);
+  }
+  for (let g = 0x70; g <= 0x7e; g++) {
+    add(mscDeviceSelect, g, `Group ${g - 0x6f} (${hex(g)})`);
+  }
+  const formats: [number, string][] = [
+    [0x01, "Lighting (General)"],
+    [0x02, "Moving Lights"],
+    [0x10, "Sound (General)"],
+    [0x20, "Machinery (General)"],
+    [0x30, "Video (General)"],
+    [0x40, "Projection (General)"],
+    [0x50, "Process Control (General)"],
+    [0x60, "Pyro (General)"],
+    [0x7f, "All-types"],
+  ];
+  for (const [v, name] of formats) {
+    add(mscFormatSelect, v, `${name} (${hex(v)})`);
+  }
+}
+
+/** Select `value` (or `fallback`), adding an option for an unlisted value. */
+function selectMsc(
+  select: HTMLSelectElement,
+  value: number | undefined,
+  fallback: number,
+) {
+  const v = String(value ?? fallback);
+  if (!Array.from(select.options).some((o) => o.value === v)) {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = hex(Number(v));
+    select.appendChild(o);
+  }
+  select.value = v;
 }
 
 function log(msg: string) {
@@ -256,6 +315,9 @@ async function loadDevices() {
     }
 
     profileSelect.value = settings.profile || "robust";
+    populateMscSelects();
+    selectMsc(mscDeviceSelect, settings.msc_device_id, 0x7f);
+    selectMsc(mscFormatSelect, settings.msc_command_format, 0x01);
     const modeRadio = document.querySelector(
       `input[name="mode"][value="${settings.mode || "both"}"]`,
     ) as HTMLInputElement | null;
@@ -279,6 +341,8 @@ async function persistSettings() {
     audio_out: selectedName(outputDeviceSelect),
     midi_in: selectedName(midiInSelect),
     midi_out: selectedName(midiOutSelect),
+    msc_device_id: Number(mscDeviceSelect.value || 0x7f),
+    msc_command_format: Number(mscFormatSelect.value || 0x01),
   };
   await invoke("set_settings", { settings });
   log("Settings saved.");
@@ -388,6 +452,8 @@ startListenBtn.addEventListener("click", async () => {
       audioIn: selectedName(inputDeviceSelect),
       midiOut: selectedName(midiOutSelect),
       profile: profileSelect.value,
+      mscDeviceId: Number(mscDeviceSelect.value || 0x7f),
+      mscCommandFormat: Number(mscFormatSelect.value || 0x01),
     });
     if (trackRun("decoder", runId)) {
       decodedDisplay.innerHTML =

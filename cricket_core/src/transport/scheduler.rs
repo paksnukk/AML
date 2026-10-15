@@ -1,5 +1,7 @@
-//! Pure TX message scheduler: priority queue, idle keepalive / NoteOff refresh,
-//! and bounded NoteOn dropping. Time is a sample counter supplied by the caller.
+//! Pure TX message scheduler (spec §5.5): priority tiers, latest-value-wins
+//! coalescing of continuous controllers, idle keepalive / NoteOff refresh,
+//! and bounded NoteOn dropping. Time is a sample counter supplied by the
+//! caller.
 //!
 //! The caller encodes only what [`TxScheduler::poll`] returns and assumes each
 //! returned message is transmitted immediately. Do not call `poll` again until
@@ -8,6 +10,7 @@
 
 use super::TransportMessage;
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 const REFRESH_CAPACITY: usize = 32;
 const REFRESH_LIFETIME_MS: u64 = 10_000;
@@ -19,44 +22,80 @@ const NOTEON_BUDGET_MS: u64 = 250;
 /// Queued NoteOns that are never dropped for the airtime budget, so a chord
 /// survives even when one message is longer than the budget (Robust).
 const MIN_KEPT_NOTE_ONS: usize = 4;
+/// Controllers that hold notes (sustain, sostenuto, hold 2). A NoteOff never
+/// overtakes a queued one on its channel: pedal down then key up must not
+/// arrive as key up then pedal down.
+const PEDAL_CONTROLLERS: [u8; 3] = [64, 66, 69];
 
-/// Allocation-free set of note numbers (one bit per `u8` value).
+/// Allocation-free set of (channel, note) pairs.
 #[derive(Clone, Copy, Default)]
-struct NoteSet([u128; 2]);
+struct NoteSet([u128; 16]);
 
 impl NoteSet {
-    fn insert(&mut self, note: u8) {
-        self.0[usize::from(note >> 7)] |= 1 << (note & 0x7F);
+    fn insert(&mut self, channel: u8, note: u8) {
+        self.0[usize::from(channel & 0x0F)] |= 1 << (note & 0x7F);
     }
 
-    fn remove(&mut self, note: u8) {
-        self.0[usize::from(note >> 7)] &= !(1 << (note & 0x7F));
+    fn remove(&mut self, channel: u8, note: u8) {
+        self.0[usize::from(channel & 0x0F)] &= !(1 << (note & 0x7F));
     }
 
-    fn contains(&self, note: u8) -> bool {
-        self.0[usize::from(note >> 7)] & (1 << (note & 0x7F)) != 0
+    fn contains(&self, channel: u8, note: u8) -> bool {
+        self.0[usize::from(channel & 0x0F)] & (1 << (note & 0x7F)) != 0
     }
 
     fn clear(&mut self) {
-        self.0 = [0; 2];
+        self.0 = [0; 16];
+    }
+
+    fn clear_channel(&mut self, channel: u8) {
+        self.0[usize::from(channel & 0x0F)] = 0;
     }
 }
 
 #[derive(Clone, Copy)]
 struct RefreshEntry {
+    channel: u8,
     note: u8,
+    velocity: u8,
     /// Stream sample when the original user NoteOff was emitted.
     emitted_at: u64,
     sent: u32,
 }
 
+impl RefreshEntry {
+    fn is(&self, channel: u8, note: u8) -> bool {
+        self.channel == channel && self.note == note
+    }
+}
+
+/// A NoteOff waiting for the queued message it must not overtake.
+#[derive(Clone, Copy)]
+struct HeldOff {
+    channel: u8,
+    note: u8,
+    velocity: u8,
+    push_sample: u64,
+}
+
+impl HeldOff {
+    fn message(&self) -> TransportMessage {
+        TransportMessage::NoteOff {
+            channel: self.channel,
+            note: self.note,
+            velocity: self.velocity,
+        }
+    }
+}
+
 struct Queued {
     msg: TransportMessage,
     push_sample: u64,
-    /// NoteOn only: a NoteOff for this note arrived while this NoteOn was
-    /// still queued (push sample of that NoteOff). It is sent right after
-    /// this NoteOn, so a short note is not released before it is struck.
-    release_after: Option<u64>,
+    /// NoteOffs that arrived while this message (a NoteOn for their note, or
+    /// a pedal controller on their channel) was queued. They are sent right
+    /// after it: a short note is not released before it is struck, and a
+    /// key released after the pedal went down stays sustained.
+    held: Vec<HeldOff>,
 }
 
 impl Queued {
@@ -64,19 +103,89 @@ impl Queued {
         Self {
             msg,
             push_sample,
-            release_after: None,
+            held: Vec::new(),
         }
     }
 
-    fn is_note_on(&self, note: u8) -> bool {
-        matches!(self.msg, TransportMessage::NoteOn { note: n, .. } if n == note)
+    /// Whether a NoteOff for (`channel`, `note`) must wait behind this.
+    fn holds_release_of(&self, channel: u8, note: u8) -> bool {
+        match self.msg {
+            TransportMessage::NoteOn {
+                channel: c,
+                note: n,
+                ..
+            } => c == channel && n == note,
+            TransportMessage::ControlChange {
+                channel: c,
+                controller,
+                ..
+            } => c == channel && PEDAL_CONTROLLERS.contains(&controller),
+            _ => false,
+        }
     }
+}
+
+/// Coalescing key of a continuous update: (kind, channel, controller / note).
+type Key = (u8, u8, u8);
+
+/// How the scheduler treats a message (spec §5.5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Panic, and the channel mode messages that end all notes on a channel
+    /// (CC 120 All Sound Off, 123 All Notes Off, 124–127 Omni / Mono / Poly).
+    Panic,
+    /// NoteOff and MSC.
+    Urgent,
+    /// Continuous data, latest value wins: CC (except below), pitch bend,
+    /// channel and poly pressure.
+    Continuous(Key),
+    /// Everything else, never coalesced: NoteOn, Program Change, Bank Select
+    /// (CC 0 / 32), RPN / NRPN / Data Entry (CC 6, 38, 96–101), CC 121 / 122,
+    /// system common.
+    Discrete,
+}
+
+fn class(msg: &TransportMessage) -> Class {
+    use TransportMessage as M;
+    match *msg {
+        M::Panic => Class::Panic,
+        M::ControlChange {
+            controller: 120 | 123..=127,
+            ..
+        } => Class::Panic,
+        M::NoteOff { .. } | M::Msc(_) => Class::Urgent,
+        M::ControlChange {
+            channel,
+            controller,
+            ..
+        } if !matches!(controller, 0 | 32 | 6 | 38 | 96..=101 | 120..=127) => {
+            Class::Continuous((0, channel, controller))
+        }
+        M::PitchBend { channel, .. } => Class::Continuous((1, channel, 0)),
+        M::ChannelPressure { channel, .. } => Class::Continuous((2, channel, 0)),
+        M::PolyPressure { channel, note, .. } => Class::Continuous((3, channel, note)),
+        _ => Class::Discrete,
+    }
+}
+
+/// Whether two messages' channel scopes overlap (`None` = not a channel
+/// message, overlaps everything).
+fn overlaps(a: Option<u8>, b: Option<u8>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+fn is_note_on(msg: &TransportMessage) -> bool {
+    matches!(msg, TransportMessage::NoteOn { .. })
 }
 
 /// Result of [`TxScheduler::poll_detailed`].
 pub struct PollResult {
     pub msg: TransportMessage,
-    /// True for Panic, NoteOff, NoteOn, ProgramChange, and MscLite from the user queues.
+    /// True for messages from the user queues (everything except NoteOff
+    /// refreshes and Heartbeats).
     pub user: bool,
 }
 
@@ -87,8 +196,11 @@ pub struct TxScheduler {
     refresh_lifetime_samples: u64,
     noteon_budget_samples: u64,
 
+    /// Panic-class messages.
     panic_q: VecDeque<Queued>,
-    note_off_q: VecDeque<Queued>,
+    /// NoteOff and MSC, in arrival order.
+    urgent_q: VecDeque<Queued>,
+    /// Everything else (NoteOn, controllers, Program Change, system common).
     normal_q: VecDeque<Queued>,
 
     /// Notes whose NoteOn has been emitted (sounding on the far side).
@@ -110,7 +222,7 @@ impl TxScheduler {
             refresh_lifetime_samples: hz * REFRESH_LIFETIME_MS / 1000,
             noteon_budget_samples: hz * NOTEON_BUDGET_MS / 1000,
             panic_q: VecDeque::new(),
-            note_off_q: VecDeque::new(),
+            urgent_q: VecDeque::new(),
             normal_q: VecDeque::new(),
             sounding: NoteSet::default(),
             refresh: VecDeque::new(),
@@ -119,19 +231,15 @@ impl TxScheduler {
         }
     }
 
-    /// Messages waiting to be sent (a NoteOff held behind its NoteOn counts).
+    /// Messages waiting to be sent (held NoteOffs count).
     pub fn queued(&self) -> usize {
-        let held_offs = self
-            .normal_q
-            .iter()
-            .filter(|q| q.release_after.is_some())
-            .count();
-        self.panic_q.len() + self.note_off_q.len() + self.normal_q.len() + held_offs
+        let held: usize = self.normal_q.iter().map(|q| q.held.len()).sum();
+        self.panic_q.len() + self.urgent_q.len() + self.normal_q.len() + held
     }
 
     /// How long the oldest queued message has waited at `now_samples`.
     pub fn oldest_wait_samples(&self, now_samples: u64) -> u64 {
-        [&self.panic_q, &self.note_off_q, &self.normal_q]
+        [&self.panic_q, &self.urgent_q, &self.normal_q]
             .iter()
             .filter_map(|q| q.iter().map(|e| e.push_sample).min())
             .min()
@@ -147,39 +255,94 @@ impl TxScheduler {
     }
 
     pub fn push(&mut self, msg: TransportMessage, push_sample: u64) {
-        match msg {
-            TransportMessage::Panic => {
-                // A NoteOn queued before the Panic would sound after it.
+        match class(&msg) {
+            Class::Panic => {
+                // A NoteOn queued before it would sound after it.
+                let scope = msg.channel();
                 self.normal_q
-                    .retain(|q| !matches!(q.msg, TransportMessage::NoteOn { .. }));
+                    .retain(|q| !(is_note_on(&q.msg) && overlaps(scope, q.msg.channel())));
                 self.panic_q.push_back(Queued::new(msg, push_sample));
             }
-            TransportMessage::NoteOff { note } => {
-                // Release after the latest queued strike of this note, if any;
-                // otherwise the note is (or will be) sounding from an earlier,
-                // already sent NoteOn and the release goes out with priority.
-                match self.normal_q.iter_mut().rev().find(|q| q.is_note_on(note)) {
-                    Some(on) => {
-                        on.release_after.get_or_insert(push_sample);
+            Class::Urgent => {
+                if let TransportMessage::NoteOff {
+                    channel,
+                    note,
+                    velocity,
+                } = msg
+                {
+                    // Release after the latest queued strike of this note or
+                    // pedal on its channel, if any; otherwise the note is (or
+                    // will be) sounding from an earlier, already sent NoteOn
+                    // and the release goes out with priority.
+                    if let Some(q) = self
+                        .normal_q
+                        .iter_mut()
+                        .rev()
+                        .find(|q| q.holds_release_of(channel, note))
+                    {
+                        if !q
+                            .held
+                            .iter()
+                            .any(|h| h.channel == channel && h.note == note)
+                        {
+                            q.held.push(HeldOff {
+                                channel,
+                                note,
+                                velocity,
+                                push_sample,
+                            });
+                        }
+                        return;
                     }
-                    None => self.note_off_q.push_back(Queued::new(msg, push_sample)),
+                }
+                self.urgent_q.push_back(Queued::new(msg, push_sample));
+            }
+            Class::Continuous(key) => {
+                if !self.coalesce(&msg, key) {
+                    self.normal_q.push_back(Queued::new(msg, push_sample));
                 }
             }
-            TransportMessage::NoteOn { .. } => {
-                while self
-                    .droppable_airtime_samples()
-                    .saturating_add(self.message_samples)
-                    > self.noteon_budget_samples
-                    && self.queued_note_ons() >= MIN_KEPT_NOTE_ONS
-                {
-                    if !self.drop_oldest_note_on() {
-                        break;
+            Class::Discrete => {
+                if is_note_on(&msg) {
+                    while self
+                        .droppable_airtime_samples()
+                        .saturating_add(self.message_samples)
+                        > self.noteon_budget_samples
+                        && self.queued_note_ons() >= MIN_KEPT_NOTE_ONS
+                    {
+                        if !self.drop_oldest_note_on() {
+                            break;
+                        }
                     }
                 }
                 self.normal_q.push_back(Queued::new(msg, push_sample));
             }
-            other => self.normal_q.push_back(Queued::new(other, push_sample)),
         }
+    }
+
+    /// Latest value wins: replace the newest queued update with the same key
+    /// in place, unless a message it must stay ordered with is queued after
+    /// it (a non-continuous message of the same channel or a system message,
+    /// or NoteOffs held behind a pedal). Updates of other controllers are
+    /// independent and do not block. Returns false if `msg` must be appended.
+    fn coalesce(&mut self, msg: &TransportMessage, key: Key) -> bool {
+        let channel = Some(key.1);
+        for q in self.normal_q.iter_mut().rev() {
+            let same_channel = overlaps(q.msg.channel(), channel);
+            match class(&q.msg) {
+                Class::Continuous(k) if k == key => {
+                    if !q.held.is_empty() {
+                        return false;
+                    }
+                    q.msg = msg.clone();
+                    return true;
+                }
+                Class::Continuous(_) if q.held.is_empty() || !same_channel => {}
+                _ if same_channel => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn poll(&mut self, now_samples: u64) -> Option<TransportMessage> {
@@ -188,24 +351,33 @@ impl TxScheduler {
 
     pub fn poll_detailed(&mut self, now_samples: u64) -> Option<PollResult> {
         if let Some(q) = self.panic_q.pop_front() {
-            self.sounding.clear();
-            return Some(self.emit(q.msg, now_samples, true));
-        }
-        if let Some(q) = self.note_off_q.pop_front() {
-            if let TransportMessage::NoteOff { note } = q.msg {
-                self.sounding.remove(note);
-                self.push_refresh(note, now_samples);
+            match q.msg.channel() {
+                Some(ch) => self.sounding.clear_channel(ch),
+                None => self.sounding.clear(),
             }
             return Some(self.emit(q.msg, now_samples, true));
         }
-        if let Some(q) = self.normal_q.pop_front() {
-            if let TransportMessage::NoteOn { note, .. } = q.msg {
-                self.cancel_refresh(note);
-                self.sounding.insert(note);
-                if let Some(push_sample) = q.release_after {
-                    self.note_off_q
-                        .push_back(Queued::new(TransportMessage::NoteOff { note }, push_sample));
-                }
+        if let Some(q) = self.urgent_q.pop_front() {
+            if let TransportMessage::NoteOff {
+                channel,
+                note,
+                velocity,
+            } = q.msg
+            {
+                self.sounding.remove(channel, note);
+                self.push_refresh(channel, note, velocity, now_samples);
+            }
+            return Some(self.emit(q.msg, now_samples, true));
+        }
+        if let Some(i) = self.next_normal() {
+            let q = self.normal_q.remove(i).expect("index in range");
+            if let TransportMessage::NoteOn { channel, note, .. } = q.msg {
+                self.cancel_refresh(channel, note);
+                self.sounding.insert(channel, note);
+            }
+            for h in &q.held {
+                self.urgent_q
+                    .push_back(Queued::new(h.message(), h.push_sample));
             }
             return Some(self.emit(q.msg, now_samples, true));
         }
@@ -215,8 +387,8 @@ impl TxScheduler {
             return None;
         }
 
-        if let Some(note) = self.take_refresh() {
-            return Some(self.emit(TransportMessage::NoteOff { note }, now_samples, false));
+        if let Some(msg) = self.take_refresh() {
+            return Some(self.emit(msg, now_samples, false));
         }
 
         if now_samples < self.next_keepalive_sample() {
@@ -225,18 +397,41 @@ impl TxScheduler {
         Some(self.emit(TransportMessage::Heartbeat, now_samples, false))
     }
 
+    /// Index of the next normal-tier message. Non-continuous messages go in
+    /// arrival order, each after the continuous updates of its own channel
+    /// queued before it, but ahead of those of other channels (a NoteOn on
+    /// one channel does not wait behind a fader on another). With only
+    /// continuous updates queued, the oldest goes first.
+    fn next_normal(&self) -> Option<usize> {
+        let first_discrete = self
+            .normal_q
+            .iter()
+            .position(|q| !matches!(class(&q.msg), Class::Continuous(_)));
+        let Some(d) = first_discrete else {
+            return (!self.normal_q.is_empty()).then_some(0);
+        };
+        // Everything before `d` is a continuous update; the first one of
+        // `d`'s channel (or `d` itself) goes now.
+        let scope = self.normal_q[d].msg.channel();
+        self.normal_q
+            .iter()
+            .position(|e| overlaps(e.msg.channel(), scope))
+    }
+
     fn emit(&mut self, msg: TransportMessage, now_samples: u64, user: bool) -> PollResult {
         self.last_emit_sample = Some(now_samples);
         PollResult { msg, user }
     }
 
-    fn push_refresh(&mut self, note: u8, emitted_at: u64) {
-        self.cancel_refresh(note);
+    fn push_refresh(&mut self, channel: u8, note: u8, velocity: u8, emitted_at: u64) {
+        self.cancel_refresh(channel, note);
         if self.refresh.len() >= REFRESH_CAPACITY {
             self.refresh.pop_front();
         }
         self.refresh.push_back(RefreshEntry {
+            channel,
             note,
+            velocity,
             emitted_at,
             sent: 0,
         });
@@ -246,19 +441,24 @@ impl TxScheduler {
     /// release. A fresh NoteOff is not stuck behind notes that already had
     /// several repeats, and the release that has waited longest is not stuck
     /// behind newer ones.
-    fn take_refresh(&mut self) -> Option<u8> {
+    fn take_refresh(&mut self) -> Option<TransportMessage> {
         let i = (0..self.refresh.len())
             .min_by_key(|&i| (self.refresh[i].sent, self.refresh[i].emitted_at))?;
-        let note = self.refresh[i].note;
-        self.refresh[i].sent += 1;
-        if self.refresh[i].sent >= REFRESH_MAX_REPEATS {
+        let e = &mut self.refresh[i];
+        e.sent += 1;
+        let msg = TransportMessage::NoteOff {
+            channel: e.channel,
+            note: e.note,
+            velocity: e.velocity,
+        };
+        if e.sent >= REFRESH_MAX_REPEATS {
             self.refresh.remove(i);
         }
-        Some(note)
+        Some(msg)
     }
 
-    fn cancel_refresh(&mut self, note: u8) {
-        self.refresh.retain(|e| e.note != note);
+    fn cancel_refresh(&mut self, channel: u8, note: u8) {
+        self.refresh.retain(|e| !e.is(channel, note));
     }
 
     fn prune_refresh(&mut self, now_samples: u64) {
@@ -267,43 +467,29 @@ impl TxScheduler {
     }
 
     fn queued_note_ons(&self) -> usize {
-        self.normal_q
-            .iter()
-            .filter(|q| matches!(q.msg, TransportMessage::NoteOn { .. }))
-            .count()
+        self.normal_q.iter().filter(|q| is_note_on(&q.msg)).count()
     }
 
     /// Airtime of queued NoteOns, plus the NoteOffs held behind them.
     fn droppable_airtime_samples(&self) -> u64 {
         self.normal_q
             .iter()
-            .filter(|q| matches!(q.msg, TransportMessage::NoteOn { .. }))
-            .map(|q| {
-                if q.release_after.is_some() {
-                    self.message_samples.saturating_mul(2)
-                } else {
-                    self.message_samples
-                }
-            })
+            .filter(|q| is_note_on(&q.msg))
+            .map(|q| self.message_samples.saturating_mul(1 + q.held.len() as u64))
             .fold(0u64, u64::saturating_add)
     }
 
     fn drop_oldest_note_on(&mut self) -> bool {
-        let Some(pos) = self
-            .normal_q
-            .iter()
-            .position(|q| matches!(q.msg, TransportMessage::NoteOn { .. }))
-        else {
+        let Some(pos) = self.normal_q.iter().position(|q| is_note_on(&q.msg)) else {
             return false;
         };
         let q = self.normal_q.remove(pos).expect("position is in range");
         // The held NoteOff goes with its NoteOn, unless the note is still
         // sounding from an earlier strike: then the release must still go out.
-        if let (TransportMessage::NoteOn { note, .. }, Some(push_sample)) = (q.msg, q.release_after)
-        {
-            if self.sounding.contains(note) {
-                self.note_off_q
-                    .push_back(Queued::new(TransportMessage::NoteOff { note }, push_sample));
+        for h in q.held {
+            if self.sounding.contains(h.channel, h.note) {
+                self.urgent_q
+                    .push_back(Queued::new(h.message(), h.push_sample));
             }
         }
         self.note_on_dropped = true;
@@ -316,7 +502,9 @@ mod tests {
     use super::*;
     use crate::modem::repetition_samples;
     use crate::phy::PhyConfig;
-    use TransportMessage::{Heartbeat, NoteOff, NoteOn, Panic};
+    use crate::transport::msc::{MscCommand, MscCue, MscMessage};
+    use alloc::vec;
+    use TransportMessage::{ControlChange, Heartbeat, Panic, PitchBend, ProgramChange};
 
     fn scheduler(config: &PhyConfig) -> TxScheduler {
         let msg_samples = repetition_samples(config) * config.repetition_k.max(1) as u64;
@@ -329,10 +517,43 @@ mod tests {
     }
 
     fn on(note: u8) -> TransportMessage {
-        NoteOn {
+        on_ch(0, note)
+    }
+
+    fn on_ch(channel: u8, note: u8) -> TransportMessage {
+        TransportMessage::NoteOn {
+            channel,
             note,
             velocity: 100,
         }
+    }
+
+    fn off(note: u8) -> TransportMessage {
+        off_ch(0, note)
+    }
+
+    fn off_ch(channel: u8, note: u8) -> TransportMessage {
+        TransportMessage::NoteOff {
+            channel,
+            note,
+            velocity: 64,
+        }
+    }
+
+    fn cc(channel: u8, controller: u8, value: u8) -> TransportMessage {
+        ControlChange {
+            channel,
+            controller,
+            value,
+        }
+    }
+
+    fn go() -> TransportMessage {
+        TransportMessage::Msc(MscMessage::cue(
+            MscCommand::Go,
+            MscCue::from_tenths(10).unwrap(),
+            None,
+        ))
     }
 
     /// Plays `note` and releases it; returns the sample after the release.
@@ -340,8 +561,8 @@ mod tests {
         let msg = s.message_samples;
         s.push(on(note), t);
         assert_eq!(s.poll(t), Some(on(note)));
-        s.push(NoteOff { note }, t + msg);
-        assert_eq!(s.poll(t + msg), Some(NoteOff { note }));
+        s.push(off(note), t + msg);
+        assert_eq!(s.poll(t + msg), Some(off(note)));
         t + msg
     }
 
@@ -349,14 +570,27 @@ mod tests {
         s.refresh.iter().map(|e| e.note).collect()
     }
 
+    /// Everything queued, in send order (polling at one time: no refresh
+    /// or heartbeat).
+    fn drain(s: &mut TxScheduler) -> Vec<TransportMessage> {
+        let msg = s.message_samples;
+        let mut out = Vec::new();
+        let mut t = 1_000_000;
+        while s.queued() > 0 {
+            out.push(s.poll(t).unwrap());
+            t += msg;
+        }
+        out
+    }
+
     #[test]
     fn priority_panic_note_off_note_on() {
         let mut s = fast_scheduler();
-        s.push(NoteOff { note: 70 }, 0);
+        s.push(off(70), 0);
         s.push(Panic, 0);
         s.push(on(60), 0);
         assert_eq!(s.poll(0), Some(Panic));
-        assert_eq!(s.poll(0), Some(NoteOff { note: 70 }));
+        assert_eq!(s.poll(0), Some(off(70)));
         assert_eq!(s.poll(0), Some(on(60)));
         assert_eq!(s.poll(0), None);
     }
@@ -365,11 +599,75 @@ mod tests {
     fn panic_discards_note_ons_queued_before_it() {
         let mut s = fast_scheduler();
         s.push(on(60), 0);
-        s.push(on(61), 0);
+        s.push(on_ch(5, 61), 0);
         s.push(Panic, 0);
         assert_eq!(s.queued(), 1);
         assert_eq!(s.poll(0), Some(Panic));
         assert_eq!(s.poll(0), None);
+    }
+
+    /// All Notes Off / All Sound Off / mode changes are Panic-class for
+    /// their channel only; Reset All Controllers and Local Control keep
+    /// their place among the other messages.
+    #[test]
+    fn channel_mode_messages() {
+        let mut s = fast_scheduler();
+        s.push(on_ch(1, 60), 0);
+        s.push(on_ch(2, 61), 0);
+        s.push(cc(1, 7, 100), 0);
+        s.push(cc(1, 121, 0), 0);
+        s.push(cc(1, 123, 0), 0);
+        assert_eq!(
+            drain(&mut s),
+            vec![cc(1, 123, 0), on_ch(2, 61), cc(1, 7, 100), cc(1, 121, 0)]
+        );
+        for c in [120, 124, 125, 126, 127] {
+            assert!(class(&cc(0, c, 0)) == Class::Panic);
+        }
+        assert!(class(&cc(0, 122, 0)) == Class::Discrete);
+        // Not coalesced: two in a row are both sent.
+        s.push(cc(3, 123, 0), 0);
+        s.push(cc(3, 123, 0), 0);
+        assert_eq!(s.queued(), 2);
+    }
+
+    #[test]
+    fn channel_all_notes_off_clears_only_its_channel() {
+        let mut s = fast_scheduler();
+        s.push(on_ch(1, 60), 0);
+        s.push(on_ch(2, 60), 0);
+        drain(&mut s);
+        s.push(cc(1, 123, 0), 0);
+        drain(&mut s);
+        assert!(!s.sounding.contains(1, 60));
+        assert!(s.sounding.contains(2, 60));
+    }
+
+    #[test]
+    fn msc_goes_with_note_offs_ahead_of_notes() {
+        let mut s = fast_scheduler();
+        s.push(on(60), 0);
+        s.push(
+            ProgramChange {
+                channel: 0,
+                program: 3,
+            },
+            0,
+        );
+        s.push(go(), 0);
+        s.push(off(50), 0);
+        assert_eq!(
+            drain(&mut s),
+            vec![
+                go(),
+                off(50),
+                on(60),
+                ProgramChange {
+                    channel: 0,
+                    program: 3
+                }
+            ]
+        );
     }
 
     #[test]
@@ -388,9 +686,26 @@ mod tests {
         let msg = s.message_samples;
         let t = play_and_release(&mut s, 60, 0);
         assert_eq!(s.poll(t), None);
-        assert_eq!(s.poll(t + msg), Some(NoteOff { note: 60 }));
+        assert_eq!(s.poll(t + msg), Some(off(60)));
         assert_eq!(s.poll(t + msg), None);
-        assert_eq!(s.poll(t + 2 * msg), Some(NoteOff { note: 60 }));
+        assert_eq!(s.poll(t + 2 * msg), Some(off(60)));
+    }
+
+    /// Refreshes repeat the NoteOff as sent (channel and velocity).
+    #[test]
+    fn refresh_keeps_channel_and_velocity() {
+        let mut s = fast_scheduler();
+        let msg = s.message_samples;
+        let release = TransportMessage::NoteOff {
+            channel: 9,
+            note: 38,
+            velocity: 12,
+        };
+        s.push(on_ch(9, 38), 0);
+        s.poll(0);
+        s.push(release.clone(), msg);
+        assert_eq!(s.poll(msg), Some(release.clone()));
+        assert_eq!(s.poll(2 * msg), Some(release));
     }
 
     #[test]
@@ -399,9 +714,9 @@ mod tests {
         let msg = s.message_samples;
         play_and_release(&mut s, 10, 0);
         let t = play_and_release(&mut s, 20, 2 * msg);
-        assert_eq!(s.poll(t + msg), Some(NoteOff { note: 10 }));
-        assert_eq!(s.poll(t + 2 * msg), Some(NoteOff { note: 20 }));
-        assert_eq!(s.poll(t + 3 * msg), Some(NoteOff { note: 10 }));
+        assert_eq!(s.poll(t + msg), Some(off(10)));
+        assert_eq!(s.poll(t + 2 * msg), Some(off(20)));
+        assert_eq!(s.poll(t + 3 * msg), Some(off(10)));
     }
 
     #[test]
@@ -419,10 +734,14 @@ mod tests {
         let mut s = fast_scheduler();
         let hb = s.heartbeat_interval_samples;
         let t = play_and_release(&mut s, 60, 0);
-        s.push(on(60), t + 1);
-        assert_eq!(s.poll(t + 1), Some(on(60)));
+        // The same note on another channel is another note.
+        s.push(on_ch(1, 60), t + 1);
+        assert_eq!(s.poll(t + 1), Some(on_ch(1, 60)));
+        assert_eq!(refresh_notes(&s), vec![60]);
+        s.push(on(60), t + 2);
+        assert_eq!(s.poll(t + 2), Some(on(60)));
         assert!(refresh_notes(&s).is_empty());
-        assert_eq!(s.poll(t + 1 + hb), Some(Heartbeat));
+        assert_eq!(s.poll(t + 2 + hb), Some(Heartbeat));
     }
 
     #[test]
@@ -432,12 +751,12 @@ mod tests {
         for note in 0..33u8 {
             s.push(on(note), t);
             let _ = s.poll(t);
-            s.push(NoteOff { note }, t + 1);
+            s.push(off(note), t + 1);
             let _ = s.poll(t + 1);
             t += 2;
         }
         assert!(!refresh_notes(&s).contains(&0));
-        assert_eq!(s.poll(t + s.message_samples), Some(NoteOff { note: 1 }));
+        assert_eq!(s.poll(t + s.message_samples), Some(off(1)));
     }
 
     #[test]
@@ -456,7 +775,7 @@ mod tests {
         let mut t = play_and_release(&mut s, 60, 0);
         for _ in 0..REFRESH_MAX_REPEATS {
             t += msg;
-            assert_eq!(s.poll(t), Some(NoteOff { note: 60 }));
+            assert_eq!(s.poll(t), Some(off(60)));
         }
         assert!(refresh_notes(&s).is_empty());
         assert_eq!(s.poll(t + msg), None);
@@ -468,10 +787,10 @@ mod tests {
         let mut s = fast_scheduler();
         let msg = s.message_samples;
         s.push(on(60), 0);
-        s.push(NoteOff { note: 60 }, 0);
+        s.push(off(60), 0);
         assert_eq!(s.queued(), 2);
         assert_eq!(s.poll(0), Some(on(60)));
-        assert_eq!(s.poll(msg), Some(NoteOff { note: 60 }));
+        assert_eq!(s.poll(msg), Some(off(60)));
     }
 
     /// Off, on, off on a note that is already sounding (a trill or a roll)
@@ -482,22 +801,13 @@ mod tests {
         let msg = s.message_samples;
         s.push(on(60), 0);
         assert_eq!(s.poll(0), Some(on(60)));
-        s.push(NoteOff { note: 60 }, 10);
+        s.push(off(60), 10);
         s.push(on(60), 20);
-        s.push(NoteOff { note: 60 }, 30);
+        s.push(off(60), 30);
         s.push(on(60), 40);
-        s.push(NoteOff { note: 60 }, 50);
+        s.push(off(60), 50);
         let sent: Vec<_> = (1..=5).map(|i| s.poll(i * msg).unwrap()).collect();
-        assert_eq!(
-            sent,
-            vec![
-                NoteOff { note: 60 },
-                on(60),
-                NoteOff { note: 60 },
-                on(60),
-                NoteOff { note: 60 }
-            ]
-        );
+        assert_eq!(sent, vec![off(60), on(60), off(60), on(60), off(60)]);
         assert_eq!(s.queued(), 0);
         assert_eq!(refresh_notes(&s), vec![60]);
     }
@@ -508,11 +818,11 @@ mod tests {
         let msg = s.message_samples;
         s.push(on(60), 0);
         let _ = s.poll(0);
-        s.push(NoteOff { note: 60 }, msg);
+        s.push(off(60), msg);
         for i in 0..50u8 {
             s.push(on(70 + i), msg + i as u64);
         }
-        assert_eq!(s.poll(msg), Some(NoteOff { note: 60 }));
+        assert_eq!(s.poll(msg), Some(off(60)));
     }
 
     #[test]
@@ -552,12 +862,183 @@ mod tests {
         s.push(on(60), 0);
         assert_eq!(s.poll(0), Some(on(60)));
         s.push(on(60), 1);
-        s.push(NoteOff { note: 60 }, 2);
+        s.push(off(60), 2);
         for n in 70..80u8 {
             s.push(on(n), 3);
         }
         assert!(s.note_on_dropped);
-        assert_eq!(s.poll(4), Some(NoteOff { note: 60 }));
+        assert_eq!(s.poll(4), Some(off(60)));
+    }
+
+    // -- Coalescing --------------------------------------------------------
+
+    #[test]
+    fn continuous_updates_coalesce_latest_value_wins() {
+        let mut s = fast_scheduler();
+        for v in 0..100u8 {
+            s.push(cc(0, 7, v), 0);
+            s.push(
+                PitchBend {
+                    channel: 0,
+                    value: v as u16 * 100,
+                },
+                0,
+            );
+            s.push(
+                TransportMessage::ChannelPressure {
+                    channel: 0,
+                    pressure: v,
+                },
+                0,
+            );
+            s.push(
+                TransportMessage::PolyPressure {
+                    channel: 0,
+                    note: 60,
+                    pressure: v,
+                },
+                0,
+            );
+            s.push(cc(1, 7, v), 0); // another channel: its own entry
+        }
+        assert_eq!(s.queued(), 5);
+        assert_eq!(
+            drain(&mut s),
+            vec![
+                cc(0, 7, 99),
+                PitchBend {
+                    channel: 0,
+                    value: 9900
+                },
+                TransportMessage::ChannelPressure {
+                    channel: 0,
+                    pressure: 99
+                },
+                TransportMessage::PolyPressure {
+                    channel: 0,
+                    note: 60,
+                    pressure: 99
+                },
+                cc(1, 7, 99),
+            ]
+        );
+    }
+
+    /// A controller value queued before a NoteOn of its channel stays before
+    /// it (the note is struck with that value); newer values go after it.
+    #[test]
+    fn coalescing_never_crosses_a_note_of_the_channel() {
+        let mut s = fast_scheduler();
+        s.push(cc(0, 74, 10), 0);
+        s.push(on(60), 0);
+        s.push(cc(0, 74, 20), 0);
+        s.push(cc(0, 74, 30), 0);
+        s.push(cc(2, 74, 1), 0); // other channel
+        s.push(cc(2, 74, 2), 0);
+        assert_eq!(
+            drain(&mut s),
+            vec![cc(0, 74, 10), on(60), cc(0, 74, 30), cc(2, 74, 2)]
+        );
+    }
+
+    /// Bank Select, RPN / NRPN and Data Entry are never coalesced and stay
+    /// in order with the Program Change after them.
+    #[test]
+    fn bank_select_rpn_and_program_change_keep_order() {
+        let mut s = fast_scheduler();
+        let seq = vec![
+            cc(0, 0, 1),
+            cc(0, 32, 2),
+            ProgramChange {
+                channel: 0,
+                program: 5,
+            },
+            cc(0, 101, 0),
+            cc(0, 100, 0),
+            cc(0, 6, 12),
+            cc(0, 38, 0),
+            cc(0, 101, 127),
+            cc(0, 100, 127),
+            cc(0, 0, 1),
+            cc(0, 32, 3),
+            ProgramChange {
+                channel: 0,
+                program: 6,
+            },
+            ProgramChange {
+                channel: 0,
+                program: 6,
+            },
+        ];
+        for m in &seq {
+            s.push(m.clone(), 0);
+        }
+        // A fader on the same channel between them does not move them.
+        s.push(cc(0, 7, 1), 0);
+        s.push(cc(0, 7, 2), 0);
+        let mut want = seq.clone();
+        want.push(cc(0, 7, 2));
+        assert_eq!(drain(&mut s), want);
+    }
+
+    /// Pedal down then key up must not become key up then pedal down: the
+    /// NoteOff waits behind the queued pedal, and the pedal is not
+    /// coalesced past it.
+    #[test]
+    fn note_off_never_overtakes_sustain_pedal() {
+        let mut s = fast_scheduler();
+        s.push(on(60), 0);
+        assert_eq!(s.poll(0), Some(on(60)));
+        s.push(cc(0, 64, 127), 1);
+        s.push(off(60), 2);
+        s.push(off_ch(1, 61), 2); // other channel: not held
+        s.push(cc(0, 64, 0), 3);
+        assert_eq!(
+            drain(&mut s),
+            vec![off_ch(1, 61), cc(0, 64, 127), off(60), cc(0, 64, 0)]
+        );
+        // Without a NoteOff in between, pedal values coalesce.
+        s.push(cc(0, 64, 127), 10);
+        s.push(cc(0, 64, 0), 11);
+        s.push(cc(0, 64, 90), 12);
+        assert_eq!(drain(&mut s), vec![cc(0, 64, 90)]);
+    }
+
+    /// Notes on one channel do not wait behind controller updates of other
+    /// channels; the controller updates follow.
+    #[test]
+    fn notes_overtake_controllers_of_other_channels_only() {
+        let mut s = fast_scheduler();
+        for c in 1..8u8 {
+            s.push(cc(c, 7, 1), 0);
+        }
+        s.push(cc(0, 1, 5), 0);
+        s.push(on(60), 0);
+        s.push(on_ch(3, 61), 0);
+        // Each NoteOn waits for its own channel's update only.
+        assert_eq!(
+            drain(&mut s),
+            vec![
+                cc(0, 1, 5),
+                on(60),
+                cc(3, 7, 1),
+                on_ch(3, 61),
+                cc(1, 7, 1),
+                cc(2, 7, 1),
+                cc(4, 7, 1),
+                cc(5, 7, 1),
+                cc(6, 7, 1),
+                cc(7, 7, 1),
+            ]
+        );
+        // System messages keep their place relative to everything.
+        s.push(cc(4, 7, 1), 0);
+        s.push(TransportMessage::SongSelect { song: 2 }, 0);
+        s.push(on(1), 0);
+        assert_eq!(
+            drain(&mut s),
+            vec![cc(4, 7, 1), TransportMessage::SongSelect { song: 2 }, on(1)]
+        );
     }
 
     #[test]
@@ -573,7 +1054,7 @@ mod tests {
 
         while stream < duration || s.queued() > 0 {
             while next_push <= stream && next_push < duration {
-                s.push(on(note), next_push);
+                s.push(on(note & 0x7F), next_push);
                 note = note.wrapping_add(1);
                 next_push += interval;
             }

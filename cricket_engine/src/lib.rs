@@ -11,6 +11,7 @@
 //!     midi_out: MidiOut::Device(DeviceSelector::Index(0)),
 //!     profile: "robust".into(),
 //!     link_dead_ms: None,
+//!     msc: MscTarget::default(),
 //! })?;
 //! let enc = EncoderHandle::start(EncoderConfig {
 //!     audio_out: AudioOut::Device(DeviceSelector::Default),
@@ -46,7 +47,7 @@ mod loopback_tests;
 pub use audio::{
     AudioIn, AudioOut, AudioSink, AudioSource, DeviceErrorQueue, OpenAudioSink, OpenAudioSource,
 };
-pub use cricket_core::transport::TransportMessage;
+pub use cricket_core::transport::{MscTarget, TransportMessage};
 pub use decoder::{DecoderConfig, DecoderHandle};
 pub use devices::DeviceSelector;
 pub use encoder::{EncoderConfig, EncoderHandle};

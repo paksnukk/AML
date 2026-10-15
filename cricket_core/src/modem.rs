@@ -1,11 +1,10 @@
 use crate::link::{
     body_nibble_count, bytes_to_nibbles, decode_packet_bytes, deinterleave, encode_packet_bytes,
     fec_candidate_is_valid, interleave, nibbles_to_bytes, BodySymbol, FecCodec, Packet,
+    SEQ_MODULUS,
 };
 use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
-use crate::transport::{
-    fail_safe_burst, message_to_midi, FailSafeMonitor, MessageType, TransportMessage,
-};
+use crate::transport::{FailSafeMonitor, MessageType, MidiOutput, MscTarget, TransportMessage};
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -58,9 +57,10 @@ impl CricketModemTx {
         &self.config
     }
 
+    /// SEQ for the next packet: 0, 1, 2, 3, 0, … (spec §4.1).
     pub fn next_seq(&mut self) -> u8 {
         let s = self.seq;
-        self.seq = self.seq.wrapping_add(1);
+        self.seq = (self.seq + 1) % SEQ_MODULUS;
         s
     }
 
@@ -69,6 +69,7 @@ impl CricketModemTx {
         self.encode_message_with_seq(msg, seq)
     }
 
+    /// Encode `msg` with SEQ `seq` (0–3; panics otherwise).
     pub fn encode_message_with_seq(&self, msg: &TransportMessage, seq: u8) -> Vec<f32> {
         let packet = Packet {
             msg_type: msg.msg_type(),
@@ -162,6 +163,8 @@ pub struct CricketModemRx {
     /// Recently accepted packets (raw bytes, end sample) for duplicate suppression.
     recent: VecDeque<(Vec<u8>, u64)>,
     dedup_window: u64,
+    /// MIDI mapping and the state the fail-safe burst needs.
+    midi: MidiOutput,
 }
 
 impl CricketModemRx {
@@ -189,7 +192,26 @@ impl CricketModemRx {
             last_link_dead_sample: None,
             recent: VecDeque::new(),
             dedup_window,
+            midi: MidiOutput::default(),
         }
+    }
+
+    /// Device ID and command format of the MSC SysEx this receiver outputs
+    /// (spec §5.4; default all-call `0x7F`, Lighting (General) `0x01`).
+    pub fn set_msc_target(&mut self, target: MscTarget) {
+        self.midi.set_msc_target(target);
+    }
+
+    pub fn msc_target(&self) -> MscTarget {
+        self.midi.msc_target()
+    }
+
+    /// The fail-safe burst (spec §5.3) for a caller that declares link-dead
+    /// itself ([`declare_link_dead`](Self::declare_link_dead)): CC64 = 0 and
+    /// CC123 on every channel, plus pitch bend to center on channels this
+    /// receiver left bent.
+    pub fn fail_safe_burst(&mut self) -> Vec<Vec<u8>> {
+        self.midi.fail_safe()
     }
 
     pub fn stats(&self) -> ModemStats {
@@ -300,12 +322,12 @@ impl CricketModemRx {
     }
 
     /// Fire link-dead if its deadline sample lies before stream position `now`.
-    /// Emits one fail-safe burst (CC64=0, CC123) and `LinkDead`, then clears
+    /// Emits one fail-safe burst (spec §5.3) and `LinkDead`, then clears
     /// the duplicate history. The phy is not flushed: during silence it is
     /// already searching, and a packet still in flight may revive the link.
     fn poll_fail_safe(&mut self, now: u64, outputs: &mut Vec<ModemOutput>) {
         if let Some(at) = self.fail_safe.poll(now) {
-            outputs.extend(fail_safe_burst().into_iter().map(ModemOutput::Midi));
+            outputs.extend(self.midi.fail_safe().into_iter().map(ModemOutput::Midi));
             outputs.push(ModemOutput::LinkDead);
             self.link_dead = true;
             self.last_link_dead_sample = Some(at);
@@ -358,8 +380,12 @@ impl CricketModemRx {
             return false;
         }
         let slice = &bytes[..needed];
-        match decode_packet_bytes(slice) {
-            Ok(packet) => {
+        let decoded = decode_packet_bytes(slice).ok().and_then(|packet| {
+            let msg = TransportMessage::from_type_payload(packet.msg_type, &packet.payload)?;
+            Some((packet, msg))
+        });
+        match decoded {
+            Some((packet, msg)) => {
                 self.crc_pass += 1;
                 // A deadline that passed before this packet ended fires first.
                 self.poll_fail_safe(end, outputs);
@@ -372,19 +398,16 @@ impl CricketModemRx {
                 self.recent.push_back((slice.to_vec(), end));
                 self.last_seq = Some(packet.seq);
 
-                let Some(msg) =
-                    TransportMessage::from_type_payload(packet.msg_type, &packet.payload)
-                else {
-                    return true;
-                };
                 // Panic: the burst below is the only one; the phy is confirmed
                 // past this packet (back in search) right after. The duplicate history is
                 // kept so the next repetition of the Panic is suppressed.
-                outputs.extend(message_to_midi(&msg).into_iter().map(ModemOutput::Midi));
+                outputs.extend(self.midi.message(&msg).into_iter().map(ModemOutput::Midi));
                 outputs.push(ModemOutput::Message(msg));
                 true
             }
-            Err(_) => {
+            // CRC, version, SEQ or payload check failed (a CRC-valid packet
+            // with a non-canonical payload is treated as a false decode).
+            None => {
                 self.crc_fail += 1;
                 false
             }
@@ -394,8 +417,7 @@ impl CricketModemRx {
 
 impl CricketModemRx {
     /// FEC-decode the collected body into packet bytes (+ zero pad). A
-    /// candidate is accepted only if its packet passes CRC-16 / version /
-    /// type checks and its pad bytes are zero.
+    /// candidate is accepted only if [`fec_candidate_is_valid`].
     fn fec_packet_bytes(&mut self) -> Option<Vec<u8>> {
         let fec = self.fec.as_ref()?;
         let decoded = fec.decode_body(&self.body_symbols, fec_candidate_is_valid)?;

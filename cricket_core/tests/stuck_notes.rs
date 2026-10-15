@@ -1,6 +1,7 @@
-//! Stuck-note test (v1.1 plan A6, goal 2): random NoteOn/NoteOff pairs sent
-//! through a corrupted channel must end with every note released, either by
-//! its NoteOff or by the fail-safe burst (CC64 = 0, CC123).
+//! Stuck-note test (v1.1 plan A6, goal 2): random NoteOn/NoteOff pairs on
+//! several MIDI channels sent through a corrupted channel must end with every
+//! note released, either by its NoteOff or by the fail-safe burst (CC64 = 0,
+//! CC123 on every channel).
 //!
 //! A small MIDI receiver model consumes the decoder's `ModemOutput::Midi`
 //! messages in order and tracks the sounding notes. The stream mimics the real
@@ -35,6 +36,8 @@ const CORRUPTION_LEVELS: [f64; 3] = [0.005, 0.01, 0.02];
 const SNR_DB: f32 = 20.0;
 const CHUNK_SIZES: [usize; 6] = [64, 128, 240, 512, 1024, 4096];
 const MAX_HELD: usize = 6;
+/// MIDI channels the notes are spread over (1, 2, 10 and 16).
+const CHANNELS: [u8; 4] = [0, 1, 9, 15];
 /// TX keeps idling (heartbeats only) this long after the last NoteOff before
 /// the "link alive" checkpoint; longer than `link_dead_ms`.
 const IDLE_TAIL_MS: usize = 3000;
@@ -47,56 +50,70 @@ fn ms_to_samples(config: &PhyConfig, ms: usize) -> usize {
 // MIDI receiver model
 // ---------------------------------------------------------------------------
 
-/// Minimal MIDI synth state (channel 1): held keys, notes ringing on the
-/// sustain pedal, and the pedal itself.
+/// A note on a channel: (channel 0–15, note).
+type Key = (u8, u8);
+
+/// Minimal multi-channel MIDI synth state: held keys, notes ringing on the
+/// sustain pedal, and the pedal itself, per channel.
 #[derive(Debug, Default, Clone)]
 struct MidiReceiver {
-    held: BTreeSet<u8>,
-    sustained: BTreeSet<u8>,
-    sustain: bool,
+    held: BTreeSet<Key>,
+    sustained: BTreeSet<Key>,
+    sustain: [bool; 16],
     /// Notes silenced by CC123 / CC64 = 0 instead of their own NoteOff:
     /// (note, stream sample of the clear).
-    cleared_by_burst: Vec<(u8, u64)>,
+    cleared_by_burst: Vec<(Key, u64)>,
 }
 
 impl MidiReceiver {
-    fn sounding(&self) -> BTreeSet<u8> {
+    fn sounding(&self) -> BTreeSet<Key> {
         let mut s = self.held.clone();
-        if self.sustain {
-            s.extend(self.sustained.iter().copied());
-        }
+        s.extend(
+            self.sustained
+                .iter()
+                .filter(|(ch, _)| self.sustain[usize::from(*ch)]),
+        );
         s
     }
 
-    fn note_off(&mut self, note: u8) {
-        if self.held.remove(&note) && self.sustain {
-            self.sustained.insert(note);
+    fn note_off(&mut self, key: Key) {
+        if self.held.remove(&key) && self.sustain[usize::from(key.0)] {
+            self.sustained.insert(key);
         }
     }
 
     fn apply(&mut self, msg: &[u8], at: u64) {
+        let ch = msg[0] & 0x0F;
         match (msg[0] & 0xF0, msg.get(1).copied(), msg.get(2).copied()) {
-            (0x90, Some(note), Some(0)) | (0x80, Some(note), _) => self.note_off(note),
+            (0x90, Some(note), Some(0)) | (0x80, Some(note), _) => self.note_off((ch, note)),
             (0x90, Some(note), Some(_)) => {
-                self.held.insert(note);
-                self.sustained.remove(&note);
+                self.held.insert((ch, note));
+                self.sustained.remove(&(ch, note));
             }
             (0xB0, Some(64), Some(v)) => {
-                self.sustain = v >= 64;
-                if !self.sustain {
-                    let released = std::mem::take(&mut self.sustained);
+                self.sustain[usize::from(ch)] = v >= 64;
+                if v < 64 {
+                    let (released, kept): (BTreeSet<Key>, BTreeSet<Key>) =
+                        std::mem::take(&mut self.sustained)
+                            .into_iter()
+                            .partition(|k| k.0 == ch);
+                    self.sustained = kept;
                     self.cleared_by_burst
-                        .extend(released.into_iter().map(|n| (n, at)));
+                        .extend(released.into_iter().map(|k| (k, at)));
                 }
             }
             (0xB0, Some(123), Some(_)) => {
                 // All Notes Off releases keys; pedal-held notes keep ringing
                 // until the pedal goes up (the fail-safe sends CC64 = 0 first).
-                let held = std::mem::take(&mut self.held);
-                for n in held {
-                    self.cleared_by_burst.push((n, at));
-                    if self.sustain {
-                        self.sustained.insert(n);
+                let (cleared, kept): (BTreeSet<Key>, BTreeSet<Key>) =
+                    std::mem::take(&mut self.held)
+                        .into_iter()
+                        .partition(|k| k.0 == ch);
+                self.held = kept;
+                for k in cleared {
+                    self.cleared_by_burst.push((k, at));
+                    if self.sustain[usize::from(ch)] {
+                        self.sustained.insert(k);
                     }
                 }
             }
@@ -119,7 +136,7 @@ struct Stream {
     audio: Vec<f32>,
     sent: Vec<Sent>,
     /// TX-side NoteOff times per note (stream samples), ascending.
-    note_off_times: BTreeMap<u8, Vec<usize>>,
+    note_off_times: BTreeMap<Key, Vec<usize>>,
     /// Samples of one full transmission (all K repetitions).
     message_len: usize,
     /// End of the idle tail (TX alive, heartbeats only).
@@ -133,7 +150,7 @@ struct StreamBuilder {
     message_len: usize,
     audio: Vec<f32>,
     sent: Vec<Sent>,
-    note_off_times: BTreeMap<u8, Vec<usize>>,
+    note_off_times: BTreeMap<Key, Vec<usize>>,
 }
 
 impl StreamBuilder {
@@ -165,8 +182,11 @@ impl StreamBuilder {
 
     fn encode_polled(&mut self, msg: TransportMessage) {
         let start = self.audio.len();
-        if let TransportMessage::NoteOff { note } = msg {
-            self.note_off_times.entry(note).or_default().push(start);
+        if let TransportMessage::NoteOff { channel, note, .. } = msg {
+            self.note_off_times
+                .entry((channel, note))
+                .or_default()
+                .push(start);
         }
         let samples = if matches!(msg, TransportMessage::Heartbeat) {
             self.tx.encode_heartbeat()
@@ -236,26 +256,38 @@ fn build_stream(config: &PhyConfig, pairs: usize, seed: u64) -> Stream {
     let mut rng = XorShift64::new(seed);
     let mut b = StreamBuilder::new(config);
     b.idle(ms_to_samples(config, 200));
-    let mut held: Vec<u8> = Vec::new();
+    let mut held: Vec<Key> = Vec::new();
     let mut ons = 0usize;
     while ons < pairs || !held.is_empty() {
         b.idle(ms_to_samples(config, gap_ms(&mut rng)));
         let start_note =
             ons < pairs && (held.is_empty() || (held.len() < MAX_HELD && rng.next_f64() < 0.55));
         if start_note {
-            let note = loop {
-                let n = 36 + rng.below(61) as u8;
-                if !held.contains(&n) {
-                    break n;
+            let (channel, note) = loop {
+                let k = (
+                    CHANNELS[rng.below(CHANNELS.len())],
+                    36 + rng.below(61) as u8,
+                );
+                if !held.contains(&k) {
+                    break k;
                 }
             };
             let velocity = 1 + rng.below(127) as u8;
-            held.push(note);
+            held.push((channel, note));
             ons += 1;
-            b.send(TransportMessage::NoteOn { note, velocity });
+            b.send(TransportMessage::NoteOn {
+                channel,
+                note,
+                velocity,
+            });
         } else {
-            let note = held.swap_remove(rng.below(held.len()));
-            b.send(TransportMessage::NoteOff { note });
+            let (channel, note) = held.swap_remove(rng.below(held.len()));
+            let velocity = rng.below(128) as u8;
+            b.send(TransportMessage::NoteOff {
+                channel,
+                note,
+                velocity,
+            });
         }
     }
     b.idle(ms_to_samples(config, IDLE_TAIL_MS));
@@ -287,7 +319,7 @@ struct RunResult {
     false_msgs: Vec<TransportMessage>,
     /// Notes still sounding at the "link alive" checkpoint (TX idle and
     /// sending heartbeats for `IDLE_TAIL_MS` after the last NoteOff).
-    sounding_while_alive: BTreeSet<u8>,
+    sounding_while_alive: BTreeSet<Key>,
     /// Longest time (ms) a note kept sounding after its TX NoteOff, measured
     /// at the alive checkpoint for notes still sounding there.
     max_stuck_alive_ms: f64,
@@ -299,8 +331,10 @@ struct RunResult {
     /// Longest stuck episode in ms.
     max_stuck_ms: f64,
     /// Final state after the trailing silence.
-    final_sounding: BTreeSet<u8>,
+    final_sounding: BTreeSet<Key>,
     final_sustain: bool,
+    /// Channels that carried notes in this run.
+    channels_used: BTreeSet<u8>,
     /// Notes released by a mid-stream fail-safe burst (link-dead / Panic).
     burst_mid_stream: usize,
     /// Notes only released by the final link-dead burst.
@@ -370,18 +404,23 @@ fn run(name: &str, config: &PhyConfig, corruption: Corruption, seed: u64) -> Run
     // event for it is a NoteOff that started more than `allowance` (one full
     // transmission plus a chunk: worst-case delivery latency) ago.
     let allowance = stream.message_len + CHUNK_SIZES[CHUNK_SIZES.len() - 1];
-    let timeline: Vec<(usize, u8, bool)> = stream
+    let timeline: Vec<(usize, Key, bool)> = stream
         .sent
         .iter()
         .filter_map(|s| match s.msg {
-            TransportMessage::NoteOn { note, .. } => Some((s.start + offset, note, true)),
-            TransportMessage::NoteOff { note } => Some((s.start + offset, note, false)),
+            TransportMessage::NoteOn { channel, note, .. } => {
+                Some((s.start + offset, (channel, note), true))
+            }
+            TransportMessage::NoteOff { channel, note, .. } => {
+                Some((s.start + offset, (channel, note), false))
+            }
             _ => None,
         })
         .collect();
+    let channels_used = timeline.iter().map(|(_, k, _)| k.0).collect();
     let mut tl_next = 0usize;
-    let mut tx_last: BTreeMap<u8, (usize, bool)> = BTreeMap::new();
-    let mut stuck_since: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut tx_last: BTreeMap<Key, (usize, bool)> = BTreeMap::new();
+    let mut stuck_since: BTreeMap<Key, usize> = BTreeMap::new();
     let mut stuck_episodes: Vec<usize> = Vec::new();
 
     let mut pos = 0usize;
@@ -404,7 +443,7 @@ fn run(name: &str, config: &PhyConfig, corruption: Corruption, seed: u64) -> Run
             tx_last.insert(note, (at, on));
             tl_next += 1;
         }
-        let stuck_now: BTreeSet<u8> = model
+        let stuck_now: BTreeSet<Key> = model
             .sounding()
             .into_iter()
             .filter(|n| matches!(tx_last.get(n), Some(&(at, false)) if at + allowance <= end))
@@ -445,7 +484,7 @@ fn run(name: &str, config: &PhyConfig, corruption: Corruption, seed: u64) -> Run
         .count();
 
     // How long has each note sounding at the checkpoint been stuck?
-    let stuck_ms = |note: u8, at: usize| -> f64 {
+    let stuck_ms = |note: Key, at: usize| -> f64 {
         let off = stream.note_off_times[&note]
             .iter()
             .rev()
@@ -484,7 +523,8 @@ fn run(name: &str, config: &PhyConfig, corruption: Corruption, seed: u64) -> Run
         stuck_over_link_dead: stuck_episodes.iter().filter(|&&d| d > link_dead).count(),
         max_stuck_ms: stuck_episodes.iter().map(|&d| to_ms(d)).fold(0.0, f64::max),
         final_sounding: model.sounding(),
-        final_sustain: model.sustain,
+        final_sustain: model.sustain.iter().any(|&s| s),
+        channels_used,
         burst_mid_stream,
         burst_final: model.cleared_by_burst.len() - burst_mid_stream,
         link_dead_events,
@@ -581,6 +621,21 @@ fn all_notes_released_after_link_dead() {
             r.label,
             r.final_sounding,
             r.final_sustain
+        );
+    }
+}
+
+/// The runs exercise several MIDI channels (the fail-safe burst and the
+/// NoteOff refreshes must work per channel).
+#[test]
+fn notes_span_several_channels() {
+    for r in results() {
+        assert_eq!(
+            r.channels_used.len(),
+            CHANNELS.len(),
+            "[{}] channels used: {:?}",
+            r.label,
+            r.channels_used
         );
     }
 }
