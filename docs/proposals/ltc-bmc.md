@@ -1,6 +1,12 @@
 # Proposal: LTC-style biphase-mark phy ("ltc" profile)
 
-Status: **phase 1: prototype, measurements, design proposal.** Not part of the AML v1 spec. The
+Status: **Adopted in AML v1 as provisional profiles** — see spec (`docs/aml-v1-spec.md`) §6.5 (frame,
+waveform, receiver requirements) and §4.6 (body FEC of the `_fec` profiles). This document is kept as
+design history; where it differs from the spec, the spec applies. The CPU comparisons with the MFSK
+receivers in §3.2 and §5 predate the MFSK search shortcut (`fec.md` §10.1): MFSK search now costs
+~14–64 ns per sample on the host (idle to worst case), about the same as the BMC receiver (~60).
+
+Original status: **phase 1: prototype, measurements, design proposal.** Not part of the AML v1 spec. The
 prototype is in `cricket_core/src/phy/bmc/` and is selected with `PhyConfig::ltc()` / `--profile ltc`.
 The robust and fast profiles behave exactly as before. Since the first prototype the receiver makes
 soft decisions and produces erasures, and `ltc_fec` adds Reed–Solomon body FEC (§9).

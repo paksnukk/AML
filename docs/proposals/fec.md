@@ -1,6 +1,13 @@
-# Proposal: Reed–Solomon FEC for the Robust profile (experimental)
+# Proposal: Reed–Solomon FEC for the Robust profile
 
-Status: **Phase 1, prototype + measurements.** Not part of AML v1. The `robust` and `fast` profiles are
+Status: **Adopted in AML v1** — see spec (`docs/aml-v1-spec.md`) §4.6 (body FEC), §4.7 (validation
+rules), §3.2.2 (joint acquisition) and §6.1 (Robust). The profile this document calls `robust_fec` is
+now **`robust`**, the default (`robust_fec` remains an accepted alias); the K = 2 profile it calls
+`robust` is now **`robust_repeat`**, which also uses joint acquisition with one miss (§10.4). This
+document is kept as design history: names and numbers are as they were when measured; where it differs
+from the spec, the spec applies.
+
+Original status: **Phase 1, prototype + measurements.** Not part of AML v1. The `robust` and `fast` profiles are
 unchanged on the wire; the prototype is the opt-in profile `robust_fec` (`PhyConfig::robust_fec()`).
 Since the acquisition hardening (§10), `robust_fec` matches or beats `robust` in every measured channel
 except dropouts of ≥ ~50 ms, which are a single-copy body limit.
