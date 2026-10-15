@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 pub struct EncoderConfig {
     pub audio_out: AudioOut,
     pub midi_in: MidiIn,
-    /// PHY profile name ("robust" / "fast"; unknown names mean robust).
+    /// PHY profile name (see `PhyConfig::from_name`: "robust", "robust_repeat",
+    /// "fast", "ltc", "ltc_fec", …; unknown names mean robust).
     pub profile: String,
     /// Send a C-major scale (one note per second). Also on when `midi_in`
     /// is [`MidiIn::None`].

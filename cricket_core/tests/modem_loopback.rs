@@ -8,7 +8,7 @@ use cricket_core::wav::{read_wav_f32, write_wav_f32};
 
 #[test]
 fn loopback_note_on_off() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let messages = vec![
         TransportMessage::NoteOn {
             channel: 0,
@@ -28,7 +28,7 @@ fn loopback_note_on_off() {
 
 #[test]
 fn loopback_program_and_msc() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let messages = vec![
         TransportMessage::ProgramChange {
             channel: 0,
@@ -49,7 +49,7 @@ fn loopback_program_and_msc() {
 #[cfg(feature = "std")]
 #[test]
 fn loopback_via_wav_file() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let messages = vec![TransportMessage::NoteOn {
         channel: 0,
         note: 64,
@@ -69,7 +69,7 @@ fn loopback_via_wav_file() {
 
 #[test]
 fn duplicate_repetition_suppressed() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let messages = vec![TransportMessage::NoteOn {
         channel: 0,
         note: 72,
@@ -83,7 +83,7 @@ fn duplicate_repetition_suppressed() {
 
 #[test]
 fn streaming_rx_emits_stats() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let mut tx = CricketModemTx::new(config.clone());
     let audio = tx.encode_message(&TransportMessage::Panic);
     let mut rx = CricketModemRx::new(config);
@@ -104,7 +104,7 @@ fn streaming_rx_emits_stats() {
 
 #[test]
 fn level_offset_still_decodes() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let messages = vec![TransportMessage::NoteOn {
         channel: 0,
         note: 55,

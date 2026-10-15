@@ -1,4 +1,4 @@
-//! Robust-profile physical-layer parameters (see docs/aml-v1-spec.md).
+//! Physical-layer profile parameters (see docs/aml-v1-spec.md §3 and §6).
 
 use super::bmc::{BmcParams, Modulation};
 use crate::link::FecMode;
@@ -14,28 +14,30 @@ const PURITY_ROBUST: f32 = 0.25;
 const PURITY_FAST: f32 = 0.3;
 
 /// How the MFSK receiver finds a preamble (receiver-side only; the wire
-/// format is the same either way).
+/// format is the same either way). Spec §3.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Acquisition {
-    /// AML v1 (spec §3.2): gate on `preamble[0]` alone, fine-align on its
-    /// tone, then confirm the remaining preamble symbols in order.
+    /// Spec §3.2.1: gate on `preamble[0]` alone, fine-align on its tone, then
+    /// confirm the remaining preamble symbols in order. Used by Fast (whose
+    /// 2-symbol preamble is too short for joint detection).
     #[default]
     FirstSymbol,
-    /// **Experimental** joint detection over the whole preamble
-    /// (docs/proposals/fec.md, "Acquisition hardening"): a search window is a
-    /// candidate when at least `N - misses` preamble symbols show their
-    /// expected tone, fine alignment maximizes the summed expected-tone power
-    /// of all `N` symbols, and the lock is accepted when at most `misses`
-    /// symbols (anywhere, including the first) fail the detection gate and at
-    /// most one of those shows a clear *different* tone. Meant for FEC bodies,
-    /// where the coded body + CRC-16 verify the lock.
+    /// Spec §3.2.2: joint detection over the whole preamble
+    /// (docs/proposals/fec.md §10): a search window is a candidate when at
+    /// least `N - misses` preamble symbols show their expected tone, fine
+    /// alignment maximizes the summed expected-tone power of all `N` symbols,
+    /// and the lock is accepted when at most `misses` symbols (anywhere,
+    /// including the first) fail the detection gate and at most one of those
+    /// shows a clear *different* tone. Robust uses 2 misses (its coded body +
+    /// CRC-16 verify the lock), Robust repeat 1.
     Joint { misses: u8 },
 }
 
 #[derive(Debug, Clone)]
 pub struct PhyConfig {
     pub sample_rate_hz: u32,
-    /// Line code. `Mfsk` for AML v1 (robust, fast); `Bmc` is experimental.
+    /// Line code: `Mfsk` (robust, robust_repeat, fast) or `Bmc` (the
+    /// provisional LTC profiles, spec §6.5).
     pub modulation: Modulation,
     pub symbol_duration_ms: f32,
     pub guard_gap_ms: f32,
@@ -57,10 +59,11 @@ pub struct PhyConfig {
     pub interleave_depth: usize,
     pub link_dead_ms: u32,
     pub heartbeat_interval_ms: u32,
-    /// Body forward error correction (experimental; `None` = AML v1 as
-    /// specified). See docs/proposals/fec.md.
+    /// Body forward error correction (spec §4.6): `Rs16 { parity: 4 }` for
+    /// robust and the `*_fec` LTC profiles, `None` (block-interleaved
+    /// uncoded body, §4.3) otherwise.
     pub fec: FecMode,
-    /// Preamble acquisition (MFSK only; `FirstSymbol` = AML v1).
+    /// Preamble acquisition (MFSK only, spec §3.2).
     pub acquisition: Acquisition,
 }
 
@@ -71,7 +74,24 @@ impl Default for PhyConfig {
 }
 
 impl PhyConfig {
+    /// **Robust** (the default, spec §6.1): MFSK-16 at 6 ms + 0.5 ms guard,
+    /// an RS(11,7)x2 GF(16) coded, whitened 22-nibble body
+    /// (`FecMode::Rs16 { parity: 4 }`) sent once (K = 1), and joint preamble
+    /// acquisition tolerating two missed preamble symbols.
     pub fn robust() -> Self {
+        Self {
+            repetition_k: 1,
+            fec: FecMode::Rs16 { parity: 4 },
+            acquisition: Acquisition::Joint { misses: 2 },
+            ..Self::robust_repeat()
+        }
+    }
+
+    /// **Robust repeat** (spec §6.2): Robust's tones and timing with the
+    /// uncoded 16-nibble block-interleaved body sent twice (K = 2). The choice
+    /// for lines with glitches or dropouts of ~50 ms or more, which a single
+    /// coded copy cannot bridge.
+    pub fn robust_repeat() -> Self {
         Self {
             sample_rate_hz: 48_000,
             modulation: Modulation::Mfsk,
@@ -123,27 +143,13 @@ impl PhyConfig {
         }
     }
 
-    /// Experimental: Robust phy with an RS(11,7)x2 GF(16) coded body
-    /// (`FecMode::Rs16 { parity: 4 }`), a single copy (K = 1) instead of
-    /// K = 2 repetition, and joint preamble acquisition tolerating two missed
-    /// preamble symbols. Same preamble and symbol timing as Robust. Not part
-    /// of AML v1; see docs/proposals/fec.md.
-    pub fn robust_fec() -> Self {
-        Self {
-            repetition_k: 1,
-            fec: FecMode::Rs16 { parity: 4 },
-            acquisition: Acquisition::Joint { misses: 2 },
-            ..Self::robust()
-        }
-    }
-
-    /// **Experimental** LTC-style profile: biphase-mark code at 4800 bit/s
-    /// (see `docs/proposals/ltc-bmc.md`). Not part of the AML v1 spec.
+    /// LTC profile (provisional, spec §6.5): biphase-mark code at 4800 bit/s,
+    /// uncoded 16-nibble body, K = 1.
     pub fn ltc() -> Self {
         Self::ltc_with_bit_rate(4800)
     }
 
-    /// Experimental BMC profile at `bit_rate` bit/s. The symbol fields describe
+    /// BMC profile at `bit_rate` bit/s (spec §6.5: 2400, 4800 or 9600). The symbol fields describe
     /// one nibble (4 bits) so generic helpers stay meaningful; the MFSK-only
     /// fields (tones, preamble, purity) are unused.
     pub fn ltc_with_bit_rate(bit_rate: u32) -> Self {
@@ -171,13 +177,13 @@ impl PhyConfig {
         }
     }
 
-    /// **Experimental**: [`ltc`](Self::ltc) with an RS(11,7)x2 GF(16) coded
-    /// body (`FecMode::Rs16 { parity: 4 }`, 22 instead of 16 nibbles).
+    /// [`ltc`](Self::ltc) with the RS(11,7)x2 GF(16) coded, whitened body
+    /// (`FecMode::Rs16 { parity: 4 }`, 22 instead of 16 nibbles; spec §6.5).
     pub fn ltc_fec() -> Self {
         Self::ltc_fec_with_bit_rate(4800)
     }
 
-    /// Experimental BMC profile at `bit_rate` bit/s with the RS16 parity-4 body.
+    /// BMC profile at `bit_rate` bit/s with the RS16 parity-4 body.
     pub fn ltc_fec_with_bit_rate(bit_rate: u32) -> Self {
         Self {
             fec: FecMode::Rs16 { parity: 4 },
@@ -185,10 +191,13 @@ impl PhyConfig {
         }
     }
 
+    /// Profile by name (case-insensitive, `-` = `_`). `robust_fec` is a
+    /// deprecated alias of `robust` (its former name); unknown names mean
+    /// the default, robust.
     pub fn from_name(name: &str) -> Self {
         match name.to_ascii_lowercase().replace('-', "_").as_str() {
             "fast" => Self::fast(),
-            "robust_fec" => Self::robust_fec(),
+            "robust_repeat" => Self::robust_repeat(),
             "ltc" => Self::ltc(),
             "ltc2400" => Self::ltc_with_bit_rate(2400),
             "ltc4800" => Self::ltc_with_bit_rate(4800),
@@ -196,6 +205,7 @@ impl PhyConfig {
             "ltc_fec" | "ltc4800_fec" => Self::ltc_fec(),
             "ltc2400_fec" => Self::ltc_fec_with_bit_rate(2400),
             "ltc9600_fec" => Self::ltc_fec_with_bit_rate(9600),
+            // "robust", its deprecated alias "robust_fec", and unknown names.
             _ => Self::robust(),
         }
     }

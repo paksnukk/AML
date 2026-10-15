@@ -1,7 +1,8 @@
-//! Experimental LTC-style physical layer: biphase-mark code (BMC).
+//! LTC-style physical layer: biphase-mark code (BMC).
 //!
-//! Status: **phase-1 prototype** (see `docs/proposals/ltc-bmc.md`); not part
-//! of the AML v1 spec. Selected with [`PhyConfig::ltc`](super::PhyConfig::ltc).
+//! Status: **provisional** AML v1 profiles (spec §6.5; design history in
+//! `docs/proposals/ltc-bmc.md`). Selected with
+//! [`PhyConfig::ltc`](super::PhyConfig::ltc) and related constructors.
 //!
 //! # Line code
 //!
@@ -80,13 +81,15 @@ pub use tx::BmcTx;
 /// Physical-layer modulation selected by [`PhyConfig`](super::PhyConfig).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Modulation {
-    /// AML v1 MFSK-16 (Goertzel bank). Used by the robust and fast profiles.
+    /// AML v1 MFSK-16 (Goertzel bank). Used by robust, robust_repeat and fast.
     Mfsk,
-    /// Experimental biphase-mark code (LTC-style), see the module docs.
+    /// Biphase-mark code (LTC-style, provisional), see the module docs.
     Bmc(BmcParams),
 }
 
-/// Parameters of the experimental BMC phy.
+/// Parameters of the BMC phy. The wire parameters (spec §6.5) are
+/// `bit_rate`, `preamble_bits`, `postamble_bits`, `gap_bits` and
+/// `edge_frac`; the rest tune the reference receiver.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BmcParams {
     /// Bits per second (one bit = one BMC cell).

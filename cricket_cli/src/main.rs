@@ -13,10 +13,13 @@ use std::sync::mpsc::Receiver;
 #[derive(Parser)]
 #[command(author, version, about = "Cricket MIDI-over-audio modem CLI", long_about = None)]
 struct Cli {
-    /// PHY profile: robust (default), fast, or the experimental robust_fec
-    /// (Reed–Solomon body FEC) and BMC (LTC-style) profiles ltc (4800 bit/s),
-    /// ltc2400, ltc4800, ltc9600, and ltc_fec, ltc2400_fec, ltc9600_fec (with
-    /// Reed–Solomon body FEC)
+    /// PHY profile (both ends must use the same one): robust (default;
+    /// Reed–Solomon coded body, sent once), robust_repeat (uncoded body sent
+    /// twice; for lines with dropouts of ~50 ms or more), fast (clean
+    /// dedicated line), or the LTC-style biphase-mark profiles for a
+    /// dedicated clean line without EQ: ltc (4800 bit/s), ltc2400, ltc4800,
+    /// ltc9600, and with Reed–Solomon body FEC ltc_fec, ltc2400_fec,
+    /// ltc9600_fec
     #[arg(long, global = true, default_value = "robust")]
     profile: String,
 
@@ -95,8 +98,8 @@ enum Commands {
     },
     /// Encode→decode loopback with latency measurement (in-process)
     Loopback {
-        /// Profiles to measure, comma-separated (e.g. `fast,robust,robust_fec,ltc`;
-        /// `robust_fec` and `ltc*` are experimental)
+        /// Profiles to measure, comma-separated (e.g.
+        /// `robust,robust_repeat,fast,ltc_fec`)
         #[arg(long, value_delimiter = ',', default_value = "fast,robust")]
         profiles: Vec<String>,
         /// NoteOns per profile

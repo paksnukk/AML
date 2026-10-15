@@ -1,5 +1,5 @@
 //! False-accept analysis for the FEC profiles (`ltc_fec`, `ltc2400_fec`,
-//! `ltc9600_fec`, `robust_fec`): how often non-Cricket audio turns into a
+//! `ltc9600_fec`, `robust`): how often non-Cricket audio turns into a
 //! message. See `docs/proposals/fec.md` §9 for the analysis and target.
 //!
 //! A false message needs (1) a false lock whose body survives the phy gates
@@ -16,7 +16,7 @@
 //!
 //! Environment: `FALSE_SECONDS` (audio per signal, default 120),
 //! `FALSE_PROFILES` (comma-separated: ltc_fec, ltc2400_fec, ltc9600_fec,
-//! robust_fec), `FALSE_RANDOM_BODIES` (simulated random bodies per row,
+//! robust), `FALSE_RANDOM_BODIES` (simulated random bodies per row,
 //! default 200000). Results are recorded in `docs/proposals/fec.md` §9.
 
 mod support;
@@ -290,9 +290,9 @@ fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
     ];
     if bmc {
         let mfsk = [
-            PhyConfig::robust(),
+            PhyConfig::robust_repeat(),
             PhyConfig::fast(),
-            PhyConfig::robust_fec(),
+            PhyConfig::robust(),
         ];
         v.insert(0, ("MFSK traffic", mfsk_traffic(seconds, 8, &mfsk)));
         // Misconfiguration: an uncoded LTC transmitter at the same bit rate.
@@ -309,8 +309,8 @@ fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
                 bmc_traffic(&PhyConfig::ltc_fec(), seconds, 9),
             ),
         );
-        // Misconfiguration: uncoded AML v1 transmitters (robust, fast).
-        let v1 = [PhyConfig::robust(), PhyConfig::fast()];
+        // Misconfiguration: uncoded MFSK transmitters (robust_repeat, fast).
+        let v1 = [PhyConfig::robust_repeat(), PhyConfig::fast()];
         v.push(("MFSK v1 traffic", mfsk_traffic(seconds, 11, &v1)));
     }
     v
@@ -547,8 +547,8 @@ fn random_bodies_rarely_reach_the_crc() {
 
 /// Worst cases measured for the false-accept analysis, a few seconds each:
 /// MFSK traffic into `ltc2400_fec`, and transmitters without FEC on the
-/// same phy (uncoded LTC into `ltc_fec`, AML v1 Robust/Fast into
-/// `robust_fec`). Before the weight bound and the whitening these reached
+/// same phy (uncoded LTC into `ltc_fec`, uncoded Robust repeat / Fast
+/// into `robust`). Before the weight bound and the whitening these reached
 /// the CRC with 1.7 / 1.8 / 2.3 candidates per false body.
 #[test]
 fn worst_case_audio_rarely_reaches_the_crc() {
@@ -558,11 +558,11 @@ fn worst_case_audio_rarely_reaches_the_crc() {
         ..ltc_fec.clone()
     };
     let mfsk = [
-        PhyConfig::robust(),
+        PhyConfig::robust_repeat(),
         PhyConfig::fast(),
-        PhyConfig::robust_fec(),
+        PhyConfig::robust(),
     ];
-    let v1 = [PhyConfig::robust(), PhyConfig::fast()];
+    let v1 = [PhyConfig::robust_repeat(), PhyConfig::fast()];
     let cases = [
         (
             "MFSK traffic -> ltc2400_fec",
@@ -577,8 +577,8 @@ fn worst_case_audio_rarely_reaches_the_crc() {
             0.15,
         ),
         (
-            "AML v1 -> robust_fec",
-            PhyConfig::robust_fec(),
+            "robust_repeat/fast -> robust",
+            PhyConfig::robust(),
             mfsk_traffic(6.0, 23, &v1),
             0.15,
         ),
@@ -603,10 +603,7 @@ fn false_accept_report() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120.0);
-    let keys = env_list(
-        "FALSE_PROFILES",
-        "ltc_fec,ltc2400_fec,ltc9600_fec,robust_fec",
-    );
+    let keys = env_list("FALSE_PROFILES", "ltc_fec,ltc2400_fec,ltc9600_fec,robust");
     let (a_len, a_strict) = analytic_struct();
     for t in TYPES {
         println!("{t:?}: {} canonical payloads", canonical_payloads(t));

@@ -837,11 +837,11 @@ mod tests {
         assert_eq!(s.poll(0), Some(Panic));
     }
 
-    /// A Robust message is longer than the airtime budget; a chord pushed at
+    /// A Robust repeat message (K = 2) is longer than the airtime budget; a chord pushed at
     /// once must still be sent whole.
     #[test]
     fn robust_chord_is_not_dropped() {
-        let mut s = scheduler(&PhyConfig::robust());
+        let mut s = scheduler(&PhyConfig::robust_repeat());
         assert!(s.message_samples > s.noteon_budget_samples);
         for n in [60u8, 64, 67, 72] {
             s.push(on(n), 0);

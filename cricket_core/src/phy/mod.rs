@@ -1,5 +1,5 @@
 //! AML v1 physical layer: MFSK-16 synthesis, Goertzel demod, preamble sync.
-//! Plus an experimental biphase-mark (LTC-style) phy in [`bmc`].
+//! Plus the biphase-mark (LTC-style) phy of the provisional LTC profiles in [`bmc`].
 
 pub mod bmc;
 mod config;

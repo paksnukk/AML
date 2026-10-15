@@ -1,4 +1,5 @@
-//! Experimental link-layer FEC for AML packet bodies (docs/proposals/fec.md).
+//! Link-layer body FEC for AML packet bodies (spec §4.6; design history in
+//! docs/proposals/fec.md).
 //!
 //! The packet bytes (HDR, SEQ, PAYLOAD, CRC-16 — unchanged) are split into
 //! nibbles, zero-padded to [`FEC_DATA_NIBBLES`] (14 = the largest packet,
@@ -57,7 +58,7 @@ const _: () = assert!(WHITENING.len() >= CODEWORDS * RS16_MAX_N);
 /// Forward-error-correction scheme applied to the packet body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FecMode {
-    /// AML v1 as specified: 16-nibble block-interleaved body, no FEC.
+    /// Uncoded body: 16 nibbles, block-interleaved (spec §4.3).
     #[default]
     None,
     /// Two interleaved RS(7 + parity, 7) codewords over GF(16).

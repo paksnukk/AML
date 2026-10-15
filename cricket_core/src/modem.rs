@@ -33,7 +33,7 @@ pub enum ModemOutput {
 }
 
 /// High-level TX: transport message → repeated interleaved audio (MFSK, or
-/// the experimental BMC phy, per `config.modulation`).
+/// the BMC (LTC) phy, per `config.modulation`).
 pub struct CricketModemTx {
     phy: PhyTx,
     config: PhyConfig,

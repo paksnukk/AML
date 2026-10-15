@@ -97,7 +97,11 @@ fn bad_crc_repetition(config: &PhyConfig, seq: u8) -> Vec<f32> {
 
 #[test]
 fn link_dead_fires_once_sample_accurate_and_dead_state_visible() {
-    for (name, config) in [("robust", PhyConfig::robust()), ("fast", PhyConfig::fast())] {
+    for (name, config) in [
+        ("robust", PhyConfig::robust()),
+        ("robust_repeat", PhyConfig::robust_repeat()),
+        ("fast", PhyConfig::fast()),
+    ] {
         let limit = link_dead_samples(&config);
         let mut tx = CricketModemTx::new(config.clone());
         let first = tx.encode_message(&note_on(60));
@@ -179,7 +183,7 @@ fn link_dead_fires_once_sample_accurate_and_dead_state_visible() {
 
 #[test]
 fn no_link_dead_before_first_packet() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let stream = ChannelSim::new(config.clone(), 7)
         .snr_db(10.0)
         .apply(&silence(&config, 3 * config.link_dead_ms as usize));
@@ -196,7 +200,7 @@ fn no_link_dead_before_first_packet() {
 /// locking), then silence: exactly one link-dead burst.
 #[test]
 fn bad_crc_traffic_then_silence_single_burst() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let mut tx = CricketModemTx::new(config.clone());
     let mut stream = tx.encode_message(&note_on(60));
     let target = stream.len() + link_dead_samples(&config) * 3 / 2;
@@ -234,7 +238,7 @@ fn bad_crc_traffic_then_silence_single_burst() {
 
 #[test]
 fn panic_emits_exactly_one_burst() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let mut tx = CricketModemTx::new(config.clone());
     let mut stream = tx.encode_message(&TransportMessage::Panic);
     // Up to just before the link-dead deadline that the Panic packet armed.
@@ -318,7 +322,7 @@ fn decode_stream(config: &PhyConfig, stream: &[f32], chunk: usize) -> Vec<Transp
 
 #[test]
 fn dedup_repetitions_delivered_once() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     assert_eq!(config.repetition_k, 2);
     let mut tx = CricketModemTx::new(config.clone());
     let msgs = [
@@ -346,7 +350,7 @@ fn dedup_repetitions_delivered_once() {
 
 #[test]
 fn dedup_tx_restart_delivers_all() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     // Scenario 1: seq 0..3, restart, seq 0..3 again (identical messages).
     let first: Vec<TransportMessage> = (0..4).map(|i| note_on(60 + i)).collect();
     // Scenario 2: last packet seen before the restart had seq 0 and the
@@ -378,7 +382,7 @@ fn dedup_tx_restart_delivers_all() {
 
 #[test]
 fn dedup_same_seq_different_payload_delivered() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let tx = CricketModemTx::new(config.clone());
     let a = note_on(60);
     let b = TransportMessage::NoteOff {

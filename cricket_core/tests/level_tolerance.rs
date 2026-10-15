@@ -100,6 +100,11 @@ fn level_sweep_robust() {
 }
 
 #[test]
+fn level_sweep_robust_repeat() {
+    level_sweep("robust_repeat", PhyConfig::robust_repeat());
+}
+
+#[test]
 fn level_sweep_fast() {
     level_sweep("fast", PhyConfig::fast());
 }
@@ -107,6 +112,11 @@ fn level_sweep_fast() {
 #[test]
 fn minus_30db_snr20_robust() {
     low_level_with_noise("robust", PhyConfig::robust());
+}
+
+#[test]
+fn minus_30db_snr20_robust_repeat() {
+    low_level_with_noise("robust_repeat", PhyConfig::robust_repeat());
 }
 
 #[test]
@@ -186,6 +196,11 @@ fn noise_false_alarm_robust() {
 }
 
 #[test]
+fn noise_false_alarm_robust_repeat() {
+    noise_false_alarm("robust_repeat", PhyConfig::robust_repeat());
+}
+
+#[test]
 fn noise_false_alarm_fast() {
     noise_false_alarm("fast", PhyConfig::fast());
 }
@@ -193,6 +208,11 @@ fn noise_false_alarm_fast() {
 #[test]
 fn tone_soup_false_alarm_robust() {
     soup_false_alarm("robust", PhyConfig::robust());
+}
+
+#[test]
+fn tone_soup_false_alarm_robust_repeat() {
+    soup_false_alarm("robust_repeat", PhyConfig::robust_repeat());
 }
 
 #[test]

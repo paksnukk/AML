@@ -9,8 +9,8 @@
 //! Heartbeat every 500 ms, and some gaps between note messages are longer than
 //! `link_dead_ms` (the link stays alive through them thanks to heartbeats).
 //!
-//! Size: 1503 pairs in total, 167 per configuration (3 profiles, including the
-//! experimental `robust_fec`, x 3 corruption levels), SNR 20 dB, random start
+//! Size: 1503 pairs in total, 167 per configuration (3 profiles: robust,
+//! robust_repeat and fast, x 3 corruption levels), SNR 20 dB, random start
 //! offset and a random chunk size per `push_samples` call. The nine
 //! configurations run on parallel threads and are
 //! simulated once per test process (shared by the tests below).
@@ -575,9 +575,9 @@ fn results() -> &'static [RunResult] {
     RESULTS.get_or_init(|| {
         let mut cases = Vec::new();
         for (name, config) in [
-            ("robust", PhyConfig::robust()),
+            ("robust_repeat", PhyConfig::robust_repeat()),
             ("fast", PhyConfig::fast()),
-            ("robust_fec", PhyConfig::robust_fec()),
+            ("robust", PhyConfig::robust()),
         ] {
             for (i, &p) in CORRUPTION_LEVELS.iter().enumerate() {
                 let seed = 0xA6_0000 + (cases.len() as u64) * 101 + i as u64;

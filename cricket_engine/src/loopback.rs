@@ -86,7 +86,8 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 /// Measure wall-clock MIDI-in → MIDI-out NoteOn latency for `profile`
-/// (`"fast"` / `"robust"`) over `note_count` notes, each held for [`HOLD`],
+/// (a [`PhyConfig::from_name`] name such as `"robust"`, `"robust_repeat"`,
+/// `"fast"` or `"ltc_fec"`) over `note_count` notes, each held for [`HOLD`],
 /// released, and followed by a [`rest`] before the next one.
 pub fn measure_midi_loopback(profile: &str, note_count: usize) -> Result<LatencySummary> {
     if note_count == 0 {

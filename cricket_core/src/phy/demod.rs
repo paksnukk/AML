@@ -443,7 +443,7 @@ impl ModemRx {
         events
     }
 
-    /// Tolerated preamble misses under joint acquisition (`None` = AML v1
+    /// Tolerated preamble misses under joint acquisition (`None` =
     /// first-symbol acquisition).
     fn joint_misses(&self) -> Option<usize> {
         match self.config.acquisition {

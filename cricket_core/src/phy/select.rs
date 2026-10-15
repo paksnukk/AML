@@ -1,5 +1,5 @@
 //! Modulation-agnostic phy front ends used by [`crate::modem`]: dispatch to
-//! the MFSK or the experimental BMC implementation per [`PhyConfig::modulation`].
+//! the MFSK or the BMC (LTC) implementation per [`PhyConfig::modulation`].
 
 use super::bmc::{BmcRx, BmcTx, Modulation};
 use super::{LinkState, ModemRx, ModemTx, PhyConfig, RxEvent};

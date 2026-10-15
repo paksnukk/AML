@@ -1,4 +1,4 @@
-//! A/B measurements: MFSK (robust, fast) vs experimental BMC (`ltc*`).
+//! A/B measurements: MFSK (robust, robust_repeat, fast) vs BMC (`ltc*`).
 //!
 //! Prints Markdown tables; not an assertion test. Run with
 //!
@@ -24,6 +24,7 @@ const CHUNK_SIZES: [usize; 5] = [64, 128, 240, 512, 4096];
 fn profiles() -> Vec<(&'static str, PhyConfig)> {
     vec![
         ("robust", PhyConfig::robust()),
+        ("robust_repeat", PhyConfig::robust_repeat()),
         ("fast", PhyConfig::fast()),
         ("ltc2400", PhyConfig::ltc_with_bit_rate(2400)),
         ("ltc4800", PhyConfig::ltc_with_bit_rate(4800)),

@@ -56,6 +56,10 @@ fn trials(
 #[test]
 fn profile_selection() {
     assert!(matches!(PhyConfig::robust().modulation, Modulation::Mfsk));
+    assert!(matches!(
+        PhyConfig::robust_repeat().modulation,
+        Modulation::Mfsk
+    ));
     assert!(matches!(PhyConfig::fast().modulation, Modulation::Mfsk));
     assert!(matches!(
         PhyConfig::from_name("robust").modulation,
@@ -230,9 +234,9 @@ fn link_dead_fires_after_silence() {
 fn mfsk_and_bmc_do_not_cross_decode() {
     let messages: Vec<_> = (0..6).map(note_on_for).collect();
     let mfsk = [
-        PhyConfig::robust(),
+        PhyConfig::robust_repeat(),
         PhyConfig::fast(),
-        PhyConfig::robust_fec(),
+        PhyConfig::robust(),
     ];
     let mut bmc_profiles = ltc_profiles();
     bmc_profiles.extend([

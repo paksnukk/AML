@@ -239,15 +239,33 @@ function applyModeVisibility() {
   encodeCard.style.display = mode === "decode" ? "none" : "";
 }
 
+/** Short operator-facing description of a profile (both ends must match). */
+function profileDescription(profile: string): string {
+  switch (profile) {
+    case "robust_repeat":
+      return "Robust repeat — uncoded, every message sent twice. For lines with glitches or dropouts of ~50 ms or more.";
+    case "fast":
+      return "Fast — notes on a clean dedicated line (no EQ, compression, or limiter).";
+    case "ltc":
+    case "ltc2400":
+    case "ltc9600":
+      return "LTC — biphase-mark code like timecode. Dedicated clean line only: no EQ, compression, limiter or dropouts.";
+    case "ltc_fec":
+    case "ltc2400_fec":
+    case "ltc9600_fec":
+      return "LTC FEC — biphase-mark code with error correction; survives short dropouts and clicks. Dedicated line, no EQ (9600: digital lines only).";
+    default:
+      return "Robust (default) — error-corrected, one copy per message; cues and notes over a chain you don't fully trust.";
+  }
+}
+
 async function refreshProfileHint() {
   try {
     const info = await invoke<{ est_latency_ms: number }>("get_profile_info", {
       profile: profileSelect.value,
     });
-    profileHint.textContent =
-      profileSelect.value === "fast"
-        ? `Fast — notes on a clean dedicated line (no EQ, compression, or limiter). ≈ ${info.est_latency_ms.toFixed(0)} ms first-copy airtime.`
-        : `Robust — cue and program-change triggers on an uncertain chain, about 3–4 messages per second. ≈ ${info.est_latency_ms.toFixed(0)} ms first-copy airtime.`;
+    const airtime = `≈ ${info.est_latency_ms.toFixed(0)} ms first-copy airtime.`;
+    profileHint.textContent = `${profileDescription(profileSelect.value)} ${airtime}`;
   } catch (e) {
     log(`Profile info error: ${e}`);
   }
@@ -314,7 +332,10 @@ async function loadDevices() {
       clearAlarm();
     }
 
-    profileSelect.value = settings.profile || "robust";
+    // `robust_fec` is the former name of `robust`; unknown names mean robust.
+    const saved = (settings.profile || "robust").toLowerCase().replace(/-/g, "_");
+    const known = Array.from(profileSelect.options).some((o) => o.value === saved);
+    profileSelect.value = known ? saved : "robust";
     populateMscSelects();
     selectMsc(mscDeviceSelect, settings.msc_device_id, 0x7f);
     selectMsc(mscFormatSelect, settings.msc_command_format, 0x01);

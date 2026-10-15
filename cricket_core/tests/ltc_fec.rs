@@ -237,7 +237,7 @@ fn noise_and_mfsk_produce_no_messages() {
         })
         .collect();
     let mut mfsk = encode_to_samples(PhyConfig::fast(), &notes);
-    mfsk.extend(encode_to_samples(PhyConfig::robust_fec(), &notes[..4]));
+    mfsk.extend(encode_to_samples(PhyConfig::robust(), &notes[..4]));
     for (name, config) in fec_profiles() {
         for audio in [&noise, &mfsk] {
             let got = decode_chunked(config.clone(), audio, 512);
@@ -245,7 +245,7 @@ fn noise_and_mfsk_produce_no_messages() {
         }
         // And the other way round: MFSK receivers ignore the BMC audio.
         let bmc = encode_to_samples(config.clone(), &notes);
-        for m in [PhyConfig::fast(), PhyConfig::robust_fec()] {
+        for m in [PhyConfig::fast(), PhyConfig::robust()] {
             assert!(decode_chunked(m, &bmc, 512).is_empty(), "{name}");
         }
     }

@@ -1,6 +1,7 @@
-//! Experimental FEC profile (`PhyConfig::robust_fec`, docs/proposals/fec.md):
-//! loopback, sync sweep, and an A/B comparison against K = 2 repetition on
-//! the channel simulator.
+//! Body FEC (spec §4.6) on the Robust profile (`PhyConfig::robust`,
+//! docs/proposals/fec.md): loopback, sync sweep, and an A/B comparison
+//! against K = 2 repetition (`PhyConfig::robust_repeat`) on the channel
+//! simulator.
 //!
 //! The full A/B table is an ignored test (it takes a while in debug builds):
 //!
@@ -48,23 +49,39 @@ fn fec_parity(parity: u8, k: usize) -> PhyConfig {
     PhyConfig {
         repetition_k: k,
         fec: FecMode::Rs16 { parity },
-        ..PhyConfig::robust_fec()
+        ..PhyConfig::robust()
     }
 }
 
 #[test]
-fn defaults_are_unchanged() {
-    assert_eq!(PhyConfig::robust().fec, FecMode::None);
+fn profile_parameters() {
+    assert_eq!(PhyConfig::robust_repeat().fec, FecMode::None);
+    assert_eq!(PhyConfig::robust_repeat().repetition_k, 2);
     assert_eq!(PhyConfig::fast().fec, FecMode::None);
-    assert_eq!(PhyConfig::default().fec, FecMode::None);
-    assert_eq!(repetition_samples(&PhyConfig::robust()), 21 * 312);
-    let fec = PhyConfig::robust_fec();
+    assert_eq!(PhyConfig::default().fec, FecMode::Rs16 { parity: 4 });
+    assert_eq!(repetition_samples(&PhyConfig::robust_repeat()), 21 * 312);
+    let fec = PhyConfig::robust();
     assert_eq!(fec.repetition_k, 1);
     assert_eq!(fec.fec.body_nibbles(), 22);
     assert_eq!(repetition_samples(&fec), 27 * 312);
     assert!((fec.estimated_first_copy_ms() - 26.0 * 6.5).abs() < 1e-3);
-    assert_eq!(PhyConfig::from_name("robust_fec").fec, fec.fec);
-    assert_eq!(PhyConfig::robust().acquisition, Acquisition::FirstSymbol);
+    // Names: `robust_fec` is a deprecated alias of `robust`; unknown names
+    // mean robust.
+    for name in ["robust", "ROBUST", "robust_fec", "robust-fec", "nonsense"] {
+        let c = PhyConfig::from_name(name);
+        assert_eq!(c.fec, fec.fec, "{name}");
+        assert_eq!(c.repetition_k, 1, "{name}");
+        assert_eq!(c.acquisition, fec.acquisition, "{name}");
+    }
+    for name in ["robust_repeat", "robust-repeat"] {
+        let c = PhyConfig::from_name(name);
+        assert_eq!(c.fec, FecMode::None, "{name}");
+        assert_eq!(c.repetition_k, 2, "{name}");
+    }
+    assert_eq!(
+        PhyConfig::robust_repeat().acquisition,
+        Acquisition::FirstSymbol
+    );
     assert_eq!(PhyConfig::fast().acquisition, Acquisition::FirstSymbol);
     assert_eq!(fec.acquisition, Acquisition::Joint { misses: 2 });
 }
@@ -73,7 +90,7 @@ fn defaults_are_unchanged() {
 /// first) still lock; three do not, and nothing false is decoded then.
 #[test]
 fn joint_acquisition_tolerates_two_missing_preamble_symbols() {
-    let config = PhyConfig::robust_fec();
+    let config = PhyConfig::robust();
     let period = config.samples_per_symbol_period();
     let msg = TransportMessage::Msc(MscMessage::cue(
         MscCommand::Go,
@@ -119,7 +136,7 @@ fn joint_acquisition_tolerates_two_missing_preamble_symbols() {
 
 #[test]
 fn loopback_all_message_types() {
-    for config in [PhyConfig::robust_fec(), fec_parity(2, 1), fec_parity(4, 2)] {
+    for config in [PhyConfig::robust(), fec_parity(2, 1), fec_parity(4, 2)] {
         let messages = all_types();
         let samples = encode_to_samples(config.clone(), &messages);
         for chunk in [64, 240, 4096] {
@@ -130,7 +147,7 @@ fn loopback_all_message_types() {
 
 #[test]
 fn sync_offset_sweep() {
-    let config = PhyConfig::robust_fec();
+    let config = PhyConfig::robust();
     let period = config.samples_per_symbol_period();
     let mut failures = Vec::new();
     for offset in (0..2 * period).step_by(5) {
@@ -154,7 +171,7 @@ fn sync_offset_sweep() {
 /// Wrong-tone symbols are fixed by the code and counted in the stats.
 #[test]
 fn corrects_wrong_symbols_and_reports_them() {
-    let config = PhyConfig::robust_fec();
+    let config = PhyConfig::robust();
     let msg = TransportMessage::Msc(MscMessage::cue(
         MscCommand::Load,
         MscCue::from_tenths(990).unwrap(),
@@ -191,7 +208,7 @@ fn corrects_wrong_symbols_and_reports_them() {
 /// tone streams into messages (CRC-16 + version/type/pad checks).
 #[test]
 fn noise_and_random_tones_produce_no_messages() {
-    let config = PhyConfig::robust_fec();
+    let config = PhyConfig::robust();
     let rate = config.sample_rate_hz as usize;
     let mut rng = XorShift64::new(0x0BAD);
     // 10 s of white noise.
@@ -219,16 +236,16 @@ fn noise_and_random_tones_produce_no_messages() {
 #[test]
 fn fec_k1_at_least_as_robust_as_repetition_k2() {
     let trials = 120;
-    let robust = run_cell(&PhyConfig::robust(), Impairment::SymErr(0.04), trials, 77);
-    let fec = run_cell(
-        &PhyConfig::robust_fec(),
+    let robust = run_cell(
+        &PhyConfig::robust_repeat(),
         Impairment::SymErr(0.04),
         trials,
         77,
     );
+    let fec = run_cell(&PhyConfig::robust(), Impairment::SymErr(0.04), trials, 77);
     assert!(
         fec.ok >= robust.ok,
-        "robust K2 {}/{trials}, robust_fec {}/{trials}",
+        "robust_repeat (K2) {}/{trials}, robust (FEC K1) {}/{trials}",
         robust.ok,
         fec.ok
     );
@@ -379,15 +396,15 @@ fn fec_ab_table() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(400);
     let profiles: Vec<(&str, PhyConfig)> = vec![
-        ("robust K2", PhyConfig::robust()),
+        ("robust_repeat K2", PhyConfig::robust_repeat()),
         (
-            "robust K1",
+            "robust_repeat K1",
             PhyConfig {
                 repetition_k: 1,
-                ..PhyConfig::robust()
+                ..PhyConfig::robust_repeat()
             },
         ),
-        ("fec p4 K1", PhyConfig::robust_fec()),
+        ("robust (p4 K1)", PhyConfig::robust()),
         ("fec p2 K1", fec_parity(2, 1)),
         ("fec p4 K2", fec_parity(4, 2)),
     ];
@@ -468,11 +485,13 @@ fn fec_ab_table() {
 /// `PhyConfig::from_name` names, optionally with an acquisition override:
 /// `name@first` = AML v1 first-symbol acquisition, `name@jointN` = joint
 /// acquisition tolerating N misses; a `+pre6` suffix on the name extends
-/// the preamble to 6 symbols, `A 5 C 3 8 E`). Default: robust, robust_fec as
-/// before joint acquisition (`robust_fec@first`), robust_fec, fast.
+/// the preamble to 6 symbols, `A 5 C 3 8 E`). Default: robust_repeat and
+/// robust with first-symbol acquisition (`@first`, as before joint
+/// acquisition) and as specified, and fast.
 fn acq_profiles() -> Vec<(String, PhyConfig)> {
-    let names = std::env::var("ACQ_PROFILES")
-        .unwrap_or_else(|_| "robust,robust_fec@first,robust_fec,fast".to_string());
+    let names = std::env::var("ACQ_PROFILES").unwrap_or_else(|_| {
+        "robust_repeat@first,robust_repeat,robust@first,robust,fast".to_string()
+    });
     names
         .split(',')
         .map(|n| {

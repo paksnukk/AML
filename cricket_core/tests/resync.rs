@@ -10,7 +10,10 @@ use std::f32::consts::PI;
 use support::decode_chunked;
 
 fn profiles() -> Vec<(&'static str, PhyConfig)> {
-    vec![("robust", PhyConfig::robust()), ("fast", PhyConfig::fast())]
+    vec![
+        ("robust_repeat", PhyConfig::robust_repeat()),
+        ("fast", PhyConfig::fast()),
+    ]
 }
 
 /// Steady tone at `config.tone_hz(nibble)` and the transmit amplitude.
@@ -140,7 +143,7 @@ fn failed_body_decode_rewinds_to_packet_inside_it() {
     let mut failures = Vec::new();
     let mut total = 0usize;
     let mut configs = profiles();
-    configs.push(("robust_fec", PhyConfig::robust_fec()));
+    configs.push(("robust", PhyConfig::robust()));
     for (name, mut config) in configs {
         config.repetition_k = 1;
         let period = config.samples_per_symbol_period();

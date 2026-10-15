@@ -11,7 +11,11 @@ use support::{decode_chunked, ChannelSim, XorShift64};
 const CHUNK_SIZES: [usize; 5] = [64, 128, 240, 512, 4096];
 
 fn profiles() -> Vec<(&'static str, PhyConfig)> {
-    vec![("robust", PhyConfig::robust()), ("fast", PhyConfig::fast())]
+    vec![
+        ("robust", PhyConfig::robust()),
+        ("robust_repeat", PhyConfig::robust_repeat()),
+        ("fast", PhyConfig::fast()),
+    ]
 }
 
 fn note_on_for(i: usize) -> TransportMessage {
@@ -170,7 +174,7 @@ fn modest_noise_snr20_decodes() {
 
 #[test]
 fn channel_sim_knobs_behave() {
-    let config = PhyConfig::robust();
+    let config = PhyConfig::robust_repeat();
     let messages = [note_on_for(42)];
     let clean = encode_to_samples(config.clone(), &messages);
 

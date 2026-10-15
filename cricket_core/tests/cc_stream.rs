@@ -138,6 +138,7 @@ fn fader_stream_does_not_delay_notes() {
     println!("|---|---|---|---|---|---|---|");
     for (name, config) in [
         ("robust", PhyConfig::robust()),
+        ("robust_repeat", PhyConfig::robust_repeat()),
         ("fast", PhyConfig::fast()),
         ("ltc_fec", PhyConfig::ltc_fec()),
     ] {

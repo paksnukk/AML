@@ -411,12 +411,12 @@ fn ltc_false_message_report() {
                         noise_false += m;
                         noise_locks += l;
                     }
-                    // 60 s of back-to-back MFSK messages (robust and fast).
+                    // 60 s of back-to-back MFSK messages (robust_repeat, fast, robust).
                     let (mut mfsk_false, mut mfsk_locks) = (0, 0);
                     for m in [
-                        PhyConfig::robust(),
+                        PhyConfig::robust_repeat(),
                         PhyConfig::fast(),
-                        PhyConfig::robust_fec(),
+                        PhyConfig::robust(),
                     ] {
                         let mut tx = CricketModemTx::new(m.clone());
                         let mut audio = Vec::new();
