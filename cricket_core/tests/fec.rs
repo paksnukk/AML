@@ -80,7 +80,7 @@ fn profile_parameters() {
     }
     assert_eq!(
         PhyConfig::robust_repeat().acquisition,
-        Acquisition::FirstSymbol
+        Acquisition::Joint { misses: 1 }
     );
     assert_eq!(PhyConfig::fast().acquisition, Acquisition::FirstSymbol);
     assert_eq!(fec.acquisition, Acquisition::Joint { misses: 2 });
@@ -122,6 +122,48 @@ fn joint_acquisition_tolerates_two_missing_preamble_symbols() {
                 .apply(&audio);
             let got = decode_chunked(config.clone(), &rx, chunk);
             let expect = if muted.len() <= 2 {
+                vec![msg.clone()]
+            } else {
+                vec![]
+            };
+            if got != expect {
+                failures.push(format!("muted {muted:?} offset {offset}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Robust repeat's joint acquisition (1 miss): a copy with any one muted
+/// preamble symbol, including the first, still decodes; with two it does
+/// not (checked on a single copy, K = 1).
+#[test]
+fn robust_repeat_joint_acquisition_tolerates_one_missing_preamble_symbol() {
+    let config = PhyConfig {
+        repetition_k: 1,
+        ..PhyConfig::robust_repeat()
+    };
+    let period = config.samples_per_symbol_period();
+    let msg = TransportMessage::NoteOn {
+        channel: 3,
+        note: 64,
+        velocity: 90,
+    };
+    let packet = CricketModemTx::new(config.clone()).encode_message_with_seq(&msg, 2);
+    let muted_sets: [&[usize]; 7] = [&[0], &[1], &[2], &[3], &[0, 1], &[1, 3], &[2, 3]];
+    let mut failures = Vec::new();
+    for muted in muted_sets {
+        let mut audio = packet.clone();
+        for &i in muted {
+            audio[i * period..(i + 1) * period].fill(0.0);
+        }
+        for (offset, chunk) in [(0usize, 4096usize), (101, 64), (period / 2, 240)] {
+            let rx = ChannelSim::new(config.clone(), 5)
+                .offset(offset)
+                .snr_db(20.0)
+                .apply(&audio);
+            let got = decode_chunked(config.clone(), &rx, chunk);
+            let expect = if muted.len() <= 1 {
                 vec![msg.clone()]
             } else {
                 vec![]

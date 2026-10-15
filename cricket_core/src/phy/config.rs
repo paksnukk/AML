@@ -88,9 +88,11 @@ impl PhyConfig {
     }
 
     /// **Robust repeat** (spec §6.2): Robust's tones and timing with the
-    /// uncoded 16-nibble block-interleaved body sent twice (K = 2). The choice
-    /// for lines with glitches or dropouts of ~50 ms or more, which a single
-    /// coded copy cannot bridge.
+    /// uncoded 16-nibble block-interleaved body sent twice (K = 2), and joint
+    /// preamble acquisition tolerating one missed preamble symbol
+    /// (docs/proposals/fec.md §10.4, "robust@joint1"). The choice for lines
+    /// with glitches or dropouts of ~50 ms or more, which a single coded copy
+    /// cannot bridge.
     pub fn robust_repeat() -> Self {
         Self {
             sample_rate_hz: 48_000,
@@ -112,7 +114,7 @@ impl PhyConfig {
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
-            acquisition: Acquisition::FirstSymbol,
+            acquisition: Acquisition::Joint { misses: 1 },
         }
     }
 
