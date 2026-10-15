@@ -98,6 +98,30 @@ pub fn decode_packet_bytes(bytes: &[u8]) -> Result<Packet, PacketDecodeError> {
     })
 }
 
+/// Whether an FEC-decoded data block (packet nibbles + zero pad) holds a
+/// valid packet: CRC-16, version and type checks pass, the pad is zero and
+/// the payload is in range ([`MessageType::payload_in_range`]).
+///
+/// Besides the CRC-16 this leaves about 17 bits of structure a random block
+/// must also match (`docs/proposals/fec.md` §9), which is what keeps the
+/// erasure-tolerant FEC decoder from turning noise into messages.
+pub fn fec_candidate_is_valid(nibbles: &[u8]) -> bool {
+    let bytes = nibbles_to_bytes(nibbles);
+    let Some(&hdr) = bytes.first() else {
+        return false;
+    };
+    let Some(msg_type) = MessageType::from_u8(hdr & 0x0F) else {
+        return false;
+    };
+    let needed = 2 + msg_type.payload_len() + 2;
+    // Cheapest checks first: version, pad, range, then the CRC.
+    hdr >> 4 == PROTOCOL_VERSION
+        && bytes.len() >= needed
+        && bytes[needed..].iter().all(|&b| b == 0)
+        && msg_type.payload_in_range(&bytes[2..needed - 2])
+        && decode_packet_bytes(&bytes[..needed]).is_ok()
+}
+
 /// Nibble count for a packet body after interleave padding.
 pub fn body_nibble_count(msg_type: MessageType, interleave_depth: usize) -> usize {
     let raw_bytes = 2 + msg_type.payload_len() + 2; // hdr+seq+payload+crc
@@ -145,5 +169,44 @@ mod tests {
             decode_packet_bytes(&bytes),
             Err(PacketDecodeError::BadVersion(0x2))
         );
+    }
+
+    /// The FEC acceptance check: CRC-valid blocks are still rejected when the
+    /// version, pad or payload range is wrong (spec §5 ranges).
+    #[test]
+    fn fec_candidate_checks_version_pad_and_ranges() {
+        let block = |hdr: u8, payload: &[u8], pad: u8| -> Vec<u8> {
+            let mut b = vec![hdr, 42];
+            b.extend_from_slice(payload);
+            let crc = crc16_ccitt(&b);
+            b.push((crc >> 8) as u8);
+            b.push(crc as u8);
+            b.resize(7, 0);
+            if 2 + payload.len() + 2 < 7 {
+                b[6] = pad;
+            }
+            bytes_to_nibbles(&b)
+        };
+        let ok = |hdr: u8, payload: &[u8]| fec_candidate_is_valid(&block(hdr, payload, 0));
+        assert!(ok(0x10, &[60, 100]));
+        assert!(ok(0x10, &[0x7F, 0x7F]));
+        assert!(ok(0x13, &[3, 15, 127]));
+        assert!(ok(0x14, &[]));
+        // Out of range (MIDI data >= 0x80, MSC cmd > 3, cuelist > 15, cue > 127).
+        assert!(!ok(0x10, &[0x80, 100]));
+        assert!(!ok(0x10, &[60, 0xFF]));
+        assert!(!ok(0x11, &[0x80]));
+        assert!(!ok(0x12, &[0x90]));
+        assert!(!ok(0x13, &[4, 0, 0]));
+        assert!(!ok(0x13, &[0, 16, 0]));
+        assert!(!ok(0x13, &[0, 0, 128]));
+        // Wrong version, unknown type, non-zero pad.
+        assert!(!ok(0x20, &[60, 100]));
+        assert!(!ok(0x16, &[]));
+        assert!(!fec_candidate_is_valid(&block(0x14, &[], 0x01)));
+        // A corrupted CRC.
+        let mut b = block(0x10, &[60, 100], 0);
+        b[10] ^= 1;
+        assert!(!fec_candidate_is_valid(&b));
     }
 }

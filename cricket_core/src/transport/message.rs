@@ -34,6 +34,24 @@ impl MessageType {
             Self::Heartbeat | Self::Panic => 0,
         }
     }
+
+    /// Whether `payload` (of [`payload_len`](Self::payload_len) bytes) is
+    /// within the value ranges of spec §5: MIDI data bytes 0–127, MscLite
+    /// `cmd` 0–3, `cuelist` 0–15, `cue` 0–127. A transmitter never sends
+    /// anything else; the FEC receivers reject out-of-range payloads as an
+    /// extra check against false decodes (`docs/proposals/fec.md` §9).
+    pub fn payload_in_range(self, payload: &[u8]) -> bool {
+        if payload.len() != self.payload_len() {
+            return false;
+        }
+        match self {
+            Self::NoteOn | Self::NoteOff | Self::ProgramChange => payload.iter().all(|&b| b < 0x80),
+            Self::MscLite => {
+                MscCommand::from_u8(payload[0]).is_some() && payload[1] < 0x10 && payload[2] < 0x80
+            }
+            Self::Heartbeat | Self::Panic => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

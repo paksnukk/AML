@@ -1,6 +1,6 @@
 use crate::link::{
     body_nibble_count, bytes_to_nibbles, decode_packet_bytes, deinterleave, encode_packet_bytes,
-    interleave, nibbles_to_bytes, BodySymbol, FecCodec, Packet,
+    fec_candidate_is_valid, interleave, nibbles_to_bytes, BodySymbol, FecCodec, Packet,
 };
 use crate::phy::{LinkState, Modulation, PhyConfig, PhyRx, PhyTx, RxEvent};
 use crate::transport::{
@@ -398,16 +398,7 @@ impl CricketModemRx {
     /// type checks and its pad bytes are zero.
     fn fec_packet_bytes(&mut self) -> Option<Vec<u8>> {
         let fec = self.fec.as_ref()?;
-        let decoded = fec.decode_body(&self.body_symbols, |nibbles| {
-            let bytes = nibbles_to_bytes(nibbles);
-            let Some(msg_type) = MessageType::from_u8(bytes[0] & 0x0F) else {
-                return false;
-            };
-            let needed = 2 + msg_type.payload_len() + 2;
-            bytes.len() >= needed
-                && bytes[needed..].iter().all(|&b| b == 0)
-                && decode_packet_bytes(&bytes[..needed]).is_ok()
-        })?;
+        let decoded = fec.decode_body(&self.body_symbols, fec_candidate_is_valid)?;
         self.fec_corrected += decoded.corrected as u64;
         Some(nibbles_to_bytes(&decoded.nibbles))
     }
