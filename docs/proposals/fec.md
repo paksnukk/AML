@@ -387,7 +387,9 @@ Measured (`false_accept_report`, `FALSE_SECONDS=120`, same signals as §9.4):
 | ltc2400_fec | music-like / speech-like | 2.0 / 1.5 | 7,500 / 10,000 |
 | ltc2400_fec | uncoded LTC (misconfigured TX) | 89 | 169 |
 | ltc9600_fec | uncoded LTC (misconfigured TX) | 241 | **62** |
-| robust_fec | AML v1 Robust / Fast traffic | 4 | 3,700 |
+| robust_fec | AML v1 Robust / Fast traffic | 58¹ | 260 |
+
+¹ With the joint preamble acquisition of §10 (1,040 false bodies / min); 4 candidates / min before it.
 
 No candidate passed the structure check and no false message was observed; white noise, clicks and
 SMPTE LTC produced no candidate on any profile. The worst cases are 196 years for natural audio and
