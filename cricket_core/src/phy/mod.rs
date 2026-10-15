@@ -9,7 +9,7 @@ mod select;
 mod synth;
 
 pub use bmc::{BmcParams, Modulation};
-pub use config::PhyConfig;
+pub use config::{Acquisition, PhyConfig};
 pub use demod::{DemodResult, LinkState, ModemRx, RxEvent};
 pub use goertzel::{best_tone, goertzel_power, tone_purity, ToneDetection};
 pub use select::{PhyRx, PhyTx};

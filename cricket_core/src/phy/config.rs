@@ -13,6 +13,25 @@ use alloc::vec::Vec;
 const PURITY_ROBUST: f32 = 0.25;
 const PURITY_FAST: f32 = 0.3;
 
+/// How the MFSK receiver finds a preamble (receiver-side only; the wire
+/// format is the same either way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Acquisition {
+    /// AML v1 (spec §3.2): gate on `preamble[0]` alone, fine-align on its
+    /// tone, then confirm the remaining preamble symbols in order.
+    #[default]
+    FirstSymbol,
+    /// **Experimental** joint detection over the whole preamble
+    /// (docs/proposals/fec.md, "Acquisition hardening"): a search window is a
+    /// candidate when at least `N - misses` preamble symbols show their
+    /// expected tone, fine alignment maximizes the summed expected-tone power
+    /// of all `N` symbols, and the lock is accepted when at most `misses`
+    /// symbols (anywhere, including the first) fail the detection gate and at
+    /// most one of those shows a clear *different* tone. Meant for FEC bodies,
+    /// where the coded body + CRC-16 verify the lock.
+    Joint { misses: u8 },
+}
+
 #[derive(Debug, Clone)]
 pub struct PhyConfig {
     pub sample_rate_hz: u32,
@@ -41,6 +60,8 @@ pub struct PhyConfig {
     /// Body forward error correction (experimental; `None` = AML v1 as
     /// specified). See docs/proposals/fec.md.
     pub fec: FecMode,
+    /// Preamble acquisition (MFSK only; `FirstSymbol` = AML v1).
+    pub acquisition: Acquisition,
 }
 
 impl Default for PhyConfig {
@@ -71,6 +92,7 @@ impl PhyConfig {
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
+            acquisition: Acquisition::FirstSymbol,
         }
     }
 
@@ -97,16 +119,20 @@ impl PhyConfig {
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
+            acquisition: Acquisition::FirstSymbol,
         }
     }
 
     /// Experimental: Robust phy with an RS(11,7)x2 GF(16) coded body
-    /// (`FecMode::Rs16 { parity: 4 }`) and a single copy (K = 1) instead of
-    /// K = 2 repetition. Not part of AML v1; see docs/proposals/fec.md.
+    /// (`FecMode::Rs16 { parity: 4 }`), a single copy (K = 1) instead of
+    /// K = 2 repetition, and joint preamble acquisition tolerating two missed
+    /// preamble symbols. Same preamble and symbol timing as Robust. Not part
+    /// of AML v1; see docs/proposals/fec.md.
     pub fn robust_fec() -> Self {
         Self {
             repetition_k: 1,
             fec: FecMode::Rs16 { parity: 4 },
+            acquisition: Acquisition::Joint { misses: 2 },
             ..Self::robust()
         }
     }
@@ -141,6 +167,7 @@ impl PhyConfig {
             link_dead_ms: 2000,
             heartbeat_interval_ms: 500,
             fec: FecMode::None,
+            acquisition: Acquisition::FirstSymbol,
         }
     }
 

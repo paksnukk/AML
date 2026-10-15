@@ -14,7 +14,7 @@ use cricket_core::link::FecMode;
 use cricket_core::modem::{
     encode_to_samples, repetition_samples, CricketModemRx, CricketModemTx, ModemOutput,
 };
-use cricket_core::phy::PhyConfig;
+use cricket_core::phy::{Acquisition, PhyConfig};
 use cricket_core::transport::{MscCommand, TransportMessage};
 use support::{decode_chunked, ChannelSim, XorShift64};
 
@@ -40,7 +40,7 @@ fn fec_parity(parity: u8, k: usize) -> PhyConfig {
     PhyConfig {
         repetition_k: k,
         fec: FecMode::Rs16 { parity },
-        ..PhyConfig::robust()
+        ..PhyConfig::robust_fec()
     }
 }
 
@@ -56,6 +56,57 @@ fn defaults_are_unchanged() {
     assert_eq!(repetition_samples(&fec), 27 * 312);
     assert!((fec.estimated_first_copy_ms() - 26.0 * 6.5).abs() < 1e-3);
     assert_eq!(PhyConfig::from_name("robust_fec").fec, fec.fec);
+    assert_eq!(PhyConfig::robust().acquisition, Acquisition::FirstSymbol);
+    assert_eq!(PhyConfig::fast().acquisition, Acquisition::FirstSymbol);
+    assert_eq!(fec.acquisition, Acquisition::Joint { misses: 2 });
+}
+
+/// Joint acquisition: any one or two muted preamble symbols (including the
+/// first) still lock; three do not, and nothing false is decoded then.
+#[test]
+fn joint_acquisition_tolerates_two_missing_preamble_symbols() {
+    let config = PhyConfig::robust_fec();
+    let period = config.samples_per_symbol_period();
+    let msg = TransportMessage::MscLite {
+        cmd: MscCommand::Go,
+        cuelist: 2,
+        cue: 77,
+    };
+    let packet = CricketModemTx::new(config.clone()).encode_message_with_seq(&msg, 5);
+    let muted_sets: [&[usize]; 9] = [
+        &[0],
+        &[1],
+        &[2],
+        &[3],
+        &[0, 1],
+        &[0, 3],
+        &[1, 2],
+        &[2, 3],
+        &[0, 1, 2],
+    ];
+    let mut failures = Vec::new();
+    for muted in muted_sets {
+        let mut audio = packet.clone();
+        for &i in muted {
+            audio[i * period..(i + 1) * period].fill(0.0);
+        }
+        for (offset, chunk) in [(0usize, 4096usize), (101, 64), (period / 2, 240)] {
+            let rx = ChannelSim::new(config.clone(), 3)
+                .offset(offset)
+                .snr_db(20.0)
+                .apply(&audio);
+            let got = decode_chunked(config.clone(), &rx, chunk);
+            let expect = if muted.len() <= 2 {
+                vec![msg.clone()]
+            } else {
+                vec![]
+            };
+            if got != expect {
+                failures.push(format!("muted {muted:?} offset {offset}: {got:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
@@ -226,6 +277,11 @@ struct Cell {
     /// Mean message start → delivery time over delivered trials (ms).
     mean_latency_ms: f64,
     false_msgs: usize,
+    /// Dropout cells only: lost trials whose dropout overlapped the first
+    /// copy's preamble, and lost trials whose dropout started inside the
+    /// first copy's body.
+    lost_preamble_hit: usize,
+    lost_body_only: usize,
 }
 
 /// `trials` single-message transmissions (random NoteOn / MscLite, random
@@ -235,7 +291,10 @@ fn run_cell(config: &PhyConfig, imp: Impairment, trials: usize, seed: u64) -> Ce
     let rate = config.sample_rate_hz as f64;
     let mut ok = 0;
     let mut false_msgs = 0;
+    let mut lost_preamble_hit = 0;
+    let mut lost_body_only = 0;
     let mut lat = Vec::new();
+    let period = config.samples_per_symbol_period();
     for t in 0..trials {
         let msg = if t % 4 == 3 {
             TransportMessage::MscLite {
@@ -253,7 +312,8 @@ fn run_cell(config: &PhyConfig, imp: Impairment, trials: usize, seed: u64) -> Ce
         let tx = CricketModemTx::new(config.clone());
         let mut clean = tx.encode_message_with_seq(&msg, rng.below(256) as u8);
         clean.extend(std::iter::repeat_n(0.0, config.sample_rate_hz as usize / 4));
-        let audio = imp.sim(config, rng.next_u64(), offset).apply(&clean);
+        let sim_seed = rng.next_u64();
+        let audio = imp.sim(config, sim_seed, offset).apply(&clean);
 
         let mut rx = CricketModemRx::new(config.clone());
         let mut delivered_at = None;
@@ -271,11 +331,23 @@ fn run_cell(config: &PhyConfig, imp: Impairment, trials: usize, seed: u64) -> Ce
         if let Some(at) = delivered_at {
             ok += 1;
             lat.push((at as f64 - offset as f64) / rate * 1000.0);
+        } else if let Impairment::Dropout(ms) = imp {
+            // Same draw as `ChannelSim::apply` (first RNG use for a dropout
+            // without symbol corruption).
+            let d = (ms * config.sample_rate_hz as f32 / 1000.0) as usize;
+            let start = XorShift64::new(sim_seed).below(clean.len() - d);
+            if start < config.preamble.len() * period {
+                lost_preamble_hit += 1;
+            } else if (start as u64) < repetition_samples(config) {
+                lost_body_only += 1;
+            }
         }
     }
     Cell {
         ok,
         trials,
+        lost_preamble_hit,
+        lost_body_only,
         mean_latency_ms: if lat.is_empty() {
             f64::NAN
         } else {
@@ -373,4 +445,274 @@ fn fec_ab_table() {
     }
     println!("\nfalse messages (all cells): {false_total}");
     assert_eq!(false_total, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Acquisition (preamble detection) measurements
+
+/// Profiles of the acquisition tables (`ACQ_PROFILES`, comma-separated
+/// `PhyConfig::from_name` names, optionally with an acquisition override:
+/// `name@first` = AML v1 first-symbol acquisition, `name@jointN` = joint
+/// acquisition tolerating N misses; a `+pre6` suffix on the name extends
+/// the preamble to 6 symbols, `A 5 C 3 8 E`). Default: robust, robust_fec as
+/// before joint acquisition (`robust_fec@first`), robust_fec, fast.
+fn acq_profiles() -> Vec<(String, PhyConfig)> {
+    let names = std::env::var("ACQ_PROFILES")
+        .unwrap_or_else(|_| "robust,robust_fec@first,robust_fec,fast".to_string());
+    names
+        .split(',')
+        .map(|n| {
+            let n = n.trim();
+            let (base, acq) = n.split_once('@').unwrap_or((n, ""));
+            let (base, pre6) = match base.strip_suffix("+pre6") {
+                Some(b) => (b, true),
+                None => (base, false),
+            };
+            let mut config = PhyConfig::from_name(base);
+            if pre6 {
+                config.preamble = vec![0xA, 0x5, 0xC, 0x3, 0x8, 0xE];
+            }
+            if acq == "first" {
+                config.acquisition = Acquisition::FirstSymbol;
+            } else if let Some(m) = acq.strip_prefix("joint") {
+                config.acquisition = Acquisition::Joint {
+                    misses: m.parse().expect("joint<misses>"),
+                };
+            }
+            (n.to_string(), config)
+        })
+        .collect()
+}
+
+/// Delivery under the channels where acquisition matters, plus the dropout
+/// loss split (dropout starting in the preamble vs in the body).
+///
+/// ```sh
+/// cargo test --release -p cricket_core --test fec acquisition_ab_table -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "long-running A/B table; run with --release -- --ignored --nocapture"]
+fn acquisition_ab_table() {
+    let trials: usize = std::env::var("FEC_AB_TRIALS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    let profiles = acq_profiles();
+    let imps = [
+        Impairment::Clean,
+        Impairment::Snr(2.0),
+        Impairment::Snr(0.0),
+        Impairment::Snr(-2.0),
+        Impairment::Snr(-3.0),
+        Impairment::Snr(-4.0),
+        Impairment::SymErr(0.01),
+        Impairment::SymErr(0.02),
+        Impairment::SymErr(0.05),
+        Impairment::SymErr(0.10),
+        Impairment::Dropout(10.0),
+        Impairment::Dropout(30.0),
+        Impairment::Dropout(60.0),
+        Impairment::GainSnr(-40.0, 0.0),
+        Impairment::LowpassSnr(2500.0, 6.0),
+        Impairment::DriftSnr(500.0, 0.0),
+    ];
+    // One thread per (profile, impairment) cell.
+    let results: Vec<Vec<Cell>> = std::thread::scope(|s| {
+        let handles: Vec<Vec<_>> = profiles
+            .iter()
+            .map(|(_, c)| {
+                imps.iter()
+                    .enumerate()
+                    .map(|(i, imp)| s.spawn(move || run_cell(c, *imp, trials, 0xACC0 + i as u64)))
+                    .collect()
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|hs| hs.into_iter().map(|h| h.join().unwrap()).collect())
+            .collect()
+    });
+
+    println!("\nDelivery rate % (mean start→delivery ms), {trials} trials per cell:");
+    print!("| {:<22} |", "channel");
+    for (name, _) in &profiles {
+        print!(" {name:>15} |");
+    }
+    println!();
+    let mut false_total = 0;
+    for (i, imp) in imps.iter().enumerate() {
+        print!("| {:<22} |", imp.label());
+        for r in &results {
+            let c = &r[i];
+            false_total += c.false_msgs;
+            let pct = 100.0 * c.ok as f64 / c.trials as f64;
+            print!(" {:>5.1} ({:>5.0} ms) |", pct, c.mean_latency_ms);
+        }
+        println!();
+    }
+    println!("\nDropout losses (dropout starts in first-copy preamble / in its body):");
+    for (i, imp) in imps.iter().enumerate() {
+        if let Impairment::Dropout(_) = imp {
+            print!("  {:<16}", imp.label());
+            for ((name, _), r) in profiles.iter().zip(&results) {
+                let c = &r[i];
+                print!("  {name}: {}/{}", c.lost_preamble_hit, c.lost_body_only);
+            }
+            println!();
+        }
+    }
+    println!("\nfalse messages (all cells): {false_total}");
+    assert_eq!(false_total, 0);
+}
+
+/// Music-like test audio: harmonic voices (fundamentals 110–880 Hz, 10
+/// harmonics, so partials sweep the 2.5–4.1 kHz tone band), a pure-sine
+/// "whistle" melody inside the tone band, vibrato, note envelopes and
+/// drum-like noise bursts.
+fn music_like(rate: usize, seconds: usize, seed: u64) -> Vec<f32> {
+    use std::f32::consts::PI;
+    let mut rng = XorShift64::new(seed);
+    let n = rate * seconds;
+    let mut out = vec![0.0f32; n];
+    let midi_hz = |m: f32| 440.0 * 2f32.powf((m - 69.0) / 12.0);
+    for voice in 0..4 {
+        let whistle = voice == 3;
+        let mut t = 0usize;
+        let mut phase = 0.0f32;
+        while t < n {
+            let len = rate * (80 + rng.below(420)) / 1000;
+            let note = if whistle {
+                (88 + rng.below(16)) as f32 // ~2.6–4.1 kHz
+            } else {
+                (45 + rng.below(36)) as f32 // 110–880 Hz
+            };
+            let f0 = midi_hz(note);
+            let amp = if whistle { 0.15 } else { 0.08 };
+            let vib_rate = 4.0 + rng.next_f64() as f32 * 2.0;
+            for i in 0..len.min(n - t) {
+                let ts = i as f32 / rate as f32;
+                let env = (ts / 0.01).min(1.0) * (-ts * 3.0).exp().max(0.3);
+                let f = f0 * (1.0 + 0.005 * (2.0 * PI * vib_rate * ts).sin());
+                phase += 2.0 * PI * f / rate as f32;
+                if phase > 2.0 * PI {
+                    phase -= 2.0 * PI;
+                }
+                let x = if whistle {
+                    phase.sin()
+                } else {
+                    (1..=10).map(|h| (h as f32 * phase).sin() / h as f32).sum()
+                };
+                out[t + i] += amp * env * x;
+            }
+            t += len;
+        }
+    }
+    let mut t = 0;
+    while t < n {
+        let len = (rate / 20).min(n - t);
+        for i in 0..len {
+            let env = (-(i as f32) / (rate as f32 * 0.01)).exp();
+            out[t + i] += 0.2 * env * rng.gaussian() as f32;
+        }
+        t += rate * (150 + rng.below(350)) / 1000;
+    }
+    out
+}
+
+/// Phy lock attempts that reach the body (`PreambleLocked`) on audio without
+/// packets; every completed body is rejected, as the modem would.
+fn phy_locks(config: &PhyConfig, audio: &[f32]) -> usize {
+    use cricket_core::phy::{ModemRx, RxEvent};
+    let mut rx = ModemRx::new(config.clone());
+    rx.set_expected_body_nibbles(config.fec.body_nibbles());
+    let mut locks = 0;
+    for chunk in audio.chunks(256) {
+        let mut events = rx.push_samples(chunk);
+        loop {
+            locks += events
+                .iter()
+                .filter(|e| matches!(e, RxEvent::PreambleLocked { .. }))
+                .count();
+            if !rx.awaiting_verdict() {
+                break;
+            }
+            events = rx.reject();
+        }
+    }
+    locks
+}
+
+/// False-trigger rates (phy locks per minute) and receiver CPU (host ns per
+/// input sample, best of 3) on 60 s each of white noise, music-like audio
+/// and random MFSK symbols (no preambles), and on 200 back-to-back packets
+/// at SNR 0 dB. None of the packet-free inputs may produce a message.
+///
+/// ```sh
+/// cargo test --release -p cricket_core --test fec false_trigger_report -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "long-running report; run with --release -- --ignored --nocapture"]
+fn false_trigger_report() {
+    let profiles = acq_profiles();
+    let rate = 48_000usize;
+    let mut rng = XorShift64::new(0x5EED);
+    let noise: Vec<f32> = (0..60 * rate)
+        .map(|_| (rng.gaussian() * 0.3) as f32)
+        .collect();
+    let music = music_like(rate, 60, 0x0A11);
+    println!(
+        "\n| profile | locks/min noise | music | random tones | false msgs | ns/sample noise | music | random tones | packets 0 dB | delivered |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for (name, config) in &profiles {
+        // 60 s of random MFSK symbols (no preambles): other packets' bodies.
+        let mut rng = XorShift64::new(0x70E5);
+        let symbols = 60 * rate / config.samples_per_symbol_period();
+        let nibbles: Vec<u8> = (0..symbols).map(|_| rng.below(16) as u8).collect();
+        let tones = cricket_core::phy::ModemTx::new(config.clone()).synthesize_nibbles(&nibbles);
+        let locks: Vec<usize> = [&noise, &music, &tones]
+            .into_iter()
+            .map(|a| phy_locks(config, a))
+            .collect();
+        let mut tx = CricketModemTx::new(config.clone());
+        let mut clean = Vec::new();
+        let sent = 200u32;
+        for i in 0..sent {
+            clean.extend(tx.encode_message(&TransportMessage::NoteOn {
+                note: (i % 128) as u8,
+                velocity: 1 + (i % 127) as u8,
+            }));
+        }
+        let packets = ChannelSim::new(config.clone(), 7).snr_db(0.0).apply(&clean);
+        let mut false_msgs = 0;
+        let mut delivered = 0;
+        let mut ns = Vec::new();
+        for (i, audio) in [&noise, &music, &tones, &packets].into_iter().enumerate() {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let mut rx = CricketModemRx::new(config.clone());
+                let start = std::time::Instant::now();
+                let mut msgs = 0;
+                for chunk in audio.chunks(256) {
+                    for out in rx.push_samples(chunk) {
+                        if let ModemOutput::Message(_) = out {
+                            msgs += 1;
+                        }
+                    }
+                }
+                best = best.min(start.elapsed().as_nanos() as f64 / audio.len() as f64);
+                if i < 3 {
+                    false_msgs += msgs;
+                } else {
+                    delivered = msgs;
+                }
+            }
+            ns.push(best);
+        }
+        println!(
+            "| {name} | {} | {} | {} | {false_msgs} | {:.1} | {:.1} | {:.1} | {:.1} | {delivered}/{sent} |",
+            locks[0], locks[1], locks[2], ns[0], ns[1], ns[2], ns[3]
+        );
+        assert_eq!(false_msgs, 0, "{name}: false messages without packets");
+    }
 }

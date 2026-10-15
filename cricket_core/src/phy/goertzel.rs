@@ -20,6 +20,35 @@ pub fn goertzel_power(samples: &[f32], target_freq: f32, sample_rate: u32) -> f3
     q1 * q1 + q2 * q2 - q1 * q2 * coeff
 }
 
+/// Goertzel power for one frequency and the window energy `sum(x^2)`, in one
+/// pass over `samples` (`n` of them). Bit-identical to [`goertzel_power`] and
+/// [`window_energy`] on the same samples.
+pub fn goertzel_power_energy(
+    samples: impl IntoIterator<Item = f32>,
+    n: usize,
+    target_freq: f32,
+    sample_rate: u32,
+) -> (f32, f32) {
+    let nf = n as f32;
+    if nf < 2.0 {
+        return (0.0, samples.into_iter().map(|s| s * s).sum());
+    }
+    let k = (nf * target_freq) / sample_rate as f32;
+    let w = 2.0 * PI * k / nf;
+    let coeff = 2.0 * libm::cosf(w);
+
+    let mut q1 = 0.0f32;
+    let mut q2 = 0.0f32;
+    let mut energy = 0.0f32;
+    for sample in samples {
+        let q0 = coeff * q1 - q2 + sample;
+        q2 = q1;
+        q1 = q0;
+        energy += sample * sample;
+    }
+    (q1 * q1 + q2 * q2 - q1 * q2 * coeff, energy)
+}
+
 /// Result of a Goertzel tone-bank decision over one window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToneDetection {
@@ -151,6 +180,19 @@ mod tests {
             );
             // Aligned, ramped synthesized symbol: purity close to 1 at any level.
             assert!(det.purity > 0.9, "symbol {i}: purity {det:?}");
+        }
+    }
+
+    #[test]
+    fn power_energy_matches_separate_passes() {
+        let sr = 48_000u32;
+        let x: Vec<f32> = (0..288)
+            .map(|i| (0.37 * i as f32).sin() * 0.5 + (0.011 * (i * i) as f32).cos() * 0.2)
+            .collect();
+        for f in [2500.0f32, 3000.0, 3700.0] {
+            let (p, e) = goertzel_power_energy(x.iter().copied(), x.len(), f, sr);
+            assert_eq!(p.to_bits(), goertzel_power(&x, f, sr).to_bits());
+            assert_eq!(e.to_bits(), window_energy(&x).to_bits());
         }
     }
 

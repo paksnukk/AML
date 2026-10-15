@@ -1,5 +1,7 @@
-use super::config::PhyConfig;
-use super::goertzel::{best_tone, goertzel_power, rms_dbfs, ToneDetection};
+use super::config::{Acquisition, PhyConfig};
+use super::goertzel::{
+    best_tone, goertzel_power, goertzel_power_energy, rms_dbfs, tone_purity, ToneDetection,
+};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -41,6 +43,24 @@ pub enum RxEvent {
     SyncLost,
     Metrics {
         state: LinkState,
+        confidence_db: f32,
+    },
+}
+
+/// Joint acquisition: minimum mean expected-tone purity of a candidate
+/// search window, as a fraction of `min_tone_purity`. Measured: 0.8 keeps
+/// every A/B cell (down to AWGN −4 dB) and cuts the work on unrelated MFSK
+/// audio by a third; 1.0 already loses deliveries at −3/−4 dB.
+const JOINT_MIN_MEAN_PURITY: f32 = 0.8;
+
+/// Outcome of one joint-acquisition search step.
+enum JointStep {
+    NeedInput,
+    /// No lock at this window: move on by one hop.
+    Advance,
+    Lock {
+        trigger: u64,
+        aligned: u64,
         confidence_db: f32,
     },
 }
@@ -248,14 +268,46 @@ impl ModemRx {
 
         loop {
             match self.phase {
+                RxPhase::Search if self.joint_misses().is_some() => {
+                    match self.joint_search_step(sym, period, hop) {
+                        JointStep::NeedInput => break,
+                        JointStep::Advance => {
+                            self.read += hop as u64;
+                            self.trim(hop);
+                        }
+                        JointStep::Lock {
+                            trigger,
+                            aligned,
+                            confidence_db,
+                        } => {
+                            let n = self.config.preamble.len() as u64;
+                            self.attempt = Some(trigger);
+                            self.read = aligned + n * period as u64;
+                            self.phase = RxPhase::Body {
+                                collected: 0,
+                                expected: self.expected_body_nibbles,
+                                erased: 0,
+                            };
+                            self.link_state = LinkState::Locked;
+                            self.last_confidence_db = confidence_db;
+                            events.push(RxEvent::PreambleLocked { confidence_db });
+                            self.trim(hop);
+                        }
+                    }
+                }
                 RxPhase::Search => {
                     if !self.available(self.read, sym) {
                         break;
                     }
                     let trigger = self.read;
-                    let hit = self
-                        .detect_nibble(&self.window_at(trigger, sym))
-                        .is_some_and(|det| self.preamble0_ok(&det));
+                    // Cheap pre-check: the gate needs the preamble[0] tone's
+                    // purity >= min_tone_purity, so skip the 16-tone bank when
+                    // that single tone (bit-identical power and energy) fails.
+                    let hit = self.expected_purity(trigger, sym, self.config.preamble[0])
+                        >= self.config.min_tone_purity
+                        && self
+                            .detect_nibble(&self.window_at(trigger, sym))
+                            .is_some_and(|det| self.preamble0_ok(&det));
                     if hit {
                         // Fine alignment looks up to one symbol ahead and the lock
                         // needs a full period behind that. Wait for all of it (the
@@ -391,6 +443,106 @@ impl ModemRx {
         events
     }
 
+    /// Tolerated preamble misses under joint acquisition (`None` = AML v1
+    /// first-symbol acquisition).
+    fn joint_misses(&self) -> Option<usize> {
+        match self.config.acquisition {
+            Acquisition::FirstSymbol => None,
+            Acquisition::Joint { misses } => Some(misses as usize),
+        }
+    }
+
+    /// Purity of `nibble`'s tone in the window `[at, at + sym)`, or 0 below
+    /// the silence floor. Equals `detect_nibble`'s purity when that tone wins.
+    fn expected_purity(&self, at: u64, sym: usize, nibble: u8) -> f32 {
+        let start = (at - self.base()) as usize;
+        let (power, energy) = goertzel_power_energy(
+            self.buffer.range(start..start + sym).copied(),
+            sym,
+            self.config.tone_hz(nibble),
+            self.config.sample_rate_hz,
+        );
+        if rms_dbfs(energy, sym) < self.config.min_rms_dbfs {
+            return 0.0;
+        }
+        tone_purity(power, energy, sym)
+    }
+
+    /// One joint-acquisition search step at window position `self.read`.
+    ///
+    /// 1. **Candidate** (one Goertzel + energy per preamble window
+    ///    `read + i * period`): at most `misses` windows have an expected-tone
+    ///    purity below `min_tone_purity` (stops at the first excess miss), and
+    ///    the purities sum to at least `0.8 * N * min_tone_purity`.
+    /// 2. **Fine alignment** on the summed expected-tone power of all `N`
+    ///    windows ([`best_preamble_position`](Self::best_preamble_position)).
+    /// 3. **Accept** (full tone bank per aligned window): at most `misses`
+    ///    symbols fail the gate (nibble, purity, `0.5 * min_confidence_db`), at
+    ///    least one passes, and at most one failed window is won by another
+    ///    tone with at least half the gate purity, so a stream of unrelated
+    ///    tones needs three matching symbols in sequence while noise or a
+    ///    dropout may take out two.
+    fn joint_search_step(&self, sym: usize, period: usize, hop: usize) -> JointStep {
+        let misses = self.joint_misses().unwrap_or(0);
+        let n = self.config.preamble.len();
+        let min_purity = self.config.min_tone_purity;
+        let trigger = self.read;
+        let span = (n - 1) * period + sym;
+        if !self.available(trigger, span) {
+            return JointStep::NeedInput;
+        }
+        let mut failed = 0;
+        let mut sum = 0.0;
+        for (i, &nibble) in self.config.preamble.iter().enumerate() {
+            let p = self.expected_purity(trigger + (i * period) as u64, sym, nibble);
+            sum += p;
+            if p < min_purity {
+                failed += 1;
+                if failed > misses {
+                    return JointStep::Advance;
+                }
+            }
+        }
+        if sum < JOINT_MIN_MEAN_PURITY * min_purity * n as f32 {
+            return JointStep::Advance;
+        }
+        // Alignment looks up to one symbol ahead; wait for all of it so the
+        // result never depends on input chunking (re-evaluated next call).
+        if !self.available(trigger, sym + span) {
+            return JointStep::NeedInput;
+        }
+        let aligned = self.best_preamble_position(trigger, sym, hop, period);
+        let mut bad = 0;
+        let mut contradicting = 0;
+        let mut confidence_db = 0.0;
+        for (i, &nibble) in self.config.preamble.iter().enumerate() {
+            let det = self.detect_nibble(&self.window_at(aligned + (i * period) as u64, sym));
+            match det {
+                Some(d)
+                    if d.nibble == nibble
+                        && self.level_ok(&d)
+                        && d.confidence_db >= self.config.min_confidence_db * 0.5 =>
+                {
+                    confidence_db = d.confidence_db;
+                    continue;
+                }
+                Some(d) if d.nibble != nibble && d.purity >= 0.5 * min_purity => {
+                    contradicting += 1;
+                }
+                _ => {}
+            }
+            bad += 1;
+            if bad > misses || bad >= n || contradicting > 1 {
+                return JointStep::Advance;
+            }
+        }
+        JointStep::Lock {
+            trigger,
+            aligned,
+            confidence_db,
+        }
+    }
+
     fn detect_nibble(&self, window: &[f32]) -> Option<DemodResult> {
         let ToneDetection {
             index,
@@ -429,13 +581,53 @@ impl ModemRx {
     /// Needs samples up to `trigger + 2 * sym`.
     fn best_preamble0_position(&self, trigger: u64, sym: usize, hop: usize) -> u64 {
         let target = self.config.tone_hz(self.config.preamble[0]);
+        let power =
+            |at: u64| goertzel_power(&self.window_at(at, sym), target, self.config.sample_rate_hz);
+        self.maximize_position(trigger, sym, hop, power)
+    }
+
+    /// Joint-acquisition fine alignment: like
+    /// [`best_preamble0_position`](Self::best_preamble0_position), but
+    /// maximizes the expected-tone power summed over all preamble symbols
+    /// (`at + i * period`), so a weak or missing symbol does not decide the
+    /// symbol clock. Needs samples up to `trigger + 2 * sym + (N - 1) * period`.
+    fn best_preamble_position(&self, trigger: u64, sym: usize, hop: usize, period: usize) -> u64 {
+        let power = |at: u64| -> f32 {
+            self.config
+                .preamble
+                .iter()
+                .enumerate()
+                .map(|(i, &nibble)| {
+                    let start = (at + (i * period) as u64 - self.base()) as usize;
+                    goertzel_power_energy(
+                        self.buffer.range(start..start + sym).copied(),
+                        sym,
+                        self.config.tone_hz(nibble),
+                        self.config.sample_rate_hz,
+                    )
+                    .0
+                })
+                .sum()
+        };
+        self.maximize_position(trigger, sym, hop, power)
+    }
+
+    /// Window start in `[trigger - hop, trigger + sym]` (clamped to buffered
+    /// history and `align_floor`) maximizing `power`: coarse grid of `hop / 2`
+    /// through `trigger`, earliest first (ties keep the earlier), then halving
+    /// refinement down to one sample.
+    fn maximize_position(
+        &self,
+        trigger: u64,
+        sym: usize,
+        hop: usize,
+        power: impl Fn(u64) -> f32,
+    ) -> u64 {
         let lo = trigger
             .saturating_sub(hop as u64)
             .max(self.base())
             .max(self.align_floor.min(trigger));
         let hi = trigger + sym as u64;
-        let power =
-            |at: u64| goertzel_power(&self.window_at(at, sym), target, self.config.sample_rate_hz);
         let mut best = trigger;
         let mut best_power = power(trigger);
         let mut consider = |at: u64, best: &mut u64| {
