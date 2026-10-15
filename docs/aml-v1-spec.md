@@ -4,7 +4,7 @@
 
 AML (AudioMIDI Link) is the protocol; Cricket is its reference implementation.
 
-AML v1 transports MIDI/MSC-like control events over an audio path using an
+AML v1 transports MIDI 1.0 short messages (all channels) and MIDI Show Control over an audio path using an
 **MFSK-16 bitstream modem** with framed packets, CRC-16 integrity, packet
 repetition, and fail-safe link monitoring.
 
@@ -16,7 +16,7 @@ physical/link stack. The earlier prototype phy (semantic tone symbols, see
 
 | Layer | Responsibility |
 |-------|----------------|
-| Transport | Message types, MIDI mapping, heartbeat / All Notes Off policy |
+| Transport | Message types, MIDI and MSC mapping, TX scheduling, heartbeat / fail-safe policy |
 | Link | Packet header, sequence numbers, CRC-16, repetition, interleave |
 | Physical | MFSK-16 tones, preamble sync, Goertzel demodulation |
 
@@ -90,8 +90,9 @@ Used for packet acquisition and symbol-boundary alignment. The preamble replaces
 ```
 [0]     HDR         = (VERSION << 4) | MSG_TYPE
                       VERSION = 0x1 (AML v1; any other value is rejected)
-[1]     SEQ         (0..255, wrapping)
-[2..]   PAYLOAD     (length implied by MSG_TYPE)
+[1]     SEQ         = 0..3 (2-bit counter, wrapping 0, 1, 2, 3, 0, …);
+                      bits 7..2 are reserved and MUST be 0
+[2..]   PAYLOAD     (length implied by MSG_TYPE, §5)
 […]     CRC16_HI
 […]     CRC16_LO
 ```
@@ -100,12 +101,20 @@ Payload lengths by type:
 
 | MSG_TYPE | Payload bytes |
 |----------|---------------|
-| NoteOn (0) | 2 (`note`, `velocity`) |
-| NoteOff (1) | 1 (`note`) |
-| ProgramChange (2) | 1 (`program`) |
-| MscLite (3) | 3 (`cmd`, `cuelist`, `cue`) |
-| Heartbeat (4) | 0 |
-| Panic (5) | 0 |
+| Midi (0x0) | 3 (`status`, `data1`, `data2`) |
+| Msc (0x3) | 3 (compact MSC, §5.4) |
+| Heartbeat (0x4) | 0 |
+| Panic (0x5) | 0 |
+
+Type values 0x1, 0x2 and 0x6–0xF are reserved; a packet with a reserved type, a non-zero reserved
+SEQ bit or a non-canonical payload (§5.1) MUST be rejected like a CRC failure, even when its CRC is
+valid. The largest packet (Midi, Msc) is 7 bytes; shorter packets are zero-padded to the body length
+(§4.3, FEC: `docs/proposals/fec.md`), and every body has the same length whatever the type.
+
+SEQ only has to tell consecutive packets apart for duplicate suppression (§4.4): message `n` and
+`n + 4` are always more than one dedup window apart, because messages are sent one after another and
+the window is shorter than two messages. The six reserved bits are part of the structure a random
+or corrupted block must match (`docs/proposals/fec.md` §9.7).
 
 CRC-16/CCITT (poly `0x1021`, init `0xFFFF`, refin=false, refout=false, xorout=`0x0000`)
 covers all bytes from `HDR` through end of `PAYLOAD` (excludes CRC itself).
@@ -121,7 +130,8 @@ byte b → symbols [b >> 4, b & 0x0F]
 ### 4.3 Interleaving
 
 Block interleave with depth **4** over the packet nibble stream
-(column-major write, row-major read). Pad with `0x0` nibbles to a multiple of depth.
+(column-major write, row-major read). The packet nibbles are first padded with `0x0` to the fixed
+body length of **16** nibbles.
 
 ### 4.4 Repetition
 
@@ -141,37 +151,57 @@ A packet with the same `SEQ` but a different payload, or one arriving after the 
 ### 4.5 On-wire order (one repetition)
 
 ```
-PREAMBLE(4) || INTERLEAVE(NIBBLES(packet_bytes))
+PREAMBLE(4) || INTERLEAVE(PAD16(NIBBLES(packet_bytes)))
 ```
 
-Example NoteOn body size: HDR+SEQ+2+CRC = 6 bytes → 12 nibbles → pad to 12
-(already multiple of 4). One repetition ≈ 4 + 12 = 16 symbols ≈ 104 ms @ 6.5 ms/symbol.
+Every body is 16 nibbles: one repetition is 4 + 16 = 20 symbols ≈ 130 ms @ 6.5 ms/symbol.
 Latency to first good copy is one repetition; K=2 improves delivery under burst loss.
 
 ## 5. Transport messages
 
 | MSG_TYPE | Name | Payload |
 |----------|------|---------|
-| 0x0 | NoteOn | `note` (0–127), `velocity` (0–127) |
-| 0x1 | NoteOff | `note` (0–127) |
-| 0x2 | ProgramChange | `program` (0–127) |
-| 0x3 | MscLite | `cmd` (0=GO,1=STOP,2=RESUME,3=LOAD), `cuelist` (0–15), `cue` (0–127) |
+| 0x0 | Midi | One MIDI 1.0 short message: `status`, `data1`, `data2` (§5.1) |
+| 0x3 | Msc | MIDI Show Control command, compact form (§5.4) |
 | 0x4 | Heartbeat | empty |
 | 0x5 | Panic | empty |
 
-Velocity and program use full 7-bit resolution (unlike the legacy prototype phy's 4-bit quantization).
+### 5.1 Midi payload and validation
 
-### 5.1 MIDI mapping
+The payload is the MIDI message itself, without running status, with unused bytes zero:
 
-| Message | MIDI bytes |
-|---------|------------|
-| NoteOn | `0x90, note, velocity` (velocity 0 treated as NoteOff) |
-| NoteOff | `0x80, note, 0x40` |
-| ProgramChange | `0xC0, program` |
-| Panic / link-dead | Fail-safe burst, two messages in order: Sustain off `0xB0, 0x40, 0x00`, then All Notes Off `0xB0, 0x7B, 0x00` |
-| MscLite | Application-defined in POC (logged / evented; not SysEx) |
+| Status | Message | Data bytes |
+|--------|---------|------------|
+| `0x8n` | Note Off (with release velocity) | note, velocity |
+| `0x9n` | Note On, velocity 1–127 | note, velocity |
+| `0xAn` | Polyphonic key pressure | note, pressure |
+| `0xBn` | Control Change, incl. channel mode messages (controllers 120–127) | controller, value |
+| `0xCn` | Program Change | program, `0` |
+| `0xDn` | Channel pressure | pressure, `0` |
+| `0xEn` | Pitch Bend | LSB, MSB |
+| `0xF2` | Song Position Pointer | LSB, MSB |
+| `0xF3` | Song Select | song, `0` |
+| `0xF6` | Tune Request | `0`, `0` |
 
-### 5.2 Fail-safe
+`n` is the MIDI channel (0–15 = channels 1–16); all 16 channels are carried. A payload is
+**canonical** if its status byte is in the table, its data bytes are `< 0x80`, its unused bytes are
+`0`, and it is not a Note On with velocity 0. A transmitter MUST send canonical payloads only: a Note
+On with velocity 0 is sent as Note Off with velocity 64 (`0x40`). A receiver MUST reject a packet
+whose payload is not canonical (§4.1).
+
+Not carried, by design: System Exclusive other than MSC (§5.4), MIDI Time Code quarter frames,
+and all System Real-Time messages (Timing Clock, Start, Continue, Stop, Active Sensing, Reset).
+Their value depends on timing: a clock or timecode stream needs a steady rate with sub-millisecond
+jitter, and a packet takes 22–270 ms of airtime depending on the profile, so these streams would
+both arrive useless and delay every other message. A transmitter drops them at its MIDI input.
+
+### 5.2 MIDI mapping
+
+The receiver outputs each Midi payload as the MIDI message it holds (2 or 3 bytes per the table in
+§5.1; `0xF6` alone), on its channel. Msc is output as an MSC SysEx (§5.4); Heartbeat has no MIDI
+output; Panic outputs the fail-safe burst (§5.3).
+
+### 5.3 Fail-safe
 
 - Decoder marks link **dead** if no CRC-valid packet for **`link_dead_ms`** (default **2000 ms**)
   after the first valid packet. This **sample-clock** link-dead detector is timed in received
@@ -182,18 +212,80 @@ Velocity and program use full 7-bit resolution (unlike the legacy prototype phy'
 - **Wall-clock input watchdog** (engine RX, distinct from sample-clock link-dead): if the capture
   device delivers no audio samples for **`link_dead_ms`** while the link has been alive (at least
   one valid packet received and sample-clock link-dead not yet fired), the worker emits the
-  fail-safe burst (§5.1) exactly once (when the modem still considers the link alive), raises an
+  fail-safe burst exactly once (when the modem still considers the link alive), raises an
   **audio-input-stalled** alarm, and disarms sample-clock link-dead for that outage. When samples
   resume, the stall alarm clears; link state stays **Dead** until the next valid packet, as usual.
   Sample-clock link-dead is unchanged when samples keep arriving but packets do not.
-- On link-dead (either detector), or on Panic: emit the fail-safe burst (§5.1) exactly once. The
+- On link-dead (either detector), or on Panic: emit the **fail-safe burst** exactly once. The
   demodulator is already back in search after each packet / during silence; its buffer is not
   flushed. Link-dead also clears the dedup history (§4.4). A Panic is a valid packet, so a link
   that goes silent after it later produces its own link-dead burst.
 - Bad-CRC / incomplete frames are discarded; return to search
-- Idle **Heartbeat** timing and keepalive airtime are defined by the TX scheduler (§5.3).
+- Idle **Heartbeat** timing and keepalive airtime are defined by the TX scheduler (§5.5).
 
-### 5.3 TX scheduler
+**Fail-safe burst.** For each MIDI channel 1–16 in order: Sustain off (`0xBn 0x40 0x00`), then
+All Notes Off (`0xBn 0x7B 0x00`), then — only on channels whose last Pitch Bend output by this
+receiver was not center and not followed by Reset All Controllers — Pitch Bend center
+(`0xEn 0x00 0x40`). That is 32–48 short messages (~31–46 ms on a 31.25 kbit/s MIDI cable).
+
+- *All 16 channels*, not only channels seen since start: the receiver may have restarted while
+  notes were sounding, and a stateless burst cannot miss a channel. It is the usual "MIDI panic"
+  convention and harmless on channels without notes.
+- *Sustain off first*, because All Notes Off does not release notes held by the pedal.
+- *Pitch Bend center* only where this receiver left a bend: a pitch wheel springs back to center, so
+  a lost "back to center" would detune every later note; other controllers have no rest position
+  and are left alone.
+- *Not sent:* Reset All Controllers (CC121; it also resets expression, modulation and pressure
+  that a show may rely on, and its exact effect varies between devices), All Sound Off (CC120;
+  it cuts release tails), and Note Offs per note.
+
+### 5.4 MIDI Show Control
+
+MSC 1.0 messages are SysEx: `F0 7F <device_id> 02 <command_format> <command> <data> F7`, where cue
+numbers, lists and paths are ASCII digits with an optional `.` (`"14.5"` = `31 34 2E 35`), separated
+by `00` (`<cue> 00 <list> 00 <path>`).
+
+AML carries the **command and its data only**. The device ID and command format are **receiver
+settings** (default device ID **`0x7F`** all-call, so every MSC device responds; default command format
+**`0x01`** Lighting (General), the format lighting consoles listen for). A transmitter accepts MSC from
+any device ID and in any command format.
+
+**Compact form** (payload bytes `b0 b1 b2`, big-endian 24 bits):
+
+```
+bits 23..19  command   MSC command byte (supported commands only, table below)
+bits 18..15  list      0 = no cue list; 1–15 = cue list 1–15
+bits 14..0   value     cue commands: 0 = no cue; v = 1–10000 → cue (v − 1) / 10  (0.0–999.9)
+                       FIRE: macro number 0–127
+                       other commands: 0
+```
+
+| Command (byte) | Data | Compact |
+|---|---|---|
+| GO (01), STOP (02), RESUME (03), GO_OFF (0B), GO/JAM_CLOCK (10) | `[cue [00 list]]` | cue optional; list only with a cue |
+| LOAD (05) | `cue [00 list]` | cue required; list optional |
+| FIRE (07) | macro number | value = macro, list 0 |
+| ALL_OFF (08), RESTORE (09), RESET (0A) | none | list 0, value 0 |
+| STANDBY_+ (11), STANDBY_- (12), SEQUENCE_+ (13), SEQUENCE_- (14), START_CLOCK (15), STOP_CLOCK (16), ZERO_CLOCK (17), MTC_CHASE_ON (19), MTC_CHASE_OFF (1A) | `[list]` | list optional, value 0 |
+| OPEN_CUE_LIST (1B), CLOSE_CUE_LIST (1C) | `list` | list required, value 0 |
+
+A compact payload is **canonical** only as in this table (a receiver rejects anything else, §4.1).
+
+**Numbers.** Cue and list numbers are carried as numbers: `"05"`, `"5.0"`, `"5."` and `"5"` are the
+same cue and are output as `"5"`; `"12.50"` is output as `"12.5"`. Cues 0–999.9 with at most one
+decimal (after dropping trailing zeros) and lists 1–15 are carried.
+
+**Not carried** (the transmitter drops the message and reports it, e.g. "MSC cue 12.345 not
+representable"; it never sends an approximation): cues with more than one decimal or above 999.9,
+lists 0 or above 15, lists with decimals, cue paths, TIMED_GO, SET, SET_CLOCK, OPEN_CUE_PATH,
+CLOSE_CUE_PATH, and malformed MSC. Other SysEx is ignored silently (§5.1).
+
+**Output.** The receiver outputs `F0 7F <device_id> 02 <command_format> <command> <data> F7` with its
+configured device ID and command format; `<data>` is the cue in ASCII without trailing zeros (`14`,
+`14.5`, `0.5`), then `00` and the list in ASCII if there is one; the list alone for list commands;
+the macro byte for FIRE; nothing otherwise.
+
+### 5.5 TX scheduler
 
 The encoder schedules transport messages before modem encoding. **Heartbeat** is generated by the
 scheduler when due; it is not queued with user traffic.
@@ -202,40 +294,70 @@ scheduler when due; it is not queued with user traffic.
 
 | Order | Messages |
 |-------|----------|
-| 1 | Panic |
-| 2 | NoteOff (user queue) |
-| 3 | NoteOn, ProgramChange, MscLite |
+| 1 | Panic; channel-mode messages that end notes: CC 120 (All Sound Off), 123 (All Notes Off), 124–127 (Omni Off/On, Mono, Poly) |
+| 2 | Note Off (any channel) and MSC, in arrival order |
+| 3 | Everything else: Note On, Program Change, Control Change, Pitch Bend, pressure, system common |
 | 4 | NoteOff refresh (idle keepalive; see below) |
 | 5 | Heartbeat |
 
-**Heartbeat:** every **500 ms** only when fully idle: no Panic, NoteOff, or normal message queued,
-no NoteOff parked behind a queued NoteOn, and the NoteOff refresh list is empty. While user
-messages or refreshes are pending, Heartbeat uses no airtime.
+Messages of order 1 and order 2 are never coalesced or dropped.
 
-**NoteOff refresh:** after a user NoteOff is transmitted, its note is repeated up to **6** times
-within **10 s** (max **32** most recent releases). When nothing higher in the table is pending, each
-free packet sends a **NoteOff** for one refresh entry instead of waiting for Heartbeat: the note with
-the **fewest** refresh transmissions so far, then the **oldest** original release. A **NoteOn** for
-that note removes it from the refresh list. Refresh never runs ahead of a **NoteOn** already in the
-normal queue. Each release therefore costs a bounded burst of airtime (6 messages: about 0.3 s on
-Fast, 1.6 s on Robust) that a NoteOn arriving meanwhile may wait behind for up to one message.
+**Order within tier 3.** *Continuous* messages — Control Change except Bank Select (CC 0, 32), Data
+Entry (6, 38), Data Increment/Decrement (96, 97), NRPN/RPN select (98–101) and the channel mode
+messages (120–127); Pitch Bend; channel pressure; polyphonic key pressure — are latest-value-wins.
+All other tier-3 messages are *discrete* and keep their arrival order. The next tier-3 message is:
+the oldest discrete message, unless a continuous message **of its channel** was queued before it,
+in which case that continuous message goes first; with no discrete message queued, the oldest
+continuous message. A note therefore waits for at most the controller values of its own channel that
+were set before it (it is struck with them), never for those of other channels. System common
+messages have no channel and keep their place relative to everything.
 
-**Held NoteOff:** a NoteOff that arrives while a NoteOn for the same note is still queued is held
-with the latest such NoteOn and sent immediately after it, so the note is not released before it
-is struck. This also keeps off / on / off on a note that is already sounding (a trill or roll) in
-order.
+**Coalescing (latest value wins).** A continuous message replaces, in place, the newest queued
+continuous message with the same channel, kind and controller (or note, for polyphonic pressure),
+unless a discrete message of the same channel or a system common message is queued after it, or
+Note Offs are held behind it (below); then it is queued as a new message. So a controller value set
+before a Note On stays before it and the newer value follows it; Bank Select, RPN/NRPN and Data Entry
+are never merged or reordered, and stay in order with the Program Change after them. Program Change
+is never coalesced: each one can be a deliberate action (a scene or cue on the receiving device), and
+a skipped program can be audible. A fader streaming faster than the link carries thus costs one queued
+message, and its final value goes out within the message in flight plus one.
 
-**Panic** removes NoteOns that are still queued (they would otherwise sound after the Panic).
+**Held NoteOff.** A Note Off that arrives while a Note On for the same channel and note is still
+queued is held with the latest such Note On and sent immediately after it, so the note is not
+released before it is struck; this also keeps off / on / off on a note that is already sounding (a
+trill or roll) in order. Likewise a Note Off that arrives while a pedal controller of its channel —
+Sustain (CC 64), Sostenuto (66) or Hold 2 (69) — is queued is held behind the latest such pedal
+message: pedal down then key up must not become key up then pedal down (the note would stop instead
+of ringing). A pedal message with held Note Offs is not coalesced.
 
-**Queue bounds:** queued **NoteOn** airtime is capped at **250 ms** (one on-wire message period per
-queued NoteOn, plus one extra period for a NoteOff held with it). Before accepting another NoteOn,
-the oldest queued NoteOn is dropped until the budget fits, but at least **4** queued NoteOns are
-always kept, so a chord survives even when one message is longer than the budget (Robust). A
-NoteOff held with a dropped NoteOn is dropped too, unless the note is still sounding from an earlier
-strike. A NoteOff for a note already on the air, and **Panic**, are never dropped.
+**Panic and channel mode.** Panic removes queued Note Ons on every channel; a Panic-class channel
+mode message (order 1) removes queued Note Ons of its channel (they would otherwise sound after it).
+Reset All Controllers (CC 121) and Local Control (CC 122) are discrete tier-3 messages: moving them
+ahead of queued controller values would change the resulting state.
+
+**Heartbeat:** every **500 ms** only when fully idle: no message queued, no NoteOff held, and the
+NoteOff refresh list is empty. While user messages or refreshes are pending, Heartbeat uses no
+airtime.
+
+**NoteOff refresh:** after a user Note Off is transmitted, it is repeated (same channel, note and
+velocity) up to **6** times within **10 s** (max **32** most recent releases). When nothing higher in
+the table is pending, each free packet sends a **Note Off** for one refresh entry instead of waiting
+for Heartbeat: the note with the **fewest** refresh transmissions so far, then the **oldest**
+original release. A **Note On** for that channel and note removes it from the refresh list. Refresh
+never runs ahead of a queued message. Each release therefore costs a bounded burst of airtime (6
+messages: about 0.3 s on Fast, 1.6 s on Robust) that a Note On arriving meanwhile may wait behind for
+up to one message.
+
+**Queue bounds:** queued **Note On** airtime is capped at **250 ms** (one on-wire message period per
+queued Note On, plus one per Note Off held with it). Before accepting another Note On, the oldest
+queued Note On is dropped until the budget fits, but at least **4** queued Note Ons are always kept,
+so a chord survives even when one message is longer than the budget (Robust). A Note Off held with a
+dropped Note On is dropped too, unless the note is still sounding from an earlier strike. A Note Off
+for a note already on the air, MSC, and Panic-class messages are never dropped. Continuous messages
+are bounded by coalescing.
 
 **Audio output ring:** sized to about **two** on-wire messages. The next message is chosen and
-encoded only when buffered output has drained below **10 ms**, so a NoteOn that arrives while a
+encoded only when buffered output has drained below **10 ms**, so a Note On that arrives while a
 message is playing waits for that message only, not for one already encoded behind it.
 
 ## 6. Profiles
