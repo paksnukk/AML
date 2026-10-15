@@ -23,15 +23,17 @@ Cricket speaks **AML v1** (AudioMIDI Link), an open protocol for MIDI over audio
 ## How it works
 
 Each MIDI event becomes a small **packet**: a preamble, a header, a sequence number, the payload and a CRC16.
-The packet is sent as **16-tone FSK**: one pure tone at a time, and each tone carries 4 bits.
+The packet is sent as **16-tone FSK**: one pure tone at a time, and each tone carries 4 bits. By default the
+packet is protected by a Reed–Solomon code, so a few wrong or missing tones are repaired instead of
+losing the message (the LTC profiles send the same packets as a timecode-like square wave instead).
 
 - **Level doesn't matter.** Tones are detected by their purity (Goertzel power relative to the window's
   energy), not by their loudness. Anything from −30 dB to 0 dB relative to the transmit level decodes,
   so someone riding the fader doesn't break the link.
 - **Packets find their own start.** A preamble marks every packet. After a false start or a missed
   symbol, the decoder rewinds and locks on again without throwing away audio it has already received.
-- **Copies are counted once.** Repeated copies of a packet are dropped by sequence number within a short
-  time window.
+- **Copies are counted once.** With Robust repeat, every packet is sent twice; the second copy is dropped
+  by sequence number within a short time window.
 - **Nothing is left hanging.** A heartbeat keeps the link alive. If no valid packet arrives for 2 s, or the
   audio input stops delivering samples, the decoder sends **Sustain off + All Notes Off on all 16
   channels** once (and re-centers any pitch bend it left bent). Each released note's NoteOff is
@@ -66,39 +68,52 @@ The packet is sent as **16-tone FSK**: one pure tone at a time, and each tone ca
 - **Panic** (the GUI button): All Notes Off everywhere.
 
 **Not carried, on purpose:** other System Exclusive, MIDI Clock and the other real-time messages
-(Start/Stop/Continue, Active Sensing), and MIDI Time Code. A packet takes 20–270 ms of airtime
+(Start/Stop/Continue, Active Sensing), and MIDI Time Code. A packet takes 8–273 ms of airtime
 depending on the profile; clock and timecode need a steady stream with sub-millisecond timing, so they
 would arrive useless and would delay every note and cue behind them. Run timecode as LTC on its own
 audio channel instead. Large SysEx dumps would block the line for seconds.
 
 ## Profiles
 
-| | **Robust** (default) | **Fast** |
-|---|---|---|
-| Use it for | Cues and program changes over chains you don't fully trust | Playing notes over a clean, dedicated line (no EQ, compression or limiter) |
-| Symbol | 6 ms + 0.5 ms guard | 3 ms |
-| Tones | 16 × 100 Hz steps from 2.5 kHz | 16 × 200 Hz steps from 2.5 kHz |
-| Copies per message | 2 | 1 |
-| Comfortable rate | ~3–4 messages/s | ~10 messages/s |
-| Measured NoteOn latency\* | mean ~345 ms, p95 ~480 ms | mean ~80 ms, p95 ~115 ms |
+Both ends must use the same profile; it is not signalled on the wire. All profiles carry the same
+messages and are specified in [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md) §6.
 
-\* MIDI in → MIDI out through the engine, in-process (`cricket loopback`), while notes are being played *and
-released*. Real audio interfaces add their own buffering on top. Run the measurement yourself rather than
-trusting this table.
+| | **Robust** (default) | **Robust repeat** | **Fast** |
+|---|---|---|---|
+| Use it for | Cues and notes over a chain you don't fully trust | Lines with glitches or dropouts of ~50 ms or more | Playing notes over a clean, dedicated line (no EQ, compression or limiter) |
+| Symbol | 6 ms + 0.5 ms guard | 6 ms + 0.5 ms guard | 3 ms |
+| Tones | 16 × 100 Hz steps from 2.5 kHz | same | 16 × 200 Hz steps from 2.5 kHz |
+| Body | Reed–Solomon coded (repairs wrong or missing tones) | uncoded | uncoded |
+| Copies per message | 1 | 2 | 1 |
+| Airtime per message | 175.5 ms | 273 ms | 57 ms |
+| Comfortable rate | ~5 messages/s | ~3–4 messages/s | ~10–17 messages/s |
+| Measured NoteOn latency\* | mean ~265–270 ms, p95 ~340–350 ms | mean ~345–360 ms, p95 ~475–500 ms | mean ~80 ms, p95 ~115 ms |
 
-### Experimental profiles
+Robust finds a packet even when two of its four preamble tones are lost, and repairs up to 8 missing or
+4 wrong tones in the body. In the channel simulator it delivers as often as Robust repeat or more in
+every condition except dropouts of 50 ms and longer, where the second copy wins (60 ms dropouts: 92 %
+vs 72 % delivered). Robust repeat was the default before v1.1 (as `robust`); a profile name
+`robust_fec` from earlier builds now means Robust.
 
-More profiles are in the code for evaluation. They are **not part of AML v1**, so both ends must pick the
-same one, and they may change or go away. Select one with `--profile` (e.g. `cricket --profile ltc decode …`).
+### LTC profiles (dedicated lines)
+
+The LTC profiles send the same packets as a biphase-mark code, like SMPTE timecode, in a fraction of
+the airtime. Their wire format is in the spec (§6.5) with status **provisional**: complete and tested
+in software, but not yet proven on real show chains, so a later revision may change it.
 
 | Profile | What it is | Measured NoteOn latency\* | Needs |
 |---|---|---|---|
-| `ltc` | LTC-style biphase-mark code at 4800 bit/s (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter, no dropouts |
-| `ltc_fec` | `ltc` with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~26 ms | As `ltc`, but tolerates short dropouts and impulse noise |
-| `robust_fec` | Robust tones with a Reed–Solomon coded body sent once instead of twice, and whole-preamble detection. In the simulator it matches or beats Robust in every channel except dropouts of ≥ ~50 ms | mean ~265 ms (Robust: ~345 ms) | Same chains as Robust; Robust is safer if the path drops out for ≥ 50 ms |
+| `ltc_fec` | 4800 bit/s with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~26 ms, p95 ~30 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter |
+| `ltc` | 4800 bit/s, uncoded (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | As `ltc_fec`, and no dropouts or clicks |
 
-The details and measurements are in [docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md) and
-[docs/proposals/fec.md](docs/proposals/fec.md).
+An EQ boost inside the signal band breaks them (+12 dB at 3 kHz stops 4800 bit/s; 2400 bit/s survives
+it but not a 1 kHz high-pass), and 9600 bit/s needs more than ~6 kHz of bandwidth (digital lines only).
+The measurements behind all profiles are in [docs/proposals/fec.md](docs/proposals/fec.md) and
+[docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md).
+
+\* MIDI in → MIDI out through the engine, in-process (`cricket loopback`, 20–60 notes), while notes are
+being played *and released*. Real audio interfaces add their own buffering on top. Run the measurement
+yourself rather than trusting this table.
 
 ## Quick start
 
@@ -124,7 +139,7 @@ cargo run -p cricket_cli -- encode --simulate
 
 # How fast is it, really? (no hardware needed; default: fast,robust)
 cargo run --release -p cricket_cli -- loopback
-cargo run --release -p cricket_cli -- loopback --profiles robust,robust_fec,fast,ltc,ltc_fec --notes 40
+cargo run --release -p cricket_cli -- loopback --profiles robust,robust_repeat,fast,ltc,ltc_fec --notes 40
 ```
 
 The binary is called `cricket` (`cargo install --path cricket_cli`, or `target/release/cricket`).
@@ -142,13 +157,13 @@ npm run tauri dev
 
 The GUI has the encoder and decoder side by side. It shows live link stats (state, confidence, CRC pass
 rate, sync losses), the TX queue and its latency, alarms for missing or stalled devices, a big red
-**Panic** button, and a **Self-Test** that measures real loopback latency for both profiles.
+**Panic** button, and a **Self-Test** that measures real loopback latency for Fast and Robust.
 
 ## Project layout
 
 | Crate | What lives there |
 |---|---|
-| [`cricket_core`](cricket_core) | The modem: tone synthesis and detection, packets, CRC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy prototype phy. |
+| [`cricket_core`](cricket_core) | The modem: tone synthesis and detection, the LTC phy, packets, CRC, Reed–Solomon FEC, interleaving, TX scheduler, fail-safe. Pure Rust, `no_std` + `alloc` for microcontrollers; the default `std` feature adds WAV file I/O and the legacy prototype phy. |
 | [`cricket_engine`](cricket_engine) | The real-time part: audio/MIDI devices, encoder and decoder workers, events, loopback latency measurement. |
 | [`cricket_cli`](cricket_cli) | Command-line front end. |
 | [`cricket_gui`](cricket_gui) | Tauri 2 desktop app (TypeScript + Rust). |
@@ -169,7 +184,7 @@ every push.
 
 ## Docs
 
-- [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md): the AML v1 protocol and physical layer as implemented.
+- [`docs/aml-v1-spec.md`](docs/aml-v1-spec.md): the AML v1 protocol, all profiles and test vectors.
 - [`docs/v1.1-plan.md`](docs/v1.1-plan.md): what v1.1 set out to fix, and how.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed.
 
