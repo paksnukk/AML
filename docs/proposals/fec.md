@@ -2,6 +2,8 @@
 
 Status: **Phase 1, prototype + measurements.** Not part of AML v1. The `robust` and `fast` profiles are
 unchanged on the wire; the prototype is the opt-in profile `robust_fec` (`PhyConfig::robust_fec()`).
+Since the acquisition hardening (§10), `robust_fec` matches or beats `robust` in every measured channel
+except dropouts of ≥ ~50 ms, which are a single-copy body limit.
 
 ## 1. Problem
 
@@ -38,9 +40,10 @@ abandons a lock on the first body symbol that fails the detection gate.
 - **Whitening.** The 22 body nibbles are XORed with a fixed sequence (`fec::WHITENING`), so a body
   without FEC on the same phy does not line up with the packet checks (§9).
 - **RX changes (only with FEC):** a body symbol that fails the gate is kept as an erasure, up to 8 per
-  body (above that the attempt is abandoned and rewinds as today). One preamble symbol after the
-  first may also fail, because the coded body + CRC now verify the lock. Without this change, the
-  4-symbol preamble becomes the main loss mechanism at K = 1 (see §5).
+  body (above that the attempt is abandoned and rewinds as today). Preamble symbols may also fail,
+  because the coded body + CRC now verify the lock. Without this change, the 4-symbol preamble
+  becomes the main loss mechanism at K = 1 (see §5). In the first prototype that meant one symbol after
+  the first. `robust_fec` now uses joint preamble detection, which allows two misses anywhere (§10).
 
 Code: `cricket_core/src/link/rs16.rs` (codec, ~300 lines, `no_std` + `alloc`, no dependencies),
 `cricket_core/src/link/fec.rs` (`FecMode`, `FecCodec`), `PhyConfig::fec`, and erasure and
@@ -50,7 +53,7 @@ preamble-miss handling in `phy/demod.rs`. `ModemStats::fec_corrected` counts the
 
 | | AML v1 Robust | `robust_fec` |
 |---|---|---|
-| Preamble | `A 5 C 3` | unchanged (RX tolerates 1 miss after the first) |
+| Preamble | `A 5 C 3` | unchanged (RX: joint detection, tolerates 2 misses anywhere, §10) |
 | Packet bytes (HDR, SEQ, PAYLOAD, CRC-16) | — | unchanged |
 | Body | 16 nibbles, block-interleaved (depth 4) | 22 nibbles: 2 × RS(11,7), symbol-interleaved, XOR whitening |
 | Copies K | 2 | 1 |
@@ -72,6 +75,9 @@ preamble-miss handling in `phy/demod.rs`. `ModemStats::fec_corrected` counts the
   format is identical, only the body coding differs per profile.
 
 ## 4. Measurements
+
+*The FEC columns in this section and in §5 were measured with the first-prototype acquisition. §10.2 has the
+numbers with joint preamble detection.*
 
 Channel simulator (`cricket_core/tests/support`), one message per trial (¾ NoteOn, ¼ MscLite), random
 offset and seed, 400 trials per cell. Delivery % and mean time from message start to delivery.
@@ -140,8 +146,8 @@ messages and no stuck notes in either profile.
    NoteOn latency by ~25–30 %. It is at least as robust as today's K=2 against symbol errors and
    deep noise. It is slightly worse at the AWGN edge and for long dropouts.
 2. Keep K=2 + FEC as an option for latency-insensitive cue links.
-3. Before replacing Robust, harden the first preamble symbol: allow a softer gate on preamble[0]
-   when FEC is on, or detect the preamble by correlation. That is now the residual K=1 weakness.
+3. ~~Before replacing Robust, harden the first preamble symbol.~~ Done: joint preamble detection
+   (§10). The residual K=1 weakness is now dropouts longer than the body's erasure capacity (≳ 50 ms).
 4. Do not touch Fast yet. The same layer works there (`fast` + FEC: 72 ms vs 54 ms per message),
    but Fast exists for clean chains, where FEC buys little.
 
@@ -344,3 +350,161 @@ except `ltc2400_fec` with a 10 ms dropout (−0.7) and `robust_fec` at −4 dB (
 wins far beyond the code's radius, in a region where that profile is not usable anyway), and the
 whitening changes the bit patterns on air, which moves pattern-sensitive cells both ways (`ltc_fec`
 behind +12 dB of EQ at 3 kHz: +53; −12 dB: −0.9).
+
+## 10. Acquisition hardening
+
+With a single copy, a packet whose preamble is missed is lost, and FEC cannot help. Before this change
+`robust_fec` used the AML v1 acquisition: gate on `preamble[0]` alone (purity ≥ 0.25 **and** ≥ 3 dB over
+the runner-up tone), fine-align on that one tone, then confirm the rest in order (with one tolerated miss
+after the first). That rule caused most of the cells where `robust_fec` lost to `robust`. At 0 dB the
+first symbol often fails its 3 dB confidence gate: adjacent tones are 100 Hz apart and leak about
+−6 dB into each other's bins, so noise easily closes the gap. A 10 ms dropout on symbol 0 also costs the
+packet.
+
+### 10.1 Joint preamble detection (`Acquisition::Joint`, receiver only)
+
+`PhyConfig::acquisition` selects the receiver's preamble search. `robust_fec` now uses
+`Acquisition::Joint { misses: 2 }`. `robust` and `fast` keep `FirstSymbol`, which is exactly the
+AML v1 §3.2 behaviour. The wire format does not change: same preamble `A 5 C 3`, same timing.
+
+At each search hop (`symbol/4`) at position `t`:
+
+1. **Candidate (cheap).** One Goertzel plus the window energy for each preamble window
+   `t + i·period`, at that window's expected tone only. It is a candidate when at most `misses` windows
+   have expected-tone purity < `min_tone_purity`, and the purities sum to at least
+   `0.8 · N · min_tone_purity`. The loop stops at the first excess miss, so silence and noise usually
+   cost 3 single-tone passes per hop, against the 16-tone bank used before.
+2. **Fine alignment** maximizes the expected-tone power **summed over all N windows**, over
+   `[t − hop, t + symbol]`, using the same grid and refinement as today. A weak or muted symbol no
+   longer decides the symbol clock.
+3. **Accept** runs the full 16-tone bank on each aligned window. A symbol is good when it shows the
+   expected nibble, has purity ≥ the gate and confidence ≥ `0.5 · min_confidence_db`. The lock needs
+   at most `misses` (2) failed symbols, **anywhere** including the first. At most one of those may be
+   *contradicting*, meaning another tone wins it with ≥ half the gate purity. Noise or a dropout can
+   therefore take out two symbols, but a stream of unrelated tones still has to match three preamble
+   symbols in sequence.
+4. On a lock, the receiver goes straight to Body (no ConfirmPreamble). A failed body (erasure cap,
+   CRC/FEC reject) rewinds to `t + hop`, as before. Delivery time does not change: the decision needs
+   no samples beyond the first body symbol.
+
+`FirstSymbol` also gets an **exact** shortcut. The gate requires the `preamble[0]` tone to win with
+purity ≥ the gate, so the receiver first computes that single tone's purity, with bit-identical power and
+energy (`goertzel_power_energy`). It skips the 16-tone bank when that purity is below the gate.
+Measured results for `robust` and `fast` are identical to before in every cell (same seeds), and the
+search costs about 15× less CPU.
+
+### 10.2 Results
+
+`cargo test --release -p cricket_core --test fec acquisition_ab_table -- --ignored --nocapture`,
+`FEC_AB_TRIALS=1000`, same seeds for every column. "before" = `robust_fec@first` (the previous
+acquisition). The `robust@joint1` column is for information only; see §10.4. Delivery %:
+
+| channel | robust (K2) | robust_fec before | **robust_fec after** | fast | robust@joint1 |
+|---|---|---|---|---|---|
+| clean | 100 | 100 | **100** | 100 | 100 |
+| AWGN 2 dB | 100 | 99.4 | **100** | 99.3 | 100 |
+| AWGN 0 dB | 100 | 99.0 | **100** | 92.6 | 100 |
+| AWGN −2 dB | 97.7 | 92.1 | **100** | 5.5 | 99.9 |
+| AWGN −3 dB | 32.8 | 75.6 | **97.0** | 0 | 45.7 |
+| AWGN −4 dB | 0 | 17.3 | **39.6** | 0 | 0.1 |
+| wrong tone 1 % | 98.1 | 99.2 | **100** | 87.7 | 99.0 |
+| wrong tone 2 % | 90.9 | 97.6 | **99.6** | 73.6 | 94.8 |
+| wrong tone 5 % | 65.4 | 93.8 | **97.0** | 45.8 | 75.3 |
+| wrong tone 10 % | 31.4 | 72.1 | **79.3** | 21.4 | 42.6 |
+| dropout 10 ms | 100 | 95.7 | **99.8** | 81.3 | 100 |
+| dropout 30 ms | 95.7 | 96.1 | **97.2** | 81.5 | 97.8 |
+| dropout 60 ms | **90.1** | 70.7 | 72.2 | 80.0 | 91.9 |
+| gain −40 dB, SNR 0 | 99.9 | 99.0 | **100** | 92.0 | 100 |
+| LP 2.5 kHz, SNR 6 | 100 | 98.9 | **100** | 85.9 | 100 |
+| drift 500 ppm, SNR 0 | 100 | 97.8 | **100** | 91.8 | 100 |
+
+The §4 harness (`fec_ab_table`, 400 trials, the same seeds as the §4 table) gives the same picture for
+`fec p4 K1` = `robust_fec`. Before → after:
+0 dB 97.8 → 100, −2 dB 93.8 → 100, −3 dB 77.2 → 98.8, −4 dB 18.2 → 42.8;
+wrong tone 1/2/5/10 % 99.0/98.5/88.5/73.0 → 100/99.8/94.5/78.8;
+dropout 10/30/60 ms 95.8/96.2/70.2 → 99.8/98.5/71.8; gain −40 dB 97.5 → 100; LP 99.0 → 100; drift 98.8 → 100.
+These "after" figures include the false-accept measures of §9.
+(`fec_parity()` now also uses the joint acquisition, so the p2 and K2 columns there moved as well.)
+No cell in either table produced a false message.
+
+**Where the 60 ms dropout losses come from** (1000 trials). The split is by where the dropout starts:
+in the first copy's preamble, or in its body.
+
+| | robust | robust_fec before | robust_fec after |
+|---|---|---|---|
+| dropout 10 ms | 0 / 0 | 43 / 0 | 2 / 0 |
+| dropout 30 ms | 0 / 43 | 39 / 0 | 28 / 0 |
+| dropout 60 ms | 0 / 99 | 61 / 232 | 46 / 232 |
+
+The body losses at 60 ms are a hard limit of a single 22-symbol RS(11,7)×2 copy, not an
+acquisition problem. 60 ms is 9.2 symbol periods, so a dropout inside the body erases ≥ 9 symbols.
+The 14 data nibbles cannot be recovered from the ≤ 13 symbols left. Even a perfect acquisition would
+reach only ~77 %, against Robust's 90 %.
+
+**False triggers and CPU.** `false_trigger_report` measures phy locks that reach the body, per minute,
+on 60 s each of white noise, music-like audio and random MFSK symbols with no preamble (that is, other
+packets' bodies). It also times receiver CPU in host ns per input sample (best of 3, release build;
+"before" is the full 16-tone bank at every hop):
+
+| profile | locks/min noise / music / random tones | ns/sample noise | music | random tones | 200 packets @ 0 dB (delivered) |
+|---|---|---|---|---|---|
+| robust before | 0 / 0 / 0 | 224 | 217 | 249 | 68 (200/200) |
+| **robust after** | 0 / 0 / 0 | **14.3** | **14.6** | **64** | **53** (200/200) |
+| robust_fec before | 0 / 0 / 2 | 221 | 211 | 242 | 64 (194/200) |
+| **robust_fec after** | 0 / 0 / 13 | **44** | **39** | **156** | **60** (200/200) |
+| fast before | 0 / 0 / 225 | 204 | 198 | 256 | 69 (194/200) |
+| **fast after** | 0 / 0 / 225 | **14.6** | **15.9** | **70** | **53** (194/200) |
+
+No packet-free input produced a message. The existing false-alarm tests (noise, random tone streams
+with sprinkled preambles, `stuck_notes::no_false_messages`) pass. On random tone streams,
+`robust_fec` locks 13 times a minute instead of 2. Each lock is one rejected body decode, which counts
+toward the false-accept budget (§9). The worst-case CPU of every profile is now below the old
+common case (silence).
+
+**Engine latency** (`cricket loopback --profiles robust,robust_fec,fast --notes 60`): robust 360 ms
+mean / 503 ms p95; robust_fec 267 / 340 (with first-symbol acquisition: 266 / 344); fast 81 / 120. Acquisition
+does not move the delivery point.
+
+**Stuck-note run** (`tests/stuck_notes.rs`, back-to-back traffic, wrong tones). Messages lost,
+before → after for robust_fec: 0.5 % 6/918 → **0/918**, 1 % 10/1046 → **0/1046**, 2 % 26/1048 →
+**5/1048** (robust, unchanged: 2/788, 13/819, 47/752). No false messages, no stuck notes.
+
+### 10.3 Options measured and rejected
+
+- **Three tolerated misses** (`Joint { misses: 3 }`): one matching symbol is then enough to lock, and
+  music-like audio produced 1105 locks/min. Rejected.
+- **Contradiction rule.** The first version counted a failed symbol as contradicting only when another
+  tone won with the full 3 dB confidence. Windows straddling two symbols of an unrelated tone stream
+  then passed as "weak" misses: 122 locks/min on random tones. The purity-based rule (another tone
+  with ≥ half the gate purity) gives 13/min, with identical delivery in every cell. Its threshold
+  between 0.5× and 0.8× the gate purity made no difference.
+- **Candidate sum threshold.** At 0.8 × gate purity × N, CPU on random tones drops from 255 to ~170 ns/sample
+  (156 in the final build) at no delivery cost. At 1.0× AWGN −3/−4 dB fall to 94.8/27.0 %, and at 1.2× to 39.8/2.5 %.
+- **Longer preamble for robust_fec** (6 symbols `A 5 C 3 8 E`, +13 ms per message, harness name
+  `robust_fec+pre6`). With 2 misses: −3 dB 88.8 %, −4 dB 19.8 %, wrong tone 10 % 76.8 %, dropout 30 ms
+  94.0 %. With 3 misses: 97.4 / 36.4 / 76.8 / 96.3 %. Both are no better than 4 symbols with 2 misses
+  (97.0 / 38.5 / 80.4 / 97.2 % in the same run) and cost 13 ms. The only gain is 0 instead of 13 random-tone locks/min.
+  Rejected.
+- **Mid-body resync marker or postamble.** After joint detection, preamble-caused losses are 0.2 %
+  (10 ms), 2.8 % (30 ms) and 4.6 % (60 ms). At 30 ms robust_fec already beats robust. At 60 ms the
+  body limit above caps it at ~77 % whatever the sync does. A marker costs ≥ 1–2 symbols (6.5–13 ms,
+  +4–7 % airtime) for at most a few percent in one cell. Not worth it.
+
+### 10.4 Robust and Fast
+
+Both keep the AML v1 acquisition. Their decoding results are bit-for-bit unchanged; they gain only
+the exact CPU shortcut. Joint detection would also help Robust. With `Joint { misses: 1 }`
+(`robust@joint1` above): −3 dB 32.8 → 45.7 %, wrong tone 2/5/10 % 90.9/65.4/31.4 → 94.8/75.3/42.6 %,
+dropout 30/60 ms 95.7/90.1 → 97.8/91.9 %, with no cell worse. The costs are 10 locks/min on random tones
+and 29 ns/sample in search. That is a change to the receiver procedure in spec §3.2, so it is left to
+a spec decision. It is not useful for Fast: with a 2-symbol preamble, one tolerated miss means one
+matching tone locks, which gave 9700 locks/min on random tones.
+
+### 10.5 Verdict
+
+`robust_fec` now matches or beats `robust` in every measured cell except **long dropouts (60 ms:
+72 % vs 90 %)**. That gap is the single-copy body limit, not acquisition. At dropout 10 ms it is
+99.8 % vs 100 % (2 losses in 1000, within sampling noise). Everywhere else it is better, often by a
+wide margin: −3 dB 97 % vs 33 %, wrong tone 5 % 97 % vs 65 %. It does this with 36 % less airtime and
+~25 % lower loaded latency. If links with ≥ 50 ms dropouts matter, Robust (K = 2) or FEC with K = 2 is
+still the safer choice.

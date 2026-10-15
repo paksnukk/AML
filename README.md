@@ -66,7 +66,7 @@ same one, and they may change or go away. Select one with `--profile` (e.g. `cri
 |---|---|---|---|
 | `ltc` | LTC-style biphase-mark code at 4800 bit/s (also `ltc2400`, `ltc4800`, `ltc9600`) | mean ~22 ms | A dedicated line: ≥ 4 dB SNR, no EQ, compression or limiter, no dropouts |
 | `ltc_fec` | `ltc` with a Reed–Solomon coded body (also `ltc2400_fec`, `ltc9600_fec`); survives 1–3 ms dropouts and click bursts | mean ~26 ms | As `ltc`, but tolerates short dropouts and impulse noise |
-| `robust_fec` | Robust tones with a Reed–Solomon coded body sent once instead of twice | mean ~265 ms (Robust: ~345 ms) | Same chains as Robust |
+| `robust_fec` | Robust tones with a Reed–Solomon coded body sent once instead of twice, and whole-preamble detection. In the simulator it matches or beats Robust in every channel except dropouts of ≥ ~50 ms | mean ~265 ms (Robust: ~345 ms) | Same chains as Robust; Robust is safer if the path drops out for ≥ 50 ms |
 
 The details and measurements are in [docs/proposals/ltc-bmc.md](docs/proposals/ltc-bmc.md) and
 [docs/proposals/fec.md](docs/proposals/fec.md).
