@@ -310,8 +310,11 @@ fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
             ),
         );
         // Misconfiguration: uncoded MFSK transmitters (robust_repeat, fast).
-        let v1 = [PhyConfig::robust_repeat(), PhyConfig::fast()];
-        v.push(("MFSK v1 traffic", mfsk_traffic(seconds, 11, &v1)));
+        let uncoded_mfsk = [PhyConfig::robust_repeat(), PhyConfig::fast()];
+        v.push((
+            "uncoded MFSK traffic",
+            mfsk_traffic(seconds, 11, &uncoded_mfsk),
+        ));
     }
     v
 }
@@ -562,7 +565,7 @@ fn worst_case_audio_rarely_reaches_the_crc() {
         PhyConfig::fast(),
         PhyConfig::robust(),
     ];
-    let v1 = [PhyConfig::robust_repeat(), PhyConfig::fast()];
+    let uncoded_mfsk = [PhyConfig::robust_repeat(), PhyConfig::fast()];
     let cases = [
         (
             "MFSK traffic -> ltc2400_fec",
@@ -579,7 +582,7 @@ fn worst_case_audio_rarely_reaches_the_crc() {
         (
             "robust_repeat/fast -> robust",
             PhyConfig::robust(),
-            mfsk_traffic(6.0, 23, &v1),
+            mfsk_traffic(6.0, 23, &uncoded_mfsk),
             0.15,
         ),
     ];
