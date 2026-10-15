@@ -1,0 +1,660 @@
+//! False-accept analysis for the FEC profiles (`ltc_fec`, `ltc2400_fec`,
+//! `ltc9600_fec`, `robust_fec`): how often non-Cricket audio turns into a
+//! message. See `docs/proposals/fec.md` §9 for the analysis and target.
+//!
+//! A false message needs (1) a false lock whose body survives the phy gates
+//! ("false body"), (2) a pair of RS codeword decodings ("candidate", the
+//! pre-CRC event: both RS decoders report success), and (3) a candidate that
+//! passes every packet check. The report measures (1) and (2) directly and
+//! the structural checks (version, type, pad, payload) per candidate; the
+//! CRC-16 factor (2^-16) is then applied analytically, so a false-message
+//! rate of one per decades can be estimated from minutes of audio.
+//!
+//! ```sh
+//! cargo test --release -p cricket_core --test fec_false_accept -- --ignored --nocapture
+//! ```
+//!
+//! Environment: `FALSE_SECONDS` (audio per signal, default 120),
+//! `FALSE_PROFILES` (comma-separated: ltc_fec, ltc2400_fec, ltc9600_fec,
+//! robust_fec), `FALSE_RANDOM_BODIES` (simulated random bodies per row,
+//! default 200000). Results are recorded in `docs/proposals/fec.md` §9.
+
+mod support;
+
+use cricket_core::link::{crc16_ccitt, nibbles_to_bytes, BodySymbol, FecCodec, PROTOCOL_VERSION};
+use cricket_core::modem::{encode_to_samples, CricketModemTx};
+use cricket_core::phy::{PhyConfig, PhyRx, RxEvent};
+use cricket_core::transport::{MessageType, MscCommand, TransportMessage};
+use std::f32::consts::PI;
+use support::{ChannelSim, XorShift64};
+
+const RATE: usize = 48_000;
+/// CRC-16 pass probability for a random candidate.
+const CRC_FACTOR: f64 = 1.0 / 65_536.0;
+
+// ---------------------------------------------------------------------------
+// Signals (48 kHz mono)
+
+fn white(seconds: f32, sigma: f64, seed: u64) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    (0..(seconds * RATE as f32) as usize)
+        .map(|_| (rng.gaussian() * sigma) as f32)
+        .collect()
+}
+
+/// Back-to-back MFSK NoteOns of `profiles` (equal shares) at SNR 20 dB.
+fn mfsk_traffic(seconds: f32, seed: u64, profiles: &[PhyConfig]) -> Vec<f32> {
+    let n = (seconds * RATE as f32) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while out.len() < n {
+        let m = &profiles[(out.len() * profiles.len() / n.max(1)).min(profiles.len() - 1)];
+        let mut tx = CricketModemTx::new(m.clone());
+        let mut block = Vec::new();
+        while block.len() < RATE {
+            block.extend(tx.encode_message(&TransportMessage::NoteOn {
+                note: (i % 128) as u8,
+                velocity: 1 + (i * 7 % 127) as u8,
+            }));
+            i += 1;
+        }
+        out.extend(
+            ChannelSim::new(m.clone(), seed ^ i as u64)
+                .snr_db(20.0)
+                .apply(&block),
+        );
+    }
+    out.truncate(n);
+    out
+}
+
+/// Back-to-back BMC traffic of `config` (for the MFSK receiver), SNR 20 dB.
+fn bmc_traffic(config: &PhyConfig, seconds: f32, seed: u64) -> Vec<f32> {
+    let n = (seconds * RATE as f32) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while out.len() < n {
+        let msgs: Vec<_> = (0..50)
+            .map(|k| TransportMessage::NoteOn {
+                note: ((i + k) % 128) as u8,
+                velocity: 1 + ((i + k) * 7 % 127) as u8,
+            })
+            .collect();
+        i += 50;
+        let block = encode_to_samples(config.clone(), &msgs);
+        out.extend(
+            ChannelSim::new(config.clone(), seed ^ i as u64)
+                .snr_db(20.0)
+                .apply(&block),
+        );
+    }
+    out.truncate(n);
+    out
+}
+
+/// Clicks (1–4 sample spikes, random sign and level) on a quiet noise floor.
+fn clicks(seconds: f32, per_second: f64, seed: u64) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    let n = (seconds * RATE as f32) as usize;
+    let mut out: Vec<f32> = (0..n).map(|_| (rng.gaussian() * 0.001) as f32).collect();
+    let p = per_second / RATE as f64;
+    let mut i = 0;
+    while i < n {
+        if rng.next_f64() < p {
+            let amp =
+                (0.1 + 0.8 * rng.next_f64()) as f32 * if rng.below(2) == 0 { 1.0 } else { -1.0 };
+            let width = 1 + rng.below(4);
+            for s in out.iter_mut().skip(i).take(width) {
+                *s += amp;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Pink-ish noise (Paul Kellet's economy filter) with unit-ish RMS.
+struct Pink {
+    b: [f32; 3],
+}
+
+impl Pink {
+    fn next(&mut self, white: f32) -> f32 {
+        self.b[0] = 0.99765 * self.b[0] + white * 0.0990460;
+        self.b[1] = 0.96300 * self.b[1] + white * 0.2965164;
+        self.b[2] = 0.57000 * self.b[2] + white * 1.0526913;
+        (self.b[0] + self.b[1] + self.b[2] + white * 0.1848) * 0.25
+    }
+}
+
+/// Music-like: 1–3 voices of harmonic tones (random notes, ADSR envelopes,
+/// some square-ish timbres), drum-like noise hits and a pink-noise bed.
+fn music(seconds: f32, seed: u64) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    let n = (seconds * RATE as f32) as usize;
+    let mut out = vec![0f32; n];
+    for voice in 0..3 {
+        let mut t = rng.below(RATE / 4);
+        while t < n {
+            let dur = RATE / 10 + rng.below(RATE / 2);
+            let note = 36 + rng.below(60) as i32 + voice * 5;
+            let f0 = 440.0 * 2f32.powf((note - 69) as f32 / 12.0);
+            let square = rng.below(3) == 0;
+            let harmonics = 1 + rng.below(12);
+            let level = 0.05 + 0.15 * rng.next_f64() as f32;
+            for (k, s) in out.iter_mut().skip(t).take(dur).enumerate() {
+                let env = (k as f32 / 480.0).min(1.0) * (-(k as f32) / dur as f32 * 2.0).exp();
+                let ph = 2.0 * PI * f0 * k as f32 / RATE as f32;
+                let mut v = 0.0;
+                for h in 1..=harmonics {
+                    if square && h % 2 == 0 {
+                        continue;
+                    }
+                    v += (ph * h as f32).sin() / h as f32;
+                }
+                *s += level * env * v;
+            }
+            t += dur + rng.below(RATE / 8);
+        }
+    }
+    // Drum hits and a pink bed.
+    let mut pink = Pink { b: [0.0; 3] };
+    let mut hit = 0usize;
+    let mut hit_level = 0.0f32;
+    for (i, s) in out.iter_mut().enumerate() {
+        if i >= hit {
+            hit = i + RATE / 8 + rng.below(RATE / 2);
+            hit_level = 0.1 + 0.3 * rng.next_f64() as f32;
+        }
+        let w = rng.gaussian() as f32;
+        let since = (i + RATE / 2).saturating_sub(hit) as f32;
+        let drum = hit_level * (-since / 2400.0).exp() * w;
+        *s += 0.02 * pink.next(w) + drum * (since < 9600.0) as u8 as f32;
+    }
+    out
+}
+
+/// Speech-like: a pitch-varying glottal pulse train through three formant
+/// resonators, syllabic envelope with pauses, and fricative noise bursts.
+fn speech(seconds: f32, seed: u64) -> Vec<f32> {
+    let mut rng = XorShift64::new(seed);
+    let n = (seconds * RATE as f32) as usize;
+    let mut out = vec![0f32; n];
+    let mut t = 0usize;
+    let mut phase = 0.0f32;
+    while t < n {
+        let syll = RATE / 8 + rng.below(RATE / 4);
+        let voiced = rng.below(4) != 0;
+        let formants = [
+            300.0 + 500.0 * rng.next_f64() as f32,
+            900.0 + 1400.0 * rng.next_f64() as f32,
+            2300.0 + 900.0 * rng.next_f64() as f32,
+        ];
+        let mut res: Vec<support::Biquad> = formants
+            .iter()
+            .map(|&f| support::Biquad::peaking(f, 18.0, 6.0, RATE as u32))
+            .collect();
+        let f0 = 90.0 + 140.0 * rng.next_f64() as f32;
+        let mut seg = vec![0f32; syll.min(n - t)];
+        for (k, s) in seg.iter_mut().enumerate() {
+            let x = if voiced {
+                let f = f0 * (1.0 + 0.1 * (k as f32 / syll as f32 - 0.5));
+                phase += f / RATE as f32;
+                if phase >= 1.0 {
+                    phase -= 1.0;
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.3 * rng.gaussian() as f32
+            };
+            let env = (PI * k as f32 / syll as f32).sin();
+            *s = 0.3 * env * x;
+        }
+        for r in &mut res {
+            r.run(&mut seg);
+        }
+        out[t..t + seg.len()].copy_from_slice(&seg);
+        t += syll + if rng.below(3) == 0 { RATE / 5 } else { 0 };
+    }
+    out
+}
+
+/// SMPTE/EBU LTC timecode (80-bit frames, biphase mark) at `fps`.
+fn smpte_ltc(seconds: f32, fps: u32) -> Vec<f32> {
+    let bit_samples = RATE as f32 / (80.0 * fps as f32);
+    let n = (seconds * RATE as f32) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut level = 0.5f32;
+    let mut pos = 0.0f32;
+    let mut frame = 0u32;
+    let mut lp = 0.0f32;
+    while out.len() < n {
+        let f = frame % fps;
+        let s = (frame / fps) % 60;
+        let m = (frame / fps / 60) % 60;
+        let mut bits = [0u8; 80];
+        let mut put = |at: usize, width: usize, v: u32| {
+            for b in 0..width {
+                bits[at + b] = ((v >> b) & 1) as u8;
+            }
+        };
+        put(0, 4, f % 10);
+        put(8, 2, f / 10);
+        put(16, 4, s % 10);
+        put(24, 3, s / 10);
+        put(32, 4, m % 10);
+        put(40, 3, m / 10);
+        put(4, 4, frame.wrapping_mul(2_654_435_761) >> 28);
+        put(64, 16, 0xBFFC); // sync word 0011 1111 1111 1101, LSB first
+        for &bit in &bits {
+            for half in 0..2 {
+                if half == 0 || bit == 1 {
+                    level = -level;
+                }
+                pos += bit_samples / 2.0;
+                while (out.len() as f32) < pos {
+                    // ~25 µs rise time.
+                    lp += 0.6 * (level - lp);
+                    out.push(lp);
+                }
+            }
+        }
+        frame += 1;
+    }
+    out.truncate(n);
+    out
+}
+
+fn signals(config: &PhyConfig, seconds: f32) -> Vec<(&'static str, Vec<f32>)> {
+    let bmc = matches!(config.modulation, cricket_core::phy::Modulation::Bmc(_));
+    let third = seconds / 3.0;
+    let mut noise = white(third, 0.003, 1);
+    noise.extend(white(third, 0.05, 2));
+    noise.extend(white(third, 0.5, 3));
+    let mut click = clicks(seconds / 2.0, 100.0, 4);
+    click.extend(clicks(seconds / 2.0, 1000.0, 5));
+    let mut ltc = smpte_ltc(seconds / 2.0, 30);
+    ltc.extend(smpte_ltc(seconds / 2.0, 25));
+    let mut v = vec![
+        ("white noise", noise),
+        ("clicks", click),
+        ("music", music(seconds, 6)),
+        ("speech", speech(seconds, 7)),
+        ("SMPTE LTC", ltc),
+    ];
+    if bmc {
+        let mfsk = [
+            PhyConfig::robust(),
+            PhyConfig::fast(),
+            PhyConfig::robust_fec(),
+        ];
+        v.insert(0, ("MFSK traffic", mfsk_traffic(seconds, 8, &mfsk)));
+        // Misconfiguration: an uncoded LTC transmitter at the same bit rate.
+        let uncoded = PhyConfig {
+            fec: cricket_core::link::FecMode::None,
+            ..config.clone()
+        };
+        v.push(("uncoded LTC traffic", bmc_traffic(&uncoded, seconds, 10)));
+    } else {
+        v.insert(
+            0,
+            (
+                "BMC traffic",
+                bmc_traffic(&PhyConfig::ltc_fec(), seconds, 9),
+            ),
+        );
+        // Misconfiguration: uncoded AML v1 transmitters (robust, fast).
+        let v1 = [PhyConfig::robust(), PhyConfig::fast()];
+        v.push(("MFSK v1 traffic", mfsk_traffic(seconds, 11, &v1)));
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
+// Candidate checks (mirroring `CricketModemRx`)
+
+/// Packet checks a candidate data block passes, cheapest first.
+#[derive(Debug, Default, Clone, Copy)]
+struct Checks {
+    /// Version nibble and type nibble valid.
+    header: bool,
+    /// ... and the bytes after the packet are zero.
+    pad: bool,
+    /// ... and the payload is canonical (MIDI data < 0x80, MSC fields valid).
+    payload: bool,
+    /// CRC-16 matches.
+    crc: bool,
+}
+
+fn checks(nibbles: &[u8]) -> Checks {
+    let bytes = nibbles_to_bytes(nibbles);
+    let mut c = Checks::default();
+    let Some(t) = MessageType::from_u8(bytes[0] & 0x0F) else {
+        return c;
+    };
+    if bytes[0] >> 4 != PROTOCOL_VERSION {
+        return c;
+    }
+    c.header = true;
+    let needed = 2 + t.payload_len() + 2;
+    c.pad = bytes[needed..].iter().all(|&b| b == 0);
+    let p = &bytes[2..2 + t.payload_len()];
+    c.payload = c.pad
+        && match t {
+            MessageType::NoteOn | MessageType::NoteOff | MessageType::ProgramChange => {
+                p.iter().all(|&b| b < 0x80)
+            }
+            MessageType::MscLite => MscCommand::from_u8(p[0]).is_some() && p[1] < 16 && p[2] < 0x80,
+            MessageType::Heartbeat | MessageType::Panic => true,
+        };
+    let crc = crc16_ccitt(&bytes[..needed - 2]);
+    c.crc = bytes[needed - 2] == (crc >> 8) as u8 && bytes[needed - 1] == crc as u8;
+    c
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct FalseStats {
+    seconds: f64,
+    /// Bodies handed to the FEC decoder (passed every phy gate).
+    bodies: u64,
+    /// Candidate packets (pairs of successful RS decodes) checked.
+    candidates: u64,
+    header_pass: u64,
+    /// Structurally valid apart from the CRC (lenient payload: v1 masking).
+    struct_lenient: u64,
+    /// ... with canonical payloads.
+    struct_strict: u64,
+    /// Bodies the decoder actually accepted (false messages).
+    false_msgs: u64,
+}
+
+impl FalseStats {
+    fn per_min(&self, x: u64) -> f64 {
+        x as f64 * 60.0 / self.seconds
+    }
+
+    /// Expected years of this audio per false message, conservatively: the
+    /// larger of the observed structural passes and `analytic` (structural
+    /// pass probability of a uniformly random candidate) times the
+    /// candidates, times the CRC-16 factor.
+    fn years_per_false(&self, structural: u64, analytic: f64) -> f64 {
+        let per_sec =
+            (structural as f64).max(self.candidates as f64 * analytic) / self.seconds * CRC_FACTOR;
+        1.0 / per_sec / (3600.0 * 8766.0)
+    }
+}
+
+/// The modem's receive flow (`CricketModemRx`) with the candidate checks
+/// counted. A decoded body is a false message (the audio holds no packet
+/// for this profile).
+fn run_false(config: &PhyConfig, audio: &[f32]) -> FalseStats {
+    let mut phy = PhyRx::new(config.clone());
+    let body_len = config.fec.body_nibbles();
+    phy.set_expected_body_nibbles(body_len);
+    let fec = FecCodec::new(config.fec).expect("FEC profile");
+    let mut st = FalseStats {
+        seconds: audio.len() as f64 / config.sample_rate_hz as f64,
+        ..FalseStats::default()
+    };
+    let mut body: Vec<BodySymbol> = Vec::new();
+    let mut collecting = false;
+    for chunk in audio.chunks(512) {
+        let mut events: std::collections::VecDeque<RxEvent> = phy.push_samples(chunk).into();
+        while let Some(ev) = events.pop_front() {
+            match ev {
+                RxEvent::PreambleLocked { .. } => {
+                    collecting = true;
+                    body.clear();
+                }
+                RxEvent::BodyNibble { result, .. } if collecting => {
+                    body.push(BodySymbol {
+                        nibble: result.nibble,
+                        reliability: result.confidence_db,
+                        erased: result.erased,
+                    });
+                    if body.len() < body_len {
+                        continue;
+                    }
+                    collecting = false;
+                    st.bodies += 1;
+                    let decoded = fec.decode_body(&body, |nibbles| {
+                        st.candidates += 1;
+                        let c = checks(nibbles);
+                        st.header_pass += c.header as u64;
+                        st.struct_lenient += c.pad as u64;
+                        st.struct_strict += c.payload as u64;
+                        cricket_core::link::fec_candidate_is_valid(nibbles)
+                    });
+                    let more = if decoded.is_some() {
+                        st.false_msgs += 1;
+                        phy.confirm()
+                    } else {
+                        phy.reject()
+                    };
+                    events.extend(more);
+                }
+                RxEvent::SyncLost => collecting = false,
+                _ => {}
+            }
+        }
+    }
+    st
+}
+
+/// Probability that a uniformly random 14-nibble data block passes the
+/// structural checks: (lenient, strict). Version 1/16, type 6/16, then
+/// per type 2^-(pad bits + payload constraint bits).
+fn analytic_struct() -> (f64, f64) {
+    let p = |bits: i32| 2f64.powi(-bits);
+    // (pad bits, canonical-payload bits) per type: NoteOn, NoteOff, PC,
+    // MscLite, Heartbeat, Panic.
+    let types = [(8, 2), (16, 1), (16, 1), (0, 11), (24, 0), (24, 0)];
+    let lenient: f64 = types.iter().map(|&(pad, _)| p(pad)).sum();
+    let strict: f64 = types.iter().map(|&(pad, pl)| p(pad + pl)).sum();
+    (lenient / 256.0, strict / 256.0)
+}
+
+fn env_list(name: &str, default: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_else(|_| default.into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Uniformly random bodies (random nibbles and reliabilities, no erasures or
+/// `erasures` gate erasures): the analytic model, simulated.
+fn random_bodies(config: &PhyConfig, bodies: usize, erasures: usize, seed: u64) -> FalseStats {
+    let fec = FecCodec::new(config.fec).expect("FEC profile");
+    let mut rng = XorShift64::new(seed);
+    let mut st = FalseStats {
+        seconds: 60.0,
+        bodies: bodies as u64,
+        ..FalseStats::default()
+    };
+    for _ in 0..bodies {
+        let mut body: Vec<BodySymbol> = (0..config.fec.body_nibbles())
+            .map(|_| BodySymbol {
+                nibble: rng.below(16) as u8,
+                reliability: (rng.next_f64() * 20.0) as f32,
+                erased: false,
+            })
+            .collect();
+        let mut erased = 0;
+        while erased < erasures {
+            let i = rng.below(body.len());
+            if !body[i].erased {
+                body[i].erased = true;
+                body[i].reliability = 0.0;
+                erased += 1;
+            }
+        }
+        fec.decode_body(&body, |nibbles| {
+            st.candidates += 1;
+            let c = checks(nibbles);
+            st.header_pass += c.header as u64;
+            st.struct_lenient += c.pad as u64;
+            st.struct_strict += c.payload as u64;
+            cricket_core::link::fec_candidate_is_valid(nibbles)
+        })
+        .is_some()
+        .then(|| st.false_msgs += 1);
+    }
+    st
+}
+
+// ---------------------------------------------------------------------------
+// Fast guards (the full measurement is `false_accept_report` below)
+
+/// Uniformly random bodies: never a message, and the decoder offers few
+/// candidates to the CRC (before the weight bound: 2.35 / 2.0 / 1.45 per
+/// body at 0 / 4 / 8 gate erasures; with it: 0.04 / 0.18 / 1.02).
+#[test]
+fn random_bodies_rarely_reach_the_crc() {
+    let config = PhyConfig::ltc_fec();
+    for (erasures, max_per_body) in [(0usize, 0.1), (4, 0.35), (8, 1.3)] {
+        let st = random_bodies(&config, 5_000, erasures, 0xF00D + erasures as u64);
+        let per_body = st.candidates as f64 / st.bodies as f64;
+        assert_eq!(st.false_msgs, 0, "{erasures} erasures");
+        assert!(
+            per_body < max_per_body,
+            "{erasures} erasures: {per_body:.3} candidates per body"
+        );
+    }
+}
+
+/// Worst cases measured for the false-accept analysis, a few seconds each:
+/// MFSK traffic into `ltc2400_fec`, and transmitters without FEC on the
+/// same phy (uncoded LTC into `ltc_fec`, AML v1 Robust/Fast into
+/// `robust_fec`). Before the weight bound and the whitening these reached
+/// the CRC with 1.7 / 1.8 / 2.3 candidates per false body.
+#[test]
+fn worst_case_audio_rarely_reaches_the_crc() {
+    let ltc_fec = PhyConfig::ltc_fec();
+    let uncoded = PhyConfig {
+        fec: cricket_core::link::FecMode::None,
+        ..ltc_fec.clone()
+    };
+    let mfsk = [
+        PhyConfig::robust(),
+        PhyConfig::fast(),
+        PhyConfig::robust_fec(),
+    ];
+    let v1 = [PhyConfig::robust(), PhyConfig::fast()];
+    let cases = [
+        (
+            "MFSK traffic -> ltc2400_fec",
+            PhyConfig::from_name("ltc2400_fec"),
+            mfsk_traffic(6.0, 21, &mfsk),
+            0.9,
+        ),
+        (
+            "uncoded LTC -> ltc_fec",
+            ltc_fec,
+            bmc_traffic(&uncoded, 2.0, 22),
+            0.15,
+        ),
+        (
+            "AML v1 -> robust_fec",
+            PhyConfig::robust_fec(),
+            mfsk_traffic(6.0, 23, &v1),
+            0.15,
+        ),
+    ];
+    for (name, config, audio, max_per_body) in cases {
+        let st = run_false(&config, &audio);
+        let per_body = st.candidates as f64 / st.bodies.max(1) as f64;
+        assert_eq!(st.false_msgs, 0, "{name}");
+        assert!(st.bodies >= 10, "{name}: only {} false bodies", st.bodies);
+        assert!(
+            per_body < max_per_body,
+            "{name}: {per_body:.3} candidates per body ({} bodies)",
+            st.bodies
+        );
+    }
+}
+
+#[test]
+#[ignore = "measurement report; run in release with --ignored --nocapture"]
+fn false_accept_report() {
+    let seconds: f32 = std::env::var("FALSE_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120.0);
+    let keys = env_list(
+        "FALSE_PROFILES",
+        "ltc_fec,ltc2400_fec,ltc9600_fec,robust_fec",
+    );
+    let (a_len, a_strict) = analytic_struct();
+    println!("\nAnalytic structural pass per random candidate: lenient {a_len:.3e}, strict {a_strict:.3e}");
+    println!(
+        "CRC-16 factor 2^-16; per candidate false accept: lenient {:.3e}, strict {:.3e}",
+        a_len * CRC_FACTOR,
+        a_strict * CRC_FACTOR
+    );
+
+    let n_random: usize = std::env::var("FALSE_RANDOM_BODIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    println!("\n### Random bodies (simulated analytic model), {n_random} bodies\n");
+    println!("| gate erasures | candidates / body | header pass / cand | struct (lenient) / cand | struct (strict) / cand |");
+    println!("|---|---|---|---|---|");
+    for e in [0usize, 2, 4, 6, 7, 8] {
+        let st = random_bodies(&PhyConfig::ltc_fec(), n_random, e, 0xB0D1 + e as u64);
+        let c = st.candidates.max(1) as f64;
+        println!(
+            "| {e} | {:.2} | {:.4} | {:.2e} | {:.2e} |",
+            st.candidates as f64 / st.bodies as f64,
+            st.header_pass as f64 / c,
+            st.struct_lenient as f64 / c,
+            st.struct_strict as f64 / c,
+        );
+    }
+
+    let rows: Vec<(String, &'static str, FalseStats)> = std::thread::scope(|s| {
+        let handles: Vec<_> = keys
+            .iter()
+            .flat_map(|k| {
+                let config = PhyConfig::from_name(k);
+                signals(&config, seconds)
+                    .into_iter()
+                    .map(move |(name, audio)| (k.clone(), config.clone(), name, audio))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(k, config, name, audio)| s.spawn(move || (k, name, run_false(&config, &audio))))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    println!("\n### Non-Cricket audio, {seconds} s per signal\n");
+    println!("| profile | signal | false bodies / min | candidates / min | header pass / min | struct pass, v1 checks (count) | struct pass, + range checks (count) | false msgs | est. years / false msg, v1 checks | est. years / false msg, + range checks |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    let mut total_false = 0;
+    let fmt = |y: f64| {
+        if y.is_finite() {
+            format!("{y:.3e}")
+        } else {
+            "∞".to_string()
+        }
+    };
+    for (k, name, st) in &rows {
+        total_false += st.false_msgs;
+        println!(
+            "| {k} | {name} | {:.1} | {:.1} | {:.2} | {} | {} | {} | {} | {} |",
+            st.per_min(st.bodies),
+            st.per_min(st.candidates),
+            st.per_min(st.header_pass),
+            st.struct_lenient,
+            st.struct_strict,
+            st.false_msgs,
+            fmt(st.years_per_false(st.struct_lenient, a_len)),
+            fmt(st.years_per_false(st.struct_strict, a_strict)),
+        );
+    }
+    println!("\nEstimates: max(observed structural passes, candidates × analytic structural probability) × 2^-16.");
+    assert_eq!(total_false, 0);
+}
